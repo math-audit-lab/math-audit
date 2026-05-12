@@ -22,6 +22,14 @@ If you later update `environment.yml`, refresh the environment with:
 conda env update -f environment.yml --prune
 ```
 
+You can run a lightweight setup check before launching the GUI:
+
+```bash
+python scripts/check_setup.py
+```
+
+This does not run an audit or make an OpenAI API call. Missing optional items such as `OPENAI_API_KEY` or `pdflatex` are reported as warnings.
+
 ## 2. Configure an OpenAI API Key
 
 The GUI has an API key field in the setup area. Paste your key there before starting/resuming an audit or using the discussion pane.

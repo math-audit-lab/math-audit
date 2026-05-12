@@ -60,12 +60,13 @@ See [QUICKSTART.md](QUICKSTART.md) for setup and first-run instructions.
 At a high level:
 
 1. Create and activate the conda environment.
-2. Launch the GUI with `python audit_gui.py`.
-3. Paste an OpenAI API key into the GUI.
-4. Select a paper PDF.
-5. If a same-basename `.tex` file exists next to the PDF, the app will try TeX-aware chunking; otherwise it falls back to PDF text extraction.
-6. Start or resume the audit.
-7. Build and open reports, run verification, and optionally export a ChatGPT context pack.
+2. Optionally run `python scripts/check_setup.py` to smoke-check local dependencies without running an audit.
+3. Launch the GUI with `python audit_gui.py`.
+4. Paste an OpenAI API key into the GUI.
+5. Select a paper PDF.
+6. If a same-basename `.tex` file exists next to the PDF, the app will try TeX-aware chunking; otherwise it falls back to PDF text extraction.
+7. Start or resume the audit.
+8. Build and open reports, run verification, and optionally export a ChatGPT context pack.
 
 ## Outputs and State
 
