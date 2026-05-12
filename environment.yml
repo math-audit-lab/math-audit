@@ -1,0 +1,18 @@
+name: math-audit
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - openai
+  - pymupdf
+  - pypdf
+  - markdown
+  - jupyterlab
+  - ipykernel
+  - numpy
+  - sympy
+  - pip:
+      # PySide6 provides the Qt modules used by the GUI, including Qt WebEngine
+      # on current wheels. If QWebEngine imports fail, reinstall/update PySide6.
+      - PySide6>=6.7
