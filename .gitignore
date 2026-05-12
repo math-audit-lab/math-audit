@@ -1,0 +1,43 @@
+# Local audit examples and generated audit runs
+examples/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Temporary/local generated assets
+_mathjax_tmp/
+
+# Local environments and secrets
+.env
+.env.*
+.venv/
+venv/
+
+# Common generated output folders
+*_audit/
+exports/
+logs/
+reruns/
+qa/
+verification_results/
+python_checks/
+
+# LaTeX build outputs
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc

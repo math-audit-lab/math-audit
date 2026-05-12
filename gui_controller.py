@@ -1,0 +1,1033 @@
+from __future__ import annotations
+
+import traceback
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+from openai import OpenAI
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
+
+from audit_hooks import configure_runtime
+from audit_policy_hooks import build_final_report, build_user_message_for_chunk
+from audit_prompts import (
+    SHIPPED_AUDIT_SYSTEM_PROMPT,
+    effective_audit_system_prompt_with_source,
+    load_prompt_profiles,
+    save_prompt_profiles,
+)
+from audit_runtime import (
+    DEFAULT_MODEL as RUNTIME_DEFAULT_MODEL,
+    DEFAULT_QA_CONTEXT_MODE,
+    QA_CONTEXT_MODES,
+    ask_about_audit,
+    ask_about_paper,
+    build_concise_report as runtime_build_concise_report,
+    build_final_report as runtime_build_final_report,
+    build_verification_report,
+    cancel_pending_response_for_retry,
+    default_reasoning_effort_for_model,
+    export_chatgpt_context_pack as runtime_export_chatgpt_context_pack,
+    get_failed_verification_chunks,
+    get_audit_status,
+    get_verification_suite_status,
+    list_qa_threads,
+    load_qa_turns,
+    model_choices,
+    normalize_model_and_reasoning_effort,
+    request_pause,
+    rerun_failed_verification_chunks as runtime_rerun_failed_verification_chunks,
+    rerun_selected_chunks as runtime_rerun_selected_chunks,
+    resume_audit,
+    run_verification_suite_and_build_report,
+    set_openai_client,
+    set_active_qa_thread,
+    start_fresh_audit,
+    start_new_qa_thread,
+    supported_reasoning_efforts_for_model,
+)
+from audit_state import load_session_from_pdf
+
+
+DEFAULT_MODEL = RUNTIME_DEFAULT_MODEL
+DEFAULT_REASONING_EFFORT = default_reasoning_effort_for_model(DEFAULT_MODEL)
+MODEL_CHOICES = model_choices()
+DISCUSSION_CONTEXT_MODE_LABELS = {
+    "Reduced audit context": "reduced_audit_context",
+    "Full audit context": "full_audit_context",
+}
+DISCUSSION_CONTEXT_MODE_CHOICES = list(DISCUSSION_CONTEXT_MODE_LABELS)
+
+
+class BackendWorker(QObject):
+    result = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+        super().__init__()
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            value = self._fn(*self._args, **self._kwargs)
+        except Exception:
+            self.error.emit(traceback.format_exc())
+        else:
+            self.result.emit(value)
+        finally:
+            self.finished.emit()
+
+
+class GuiController(QObject):
+    status_updated = Signal(dict)
+    log_message = Signal(str)
+    report_output = Signal(str)
+    report_paths_updated = Signal(dict)
+    chatgpt_context_pack_exported = Signal(dict)
+    verification_progress = Signal(dict)
+    discussion_output = Signal(str)
+    discussion_history_loaded = Signal(list)
+    discussion_threads_loaded = Signal(list, str)
+    task_running_changed = Signal(bool)
+    audit_settings_changed = Signal(str, str)
+
+    def __init__(self, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self.api_key = ""
+        self.pdf_path = ""
+        self.model = DEFAULT_MODEL
+        self.reasoning_effort = DEFAULT_REASONING_EFFORT
+        self.qa_context_mode = DEFAULT_QA_CONTEXT_MODE
+
+        self._active_thread: Optional[QThread] = None
+        self._active_worker: Optional[BackendWorker] = None
+        self._active_task_name: Optional[str] = None
+        self._last_status_signature: Optional[tuple[Any, ...]] = None
+        self._shutdown_prepared = False
+        self._saved_session_model: Optional[str] = None
+        self._saved_session_reasoning_effort: Optional[str] = None
+        self._model_effort_override_active = False
+
+        configure_runtime(
+            prompt_builder=build_user_message_for_chunk,
+            final_report_builder=build_final_report,
+        )
+
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(1500)
+        self._poll_timer.timeout.connect(self.poll_status)
+        self._poll_timer.start()
+
+    def set_api_key(self, api_key: str) -> None:
+        previous_api_key = self.api_key
+        self.api_key = str(api_key or "").strip()
+        changed = self.api_key != previous_api_key
+        try:
+            if self.api_key:
+                client = OpenAI(api_key=self.api_key)
+                configure_runtime(
+                    client=client,
+                    prompt_builder=build_user_message_for_chunk,
+                    final_report_builder=build_final_report,
+                )
+                if changed:
+                    message = "API key configured for backend calls."
+                    if previous_api_key:
+                        message = "API key updated for backend calls."
+                    self.log_message.emit(message)
+            else:
+                set_openai_client(None)
+                configure_runtime(
+                    prompt_builder=build_user_message_for_chunk,
+                    final_report_builder=build_final_report,
+                )
+                if changed and previous_api_key:
+                    self.log_message.emit(
+                        "API key cleared. Report/status actions still work; live API calls now require a new key or environment configuration."
+                    )
+        except Exception as exc:
+            self.log_message.emit(f"Failed to configure API client: {type(exc).__name__}: {exc}")
+
+    def set_pdf_path(self, pdf_path: str) -> None:
+        previous_pdf_path = self.pdf_path
+        self.pdf_path = str(pdf_path or "").strip()
+        path_changed = self.pdf_path != previous_pdf_path
+        if path_changed:
+            if self.pdf_path:
+                self.log_message.emit(f"Selected PDF: {self.pdf_path}")
+            self._load_saved_audit_settings()
+            self._load_saved_discussion_history()
+            self._load_saved_discussion_threads()
+        self.poll_status()
+
+    def set_model(self, model: str) -> None:
+        self.model, self.reasoning_effort = normalize_model_and_reasoning_effort(model, None)
+        self._mark_model_effort_override_if_needed()
+
+    def set_reasoning_effort(self, reasoning_effort: str) -> None:
+        self.model, self.reasoning_effort = normalize_model_and_reasoning_effort(self.model, reasoning_effort)
+        self._mark_model_effort_override_if_needed()
+
+    def reasoning_effort_options(self, model: Optional[str] = None) -> list[str]:
+        return supported_reasoning_efforts_for_model(model or self.model)
+
+    def default_reasoning_effort(self, model: Optional[str] = None) -> str:
+        return default_reasoning_effort_for_model(model or self.model)
+
+    def prompt_profile_targets(self) -> list[str]:
+        return ["Default prompt"] + list(MODEL_CHOICES)
+
+    def prompt_text_for_target(self, target: str) -> str:
+        profiles = load_prompt_profiles()
+        clean = str(target or "").strip()
+        if clean == "Default prompt":
+            return str(profiles.get("default_prompt") or SHIPPED_AUDIT_SYSTEM_PROMPT)
+        overrides = profiles.get("model_overrides") or {}
+        if isinstance(overrides, dict) and str(overrides.get(clean) or "").strip():
+            return str(overrides.get(clean))
+        prompt, _source = effective_audit_system_prompt_with_source(clean)
+        return prompt
+
+    def prompt_status_for_target(self, target: str) -> str:
+        profiles = load_prompt_profiles()
+        clean = str(target or "").strip()
+        if clean == "Default prompt":
+            return "Custom default prompt" if str(profiles.get("default_prompt") or "").strip() else "Shipped default prompt"
+        overrides = profiles.get("model_overrides") or {}
+        if isinstance(overrides, dict) and str(overrides.get(clean) or "").strip():
+            return f"Model-specific override for {clean}"
+        _prompt, source = effective_audit_system_prompt_with_source(clean)
+        return f"Inherits {source}"
+
+    def save_prompt_for_target(self, target: str, prompt: str) -> None:
+        profiles = load_prompt_profiles()
+        clean = str(target or "").strip()
+        text = str(prompt or "")
+        if clean == "Default prompt":
+            profiles["default_prompt"] = text
+        else:
+            overrides = profiles.get("model_overrides")
+            if not isinstance(overrides, dict):
+                overrides = {}
+                profiles["model_overrides"] = overrides
+            overrides[clean] = text
+        save_prompt_profiles(profiles)
+        self.log_message.emit(f"Saved audit prompt profile: {clean}")
+
+    def reset_prompt_for_target(self, target: str) -> None:
+        profiles = load_prompt_profiles()
+        clean = str(target or "").strip()
+        if clean == "Default prompt":
+            profiles["default_prompt"] = ""
+        else:
+            overrides = profiles.get("model_overrides")
+            if isinstance(overrides, dict):
+                overrides.pop(clean, None)
+        save_prompt_profiles(profiles)
+        self.log_message.emit(f"Reset audit prompt profile: {clean}")
+
+    def set_discussion_context_mode(self, label_or_mode: str) -> None:
+        requested = str(label_or_mode or "").strip()
+        mode = DISCUSSION_CONTEXT_MODE_LABELS.get(requested, requested)
+        if mode not in QA_CONTEXT_MODES:
+            self.log_message.emit(f"Unsupported discussion context mode: {requested}")
+            return
+        if mode != self.qa_context_mode:
+            self.qa_context_mode = mode
+            display = next((label for label, value in DISCUSSION_CONTEXT_MODE_LABELS.items() if value == mode), mode)
+            self.log_message.emit(f"Discussion context mode: {display}")
+
+    def _load_saved_audit_settings(self) -> None:
+        self._saved_session_model = None
+        self._saved_session_reasoning_effort = None
+        self._model_effort_override_active = False
+        if not self.pdf_path:
+            return
+        session = load_session_from_pdf(self.pdf_path)
+        if not session:
+            return
+        model, effort = normalize_model_and_reasoning_effort(
+            session.get("model"),
+            session.get("reasoning_effort"),
+        )
+        self.model = model
+        self.reasoning_effort = effort
+        self._saved_session_model = model
+        self._saved_session_reasoning_effort = effort
+        self.audit_settings_changed.emit(model, effort)
+        self.log_message.emit(f"Loaded saved audit settings: {model} / {effort}")
+
+    def _load_saved_discussion_history(self) -> None:
+        if not self.pdf_path:
+            self.discussion_history_loaded.emit([])
+            return
+        session = load_session_from_pdf(self.pdf_path)
+        if not session:
+            self.discussion_history_loaded.emit([])
+            return
+        try:
+            turns = load_qa_turns(session, active_thread_only=True)
+        except Exception as exc:
+            self.discussion_history_loaded.emit([])
+            self.log_message.emit(f"Could not load previous discussion: {type(exc).__name__}: {exc}")
+            return
+        self.discussion_history_loaded.emit(turns)
+        if turns:
+            self.log_message.emit(f"Loaded previous discussion: {len(turns)} turns.")
+
+    def _load_saved_discussion_threads(self) -> None:
+        if not self.pdf_path:
+            self.discussion_threads_loaded.emit([], "")
+            return
+        session = load_session_from_pdf(self.pdf_path)
+        if not session:
+            self.discussion_threads_loaded.emit([], "")
+            return
+        try:
+            threads = list_qa_threads(session)
+        except Exception as exc:
+            self.discussion_threads_loaded.emit([], "")
+            self.log_message.emit(f"Could not load discussion threads: {type(exc).__name__}: {exc}")
+            return
+        active_thread_id = next((str(item.get("thread_id") or "") for item in threads if item.get("is_active")), "")
+        self.discussion_threads_loaded.emit(threads, active_thread_id)
+
+    def start_new_discussion_thread(self) -> None:
+        if self.has_active_task():
+            self.log_message.emit("Cannot start a new discussion thread while another task is running.")
+            return
+        if not self._require_session():
+            return
+        try:
+            result = start_new_qa_thread(self.pdf_path)
+        except Exception as exc:
+            self.log_message.emit(f"Could not start a new discussion thread: {type(exc).__name__}: {exc}")
+            return
+        self.discussion_history_loaded.emit([])
+        thread_id = str(result.get("thread_id") or "new thread")
+        self._load_saved_discussion_threads()
+        self.log_message.emit(f"Started new discussion thread: {thread_id}")
+        self.poll_status()
+
+    def set_active_discussion_thread(self, thread_id: str) -> None:
+        if self.has_active_task():
+            self.log_message.emit("Cannot switch discussion threads while another task is running.")
+            return
+        if not self._require_session():
+            return
+        clean_thread_id = str(thread_id or "").strip()
+        if not clean_thread_id:
+            return
+        try:
+            result = set_active_qa_thread(self.pdf_path, clean_thread_id)
+        except Exception as exc:
+            self.log_message.emit(f"Could not switch discussion thread: {type(exc).__name__}: {exc}")
+            return
+        turns = result.get("turns") or []
+        threads = result.get("threads") or []
+        selected = result.get("thread") or {}
+        active_thread_id = str(selected.get("thread_id") or clean_thread_id)
+        self.discussion_history_loaded.emit(turns)
+        self.discussion_threads_loaded.emit(threads, active_thread_id)
+        self.log_message.emit(f"Switched discussion thread: {selected.get('label') or active_thread_id}")
+        self.poll_status()
+
+    def _mark_model_effort_override_if_needed(self) -> None:
+        if self._saved_session_model is None or self._saved_session_reasoning_effort is None:
+            return
+        differs = (
+            self.model != self._saved_session_model
+            or self.reasoning_effort != self._saved_session_reasoning_effort
+        )
+        was_active = self._model_effort_override_active
+        self._model_effort_override_active = differs
+        if differs and not was_active:
+            self.log_message.emit(f"Overriding saved audit settings: {self.model} / {self.reasoning_effort}")
+
+    def has_active_task(self) -> bool:
+        return self._active_thread is not None
+
+    def active_task_name(self) -> str:
+        return self._active_task_name or ""
+
+    def prepare_for_shutdown(self) -> None:
+        if not self.has_active_task():
+            return
+        if self._shutdown_prepared:
+            return
+
+        self._shutdown_prepared = True
+        task_name = self.active_task_name() or "active task"
+        if task_name in {"Start Fresh Audit", "Resume Audit"} and self.pdf_path:
+            try:
+                request_pause(self.pdf_path, include_manifest=False)
+                self.log_message.emit("Close requested. Pause requested; shutdown will wait for the current chunk to finish.")
+            except Exception as exc:
+                self.log_message.emit(
+                    f"Close requested. Could not request pause ({type(exc).__name__}: {exc}); shutdown will wait for '{task_name}' to finish."
+                )
+                return
+        else:
+            self.log_message.emit(f"Close requested. Shutdown will wait for '{task_name}' to finish.")
+
+    def start_fresh_audit(self) -> None:
+        if not self._require_pdf_file():
+            return
+        if not self._require_api_key_for_live_calls():
+            return
+        audit_prompt, audit_prompt_source = effective_audit_system_prompt_with_source(self.model)
+        self._run_backend_task(
+            "Start Fresh Audit",
+            start_fresh_audit,
+            self._handle_audit_result,
+            self.pdf_path,
+            model=self.model,
+            reasoning_effort=self.reasoning_effort,
+            audit_system_prompt=audit_prompt,
+            audit_system_prompt_source=audit_prompt_source,
+            verbose=False,
+        )
+
+    def resume_audit(self) -> None:
+        if not self._require_pdf_file():
+            return
+        if not self._require_session():
+            return
+        if not self._require_api_key_for_live_calls():
+            return
+        model = self.model if self._model_effort_override_active else None
+        reasoning_effort = self.reasoning_effort if self._model_effort_override_active else None
+        self._run_backend_task(
+            "Resume Audit",
+            resume_audit,
+            self._handle_audit_result,
+            self.pdf_path,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            verbose=False,
+        )
+
+    def pause_audit(self) -> None:
+        if not self._require_session():
+            return
+        try:
+            info = request_pause(self.pdf_path, include_manifest=True)
+        except Exception as exc:
+            self.log_message.emit(f"Pause request failed: {type(exc).__name__}: {exc}")
+            return
+        self.log_message.emit("Pause requested. The running audit will stop after the current chunk finishes.")
+        self.status_updated.emit(self._normalize_status_payload(info))
+
+    def cancel_current_chunk(self) -> None:
+        if self.has_active_task():
+            self.log_message.emit("Cancel Current Chunk is only available when no local GUI task is active.")
+            return
+        if not self._require_session():
+            return
+        if not self._require_api_key_for_live_calls():
+            return
+        payload = self._load_status_payload()
+        pending = ((payload.get("session") or {}).get("pending") or {})
+        if not pending.get("response_id"):
+            self.log_message.emit("No saved pending response was found for the current audit.")
+            return
+        self._run_backend_task(
+            "Cancel Current Chunk",
+            cancel_pending_response_for_retry,
+            self._handle_cancel_current_chunk_result,
+            self.pdf_path,
+            include_manifest=True,
+        )
+
+    @Slot()
+    def poll_status(self) -> None:
+        payload = self._load_status_payload()
+        self.status_updated.emit(payload)
+        self._log_status_change(payload)
+
+    def rebuild_final_report(self) -> None:
+        if not self._require_session():
+            return
+        self._run_backend_task(
+            "Rebuild Final Report",
+            runtime_build_final_report,
+            self._handle_report_result,
+            self.pdf_path,
+        )
+
+    def build_concise_report(self, options: Optional[dict[str, Any]] = None) -> None:
+        if not self._require_session():
+            return
+        self._run_backend_task(
+            "Build Concise Report",
+            runtime_build_concise_report,
+            self._handle_concise_report_result,
+            self.pdf_path,
+            options=options,
+        )
+
+    def rebuild_verification_report(self) -> None:
+        if not self._require_session():
+            return
+        self._run_backend_task(
+            "Rebuild Verification Report",
+            build_verification_report,
+            self._handle_verification_report_result,
+            self.pdf_path,
+        )
+
+    def run_verification_suite(self) -> None:
+        if not self._require_session():
+            return
+
+        def progress_callback(payload: dict[str, Any]) -> None:
+            self.verification_progress.emit(dict(payload or {}))
+
+        self._run_backend_task(
+            "Run Verification Suite",
+            run_verification_suite_and_build_report,
+            self._handle_verification_suite_result,
+            self.pdf_path,
+            progress_callback=progress_callback,
+        )
+
+    def export_chatgpt_context_pack(self, options: Optional[dict[str, Any]] = None) -> None:
+        if not self._require_session():
+            return
+        self._run_backend_task(
+            "Export ChatGPT Context Pack",
+            runtime_export_chatgpt_context_pack,
+            self._handle_chatgpt_context_pack_result,
+            self.pdf_path,
+            options=options,
+        )
+
+    def rerun_selected_chunks(
+        self,
+        chunk_ids: str,
+        extra_rerun_instruction: str = "",
+        rebuild_reports: bool = True,
+    ) -> None:
+        clean_chunk_ids = str(chunk_ids or "").strip()
+        if not clean_chunk_ids:
+            self.log_message.emit("Enter one or more chunk IDs to rerun, for example: chunk_012 or 12,15,18.")
+            return
+        if self.has_active_task():
+            self.log_message.emit("Rerun Selected Chunks is only available when no local GUI task is active.")
+            return
+        if not self._require_session():
+            return
+        if not self._require_api_key_for_live_calls():
+            return
+        payload = self._load_status_payload()
+        session = payload.get("session") or {}
+        status = payload.get("status") or {}
+        if session.get("pending"):
+            self.log_message.emit("Cannot rerun chunks while the audit has a pending response.")
+            return
+        if str(status.get("status") or "") == "running":
+            self.log_message.emit("Cannot rerun chunks while the audit is running.")
+            return
+        model = self.model if self._model_effort_override_active else None
+        reasoning_effort = self.reasoning_effort if self._model_effort_override_active else None
+        self._run_backend_task(
+            "Rerun Selected Chunks",
+            runtime_rerun_selected_chunks,
+            self._handle_rerun_selected_chunks_result,
+            self.pdf_path,
+            clean_chunk_ids,
+            extra_rerun_instruction=str(extra_rerun_instruction or "").strip() or None,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            rebuild_reports=bool(rebuild_reports),
+        )
+
+    def rerun_failed_verification_chunks(
+        self,
+        chunk_ids: str = "",
+        include_verification_output: bool = True,
+        rebuild_reports: bool = True,
+    ) -> None:
+        if self.has_active_task():
+            self.log_message.emit("Failed-verification rerun is only available when no local GUI task is active.")
+            return
+        if not self._require_session():
+            return
+        if not self._require_api_key_for_live_calls():
+            return
+        payload = self._load_status_payload()
+        session = payload.get("session") or {}
+        status = payload.get("status") or {}
+        failed_verification = payload.get("failed_verification") or {}
+        failed_count = int((failed_verification.get("summary") or {}).get("failed_chunk_count", 0) or 0)
+        status_name = str(status.get("status") or "")
+        if session.get("pending"):
+            self.log_message.emit("Cannot rerun failed-verification chunks while the audit has a pending response.")
+            return
+        if status_name not in {"completed", "paused"}:
+            self.log_message.emit("Failed-verification rerun is available only for completed or paused audits.")
+            return
+        if failed_count <= 0:
+            self.log_message.emit("No failed or timed-out verification results were found.")
+            return
+        model = self.model if self._model_effort_override_active else None
+        reasoning_effort = self.reasoning_effort if self._model_effort_override_active else None
+        clean_chunk_ids = str(chunk_ids or "").strip() or None
+        self._run_backend_task(
+            "Rerun Failed Verification Chunks",
+            runtime_rerun_failed_verification_chunks,
+            self._handle_failed_verification_rerun_result,
+            self.pdf_path,
+            chunk_ids=clean_chunk_ids,
+            include_verification_output=bool(include_verification_output),
+            model=model,
+            reasoning_effort=reasoning_effort,
+            rebuild_reports=bool(rebuild_reports),
+        )
+
+    def ask_about_paper(self, question: str) -> None:
+        clean = str(question or "").strip()
+        if not clean:
+            self.log_message.emit("Enter a question before asking about the paper.")
+            return
+        if not self._require_session():
+            return
+        if not self._require_api_key_for_live_calls():
+            return
+        self._run_backend_task(
+            "Ask About Paper",
+            ask_about_paper,
+            self._handle_discussion_result,
+            self.pdf_path,
+            clean,
+            model=self.model,
+            reasoning_effort=self.reasoning_effort,
+            qa_context_mode=self.qa_context_mode,
+        )
+
+    def ask_about_audit(self, question: str) -> None:
+        clean = str(question or "").strip()
+        if not clean:
+            self.log_message.emit("Enter a question before asking about the audit.")
+            return
+        if not self._require_session():
+            return
+        if not self._require_api_key_for_live_calls():
+            return
+        self._run_backend_task(
+            "Ask About Audit",
+            ask_about_audit,
+            self._handle_discussion_result,
+            self.pdf_path,
+            clean,
+            model=self.model,
+            reasoning_effort=self.reasoning_effort,
+            qa_context_mode=self.qa_context_mode,
+        )
+
+    def _run_backend_task(
+        self,
+        task_name: str,
+        fn: Callable[..., Any],
+        on_result: Callable[[Any], None],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        if self._active_thread is not None:
+            self.log_message.emit(f"Cannot start '{task_name}' while '{self._active_task_name or 'another task'}' is still running.")
+            return
+
+        thread = QThread(self)
+        worker = BackendWorker(fn, *args, **kwargs)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.result.connect(on_result)
+        worker.error.connect(lambda message, name=task_name: self._handle_task_error(name, message))
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_active_task)
+
+        self._active_thread = thread
+        self._active_worker = worker
+        self._active_task_name = task_name
+        self._shutdown_prepared = False
+        self.task_running_changed.emit(True)
+        self.log_message.emit(f"{task_name} started.")
+        thread.start()
+
+    @Slot()
+    def _clear_active_task(self) -> None:
+        self._active_thread = None
+        self._active_worker = None
+        self._active_task_name = None
+        self._shutdown_prepared = False
+        self.task_running_changed.emit(False)
+        self.poll_status()
+
+    def _handle_task_error(self, task_name: str, message: str) -> None:
+        short = message.strip().splitlines()[-1] if message.strip() else "Unknown error"
+        self.log_message.emit(f"{task_name} failed: {short}")
+        if task_name == "Build Concise Report":
+            self.report_output.emit(f"Build Concise Report failed: {short}")
+        elif "Report" in task_name:
+            self.report_output.emit(message.strip())
+        elif "Ask About" in task_name:
+            self.discussion_output.emit(message.strip())
+
+    def _emit_current_status(self) -> None:
+        self.status_updated.emit(self._load_status_payload())
+
+    def _handle_cancel_current_chunk_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.log_message.emit("Cancel Current Chunk finished with an unexpected result shape.")
+            return
+        event = result.get("cancel_event") or {}
+        status = result.get("status") or {}
+        chunk_id = str(event.get("chunk_id") or status.get("current_chunk_id") or "the current chunk")
+        self.log_message.emit(f"Cancelled pending response; Resume Audit will retry {chunk_id}.")
+        self.status_updated.emit(self._normalize_status_payload(result))
+
+    def _handle_audit_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.log_message.emit("Audit finished with an unexpected result shape.")
+            return
+        status = result.get("status") or {}
+        usage = result.get("usage") or {}
+        totals = usage.get("totals") or {}
+        report_paths = result.get("report_paths")
+        pause_result = result.get("pause_result")
+        recovery_result = result.get("recovery_result")
+        chunks_completed = int(status.get("chunks_completed", 0) or 0)
+        chunks_total = int(status.get("chunks_total", 0) or 0)
+        total_cost = float(totals.get("cost_usd", status.get("cost_usd", 0.0)) or 0.0)
+        total_seconds = float(totals.get("audit_seconds", 0.0) or 0.0)
+        completion_summary = (
+            f"{chunks_completed}/{chunks_total} chunks | "
+            f"${total_cost:.4f} | "
+            f"{self._format_duration(total_seconds)}"
+        )
+
+        if report_paths:
+            self.log_message.emit(f"Audit completed: {completion_summary}. Reports generated.")
+            self.report_output.emit(self._format_path_payload("Audit report outputs", report_paths))
+            self.report_paths_updated.emit(dict(report_paths))
+            self._emit_current_status()
+        elif pause_result:
+            self.log_message.emit("Audit paused cleanly after the current chunk.")
+        elif recovery_result:
+            self.log_message.emit("Audit paused during recovery after a previously submitted request failed remotely.")
+        else:
+            self.log_message.emit(f"Audit returned with status: {status.get('status', 'unknown')} ({completion_summary}).")
+
+    def _handle_concise_report_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected concise-report result.")
+            return
+        primary_path = self._primary_output_path(result)
+        if primary_path:
+            self.log_message.emit(f"Concise report built. Primary output: {primary_path}")
+        else:
+            self.log_message.emit("Concise report built.")
+        self.report_output.emit(self._format_path_payload("Concise report outputs", result))
+        self.report_paths_updated.emit(dict(result))
+        self._emit_current_status()
+
+    def _handle_report_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected final-report result.")
+            return
+        primary_path = self._primary_output_path(result)
+        if primary_path:
+            self.log_message.emit(f"Final report rebuilt. Primary output: {primary_path}")
+        else:
+            self.log_message.emit("Final report rebuilt.")
+        self.report_output.emit(self._format_path_payload("Final report outputs", result))
+        self.report_paths_updated.emit(dict(result))
+        self._emit_current_status()
+
+    def _handle_verification_report_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected verification-report result.")
+            return
+        primary_path = self._primary_output_path(result)
+        if primary_path:
+            self.log_message.emit(f"Verification report rebuilt. Primary output: {primary_path}")
+            self.report_output.emit(self._format_path_payload("Verification report outputs", result))
+            self.report_paths_updated.emit(dict(result))
+            self._emit_current_status()
+        else:
+            message = "No verification results found; run the verification suite first."
+            self.log_message.emit(message)
+            self.report_output.emit(message)
+
+    def _handle_verification_suite_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected verification-suite result.")
+            return
+        summary = result.get("summary") or {}
+        total = int(summary.get("scripts_total", 0) or 0)
+        passed = int(summary.get("passed", 0) or 0)
+        failed = int(summary.get("failed", 0) or 0)
+        timed_out = int(summary.get("timeout", 0) or 0)
+        skipped = int(summary.get("skipped", 0) or 0)
+        self.log_message.emit(
+            "Verification suite finished: "
+            f"{total} scripts, {passed} passed, {failed} failed, {timed_out} timed out, {skipped} skipped."
+        )
+        report_paths = result.get("report_paths") or {}
+        if report_paths:
+            primary_path = self._primary_output_path(report_paths)
+            if primary_path:
+                self.log_message.emit(f"Verification report written. Primary output: {primary_path}")
+            self.report_output.emit(self._format_path_payload("Verification report outputs", report_paths))
+            self.report_paths_updated.emit(dict(report_paths))
+            self._emit_current_status()
+        else:
+            self.report_output.emit("Verification suite finished, but no verification report was produced.")
+            self._emit_current_status()
+
+    def _handle_chatgpt_context_pack_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected ChatGPT context-pack result.")
+            return
+        export_folder = str(result.get("export_folder") or "").strip()
+        copied = result.get("copied_files") or []
+        skipped = result.get("skipped_files") or []
+        if export_folder:
+            self.log_message.emit(f"ChatGPT context pack exported: {export_folder}")
+        lines = [
+            "ChatGPT context pack export",
+            f"- export_folder: {export_folder}",
+            "- starter_prompt: available via Copy Starter Prompt",
+            f"- audit_context: {result.get('audit_context', '')}",
+            f"- paper_structure: {result.get('paper_structure', '')}",
+            f"- sidecar_manifest: {result.get('manifest', '')}",
+            f"- copied_files: {len(copied)}",
+            f"- skipped_files: {len(skipped)}",
+            "- workflow: attach the files in the export folder, then paste the copied starter prompt into ChatGPT.",
+        ]
+        self.report_output.emit("\n".join(lines))
+        self.chatgpt_context_pack_exported.emit(dict(result))
+
+    def _handle_rerun_selected_chunks_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected selected-rerun result.")
+            return
+        chunk_ids = result.get("chunk_ids") or []
+        label = ", ".join(str(chunk_id) for chunk_id in chunk_ids) or "selected chunks"
+        archive_root = str(result.get("archive_root") or "").strip()
+        self.log_message.emit(f"Selected chunk rerun finished for {label}.")
+        if archive_root:
+            self.log_message.emit(f"Previous chunk evidence archived under: {archive_root}")
+        report_paths = result.get("report_paths") or {}
+        if report_paths:
+            self.report_output.emit(self._format_path_payload("Selected rerun report outputs", report_paths))
+        else:
+            self.report_output.emit(f"Selected rerun finished for {label}. Reports were not rebuilt.")
+        self.status_updated.emit(self._normalize_status_payload(result))
+        self._emit_current_status()
+
+    def _handle_failed_verification_rerun_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected failed-verification rerun result.")
+            return
+        info = result.get("failed_verification_rerun") or {}
+        chunk_ids = info.get("chunk_ids") or result.get("chunk_ids") or []
+        label = ", ".join(str(chunk_id) for chunk_id in chunk_ids) or "failed-verification chunks"
+        archive_root = str(result.get("archive_root") or "").strip()
+        self.log_message.emit(f"Failed-verification chunk rerun finished for {label}.")
+        if archive_root:
+            self.log_message.emit(f"Previous chunk evidence archived under: {archive_root}")
+        report_paths = result.get("report_paths") or {}
+        if report_paths:
+            self.report_output.emit(self._format_path_payload("Failed-verification rerun report outputs", report_paths))
+        else:
+            self.report_output.emit(f"Failed-verification rerun finished for {label}. Reports were not rebuilt.")
+        self.status_updated.emit(self._normalize_status_payload(result))
+        self._emit_current_status()
+
+    def _handle_discussion_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.discussion_output.emit("Unexpected discussion result.")
+            return
+        mode = str(result.get("mode") or "").strip() or "discussion"
+        question = str(result.get("question") or "").strip()
+        answer = str(result.get("answer") or "").strip()
+        response_id = str(result.get("response_id") or "n/a")
+        text = "\n".join(
+            [
+                f"Mode: {mode}",
+                f"Question: {question}",
+                f"Response ID: {response_id}",
+                "",
+                answer or "(empty answer)",
+            ]
+        ).strip()
+        self.log_message.emit(f"{mode.capitalize()} response received.")
+        self.discussion_output.emit(text)
+        self._load_saved_discussion_threads()
+        self.poll_status()
+
+    def _format_path_payload(self, title: str, payload: dict[str, Any]) -> str:
+        lines = [title]
+        for key in sorted(payload):
+            lines.append(f"- {key}: {payload.get(key)}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _primary_output_path(payload: dict[str, Any]) -> str:
+        for key in ("pdf", "tex", "md", "json"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(0.0, float(seconds or 0.0))
+        minutes, sec = divmod(int(round(seconds)), 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}h {minutes}m {sec}s"
+        if minutes:
+            return f"{minutes}m {sec}s"
+        return f"{sec}s"
+
+    def _require_pdf_file(self) -> bool:
+        if not self.pdf_path:
+            self.log_message.emit("Choose a PDF first.")
+            return False
+        path = Path(self.pdf_path)
+        if not path.exists():
+            self.log_message.emit(f"PDF not found: {self.pdf_path}")
+            return False
+        return True
+
+    def _require_session(self) -> bool:
+        if not self._require_pdf_file():
+            return False
+        if load_session_from_pdf(self.pdf_path) is None:
+            self.log_message.emit("No existing audit session was found for this PDF.")
+            return False
+        return True
+
+    def _require_api_key_for_live_calls(self) -> bool:
+        if self.api_key:
+            return True
+        self.log_message.emit("Enter an API key before starting/resuming an audit or using discussion.")
+        return False
+
+    def _load_status_payload(self) -> dict[str, Any]:
+        if not self.pdf_path:
+            return self._empty_status_payload("no_pdf", "No PDF selected.")
+        try:
+            info = get_audit_status(self.pdf_path, include_manifest=True)
+        except FileNotFoundError:
+            return self._empty_status_payload("no_session", "No existing audit session found for this PDF.")
+        except Exception as exc:
+            return self._empty_status_payload("error", f"Status read failed: {type(exc).__name__}: {exc}")
+        try:
+            info["failed_verification"] = get_failed_verification_chunks(self.pdf_path)
+        except Exception as exc:
+            info["failed_verification"] = {
+                "chunk_ids": [],
+                "chunks": [],
+                "summary": {"failed_chunk_count": 0, "failed_result_count": 0},
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        try:
+            info["verification_suite"] = get_verification_suite_status(self.pdf_path)
+        except Exception as exc:
+            info["verification_suite"] = {
+                "scripts_total": 0,
+                "scripts": [],
+                "last_run": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        return self._normalize_status_payload(info)
+
+    def _empty_status_payload(self, status_name: str, message: str) -> dict[str, Any]:
+        return {
+            "session": None,
+            "status": {
+                "status": status_name,
+                "progress_pct": 0.0,
+                "chunks_completed": 0,
+                "chunks_total": 0,
+                "estimated_pages_completed": 0,
+                "estimated_pages_total": 0,
+                "cost_usd": 0.0,
+                "current_chunk_id": None,
+            },
+            "usage": {
+                "totals": {
+                    "total_tokens": 0,
+                    "cost_usd": 0.0,
+                    "audit_seconds": 0.0,
+                }
+            },
+            "discussion_usage": {
+                "turns": 0,
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+            },
+            "pause": {"requested": False, "requested_at": None},
+            "manifest": None,
+            "failed_verification": {
+                "chunk_ids": [],
+                "chunks": [],
+                "summary": {"failed_chunk_count": 0, "failed_result_count": 0},
+            },
+            "verification_suite": {
+                "scripts_total": 0,
+                "scripts": [],
+                "last_run": None,
+            },
+            "report_freshness": {
+                "reports": {
+                    "full": {"status": "missing"},
+                    "concise": {"status": "missing"},
+                    "verification": {"status": "missing"},
+                }
+            },
+            "message": message,
+            "session_available": False,
+            "pdf_selected": bool(self.pdf_path),
+        }
+
+    def _normalize_status_payload(self, info: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(info)
+        payload["session_available"] = payload.get("session") is not None
+        payload["pdf_selected"] = bool(self.pdf_path)
+        payload.setdefault("report_freshness", {"reports": {}})
+        payload.setdefault("message", "")
+        return payload
+
+    def _log_status_change(self, payload: dict[str, Any]) -> None:
+        status = payload.get("status") or {}
+        pause = payload.get("pause") or {}
+        signature = (
+            status.get("status"),
+            status.get("current_chunk_id"),
+            status.get("chunks_completed"),
+            status.get("chunks_total"),
+            bool(pause.get("requested")),
+            pause.get("requested_at"),
+        )
+        if signature == self._last_status_signature:
+            return
+        self._last_status_signature = signature
+
+        if payload.get("session_available"):
+            self.log_message.emit(
+                f"Status: {status.get('status', 'unknown')} | "
+                f"Chunk: {status.get('current_chunk_id') or '-'} | "
+                f"Progress: {status.get('chunks_completed', 0)}/{status.get('chunks_total', 0)}"
+            )
+        elif payload.get("message"):
+            self.log_message.emit(payload["message"])
