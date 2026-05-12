@@ -44,6 +44,15 @@ The GUI frontend lives in:
 
 The notebook `automatic_math_paper_audit_consolidated.ipynb` remains available for developer maintenance/debugging only. New user-facing features should be implemented in the GUI/backend modules first.
 
+## Repository Layout
+
+- `audit_gui.py`, `gui_controller.py`, and `gui_main_window.py` implement the primary PySide6 GUI.
+- `audit_runtime.py`, `audit_policy_hooks.py`, `audit_hooks.py`, `audit_state.py`, `audit_chunking.py`, `audit_verification.py`, and `audit_prompts.py` are the shared backend modules.
+- `gui_assets/` contains bundled local MathJax and font assets. These are intentionally kept in the repository so the rendered discussion pane can typeset math without a CDN dependency.
+- `automatic_math_paper_audit_consolidated.ipynb` is retained as a secondary developer/debug notebook, not as the production frontend.
+- `audit_prompt_profiles.json` stores GUI-edited prompt profile overrides. The checked-in file is an empty/default profile; avoid committing local prompt experiments or sensitive/proprietary prompt text.
+- `examples/` is local ignored regression/test data. Generated audit workdirs, report outputs, verification results, reruns, discussion turns, and export folders should stay out of Git.
+
 ## Basic Use
 
 See [QUICKSTART.md](QUICKSTART.md) for setup and first-run instructions.

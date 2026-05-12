@@ -1,5 +1,8 @@
 # Local audit examples and generated audit runs
-examples/
+/examples/
+
+# Third-party bundled asset example pages are not needed at runtime
+gui_assets/**/examples/
 
 # macOS
 .DS_Store
@@ -9,6 +12,12 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
+.coverage
+htmlcov/
+
+# Local editor/project files
+.idea/
+.vscode/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -24,12 +33,18 @@ venv/
 
 # Common generated output folders
 *_audit/
+*_audit_archived_*/
 exports/
 logs/
 reruns/
 qa/
 verification_results/
 python_checks/
+
+# Packaging/build scratch
+build/
+dist/
+*.egg-info/
 
 # LaTeX build outputs
 *.aux
