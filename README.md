@@ -93,4 +93,5 @@ That workdir contains state JSON, chunk records, prompts/requests/responses, gen
 - Keep shared backend modules canonical.
 - Treat the notebook as secondary/debug-maintenance only.
 - Do not commit generated audit outputs or local `examples/` data.
+- Run `python scripts/check_regressions.py` for a lightweight no-API regression check of recent report-freshness and PDF-label behavior.
 - Prefer small, focused changes that preserve backward compatibility with existing audit folders.
