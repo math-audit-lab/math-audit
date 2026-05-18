@@ -92,6 +92,7 @@ class GuiController(QObject):
     discussion_history_loaded = Signal(list)
     discussion_threads_loaded = Signal(list, str)
     task_running_changed = Signal(bool)
+    cancel_task_running_changed = Signal(bool)
     audit_settings_changed = Signal(str, str)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
@@ -105,6 +106,8 @@ class GuiController(QObject):
         self._active_thread: Optional[QThread] = None
         self._active_worker: Optional[BackendWorker] = None
         self._active_task_name: Optional[str] = None
+        self._cancel_thread: Optional[QThread] = None
+        self._cancel_worker: Optional[BackendWorker] = None
         self._last_status_signature: Optional[tuple[Any, ...]] = None
         self._shutdown_prepared = False
         self._saved_session_model: Optional[str] = None
@@ -353,6 +356,12 @@ class GuiController(QObject):
     def active_task_name(self) -> str:
         return self._active_task_name or ""
 
+    def cancel_current_chunk_in_progress(self) -> bool:
+        return self._cancel_thread is not None
+
+    def _active_task_allows_concurrent_cancel(self) -> bool:
+        return self.active_task_name() in {"Start Fresh Audit", "Resume Audit"}
+
     def prepare_for_shutdown(self) -> None:
         if not self.has_active_task():
             return
@@ -364,7 +373,19 @@ class GuiController(QObject):
         if task_name in {"Start Fresh Audit", "Resume Audit"} and self.pdf_path:
             try:
                 request_pause(self.pdf_path, include_manifest=False)
-                self.log_message.emit("Close requested. Pause requested; shutdown will wait for the current chunk to finish.")
+                cancel_started = self._run_concurrent_cancel_current_chunk_task(
+                    include_manifest=False,
+                    quiet_missing=True,
+                    prefix="Close requested. ",
+                )
+                if cancel_started:
+                    self.log_message.emit(
+                        "Close requested. Pause and current chunk cancellation requested; shutdown will wait for cleanup."
+                    )
+                else:
+                    self.log_message.emit(
+                        "Close requested. Pause requested; shutdown will wait for the current chunk to finish."
+                    )
             except Exception as exc:
                 self.log_message.emit(
                     f"Close requested. Could not request pause ({type(exc).__name__}: {exc}); shutdown will wait for '{task_name}' to finish."
@@ -423,7 +444,14 @@ class GuiController(QObject):
 
     def cancel_current_chunk(self) -> None:
         if self.has_active_task():
-            self.log_message.emit("Cancel Current Chunk is only available when no local GUI task is active.")
+            if not self._active_task_allows_concurrent_cancel():
+                self.log_message.emit("Cancel Current Chunk is only available during an active audit run or when no local GUI task is active.")
+                return
+            if not self._require_session():
+                return
+            if not self._require_api_key_for_live_calls():
+                return
+            self._run_concurrent_cancel_current_chunk_task(include_manifest=True)
             return
         if not self._require_session():
             return
@@ -660,6 +688,54 @@ class GuiController(QObject):
         self.log_message.emit(f"{task_name} started.")
         thread.start()
 
+    def _run_concurrent_cancel_current_chunk_task(
+        self,
+        include_manifest: bool = True,
+        quiet_missing: bool = False,
+        prefix: str = "",
+    ) -> bool:
+        if self._cancel_thread is not None:
+            if not quiet_missing:
+                self.log_message.emit("Cancel Current Chunk is already in progress.")
+            return False
+        if not self.pdf_path:
+            if not quiet_missing:
+                self.log_message.emit("Choose a PDF first.")
+            return False
+        if not self.api_key:
+            if not quiet_missing:
+                self.log_message.emit("Enter an API key before cancelling the current chunk.")
+            return False
+        payload = self._load_status_payload()
+        pending = ((payload.get("session") or {}).get("pending") or {})
+        if not pending.get("response_id"):
+            if not quiet_missing:
+                self.log_message.emit("No saved pending response was found for the current audit.")
+            return False
+
+        thread = QThread(self)
+        worker = BackendWorker(
+            cancel_pending_response_for_retry,
+            self.pdf_path,
+            include_manifest=include_manifest,
+        )
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.result.connect(self._handle_cancel_current_chunk_result)
+        worker.error.connect(lambda message: self._handle_task_error("Cancel Current Chunk", message))
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_cancel_task)
+
+        self._cancel_thread = thread
+        self._cancel_worker = worker
+        self.cancel_task_running_changed.emit(True)
+        self.log_message.emit(f"{prefix}Cancel Current Chunk started.")
+        thread.start()
+        return True
+
     @Slot()
     def _clear_active_task(self) -> None:
         self._active_thread = None
@@ -667,6 +743,13 @@ class GuiController(QObject):
         self._active_task_name = None
         self._shutdown_prepared = False
         self.task_running_changed.emit(False)
+        self.poll_status()
+
+    @Slot()
+    def _clear_cancel_task(self) -> None:
+        self._cancel_thread = None
+        self._cancel_worker = None
+        self.cancel_task_running_changed.emit(False)
         self.poll_status()
 
     def _handle_task_error(self, task_name: str, message: str) -> None:

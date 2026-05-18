@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import shutil
 import sys
 from pathlib import Path
@@ -87,6 +88,12 @@ def main() -> int:
     controller = GuiController()
     window = MainWindow(controller)
     window.show()
+
+    def request_interrupt_shutdown(_signum, _frame) -> None:
+        controller.log_message.emit("Keyboard interrupt received; requesting GUI shutdown.")
+        QTimer.singleShot(0, window.close)
+
+    signal.signal(signal.SIGINT, request_interrupt_shutdown)
 
     def emit_startup_checks() -> None:
         for message in _startup_check_messages(project_root):

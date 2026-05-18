@@ -453,6 +453,7 @@ class MainWindow(QMainWindow):
         self.controller.discussion_history_loaded.connect(self._load_discussion_history)
         self.controller.discussion_threads_loaded.connect(self._on_discussion_threads_loaded)
         self.controller.task_running_changed.connect(self._on_task_running_changed)
+        self.controller.cancel_task_running_changed.connect(lambda _running: self._apply_button_states())
         self.controller.audit_settings_changed.connect(self._on_audit_settings_changed)
 
         self.model_combo.setCurrentText(DEFAULT_MODEL)
@@ -1240,6 +1241,11 @@ class MainWindow(QMainWindow):
         running_status = status_name == "running"
         pause_requested = bool(pause.get("requested"))
         pending_response = bool(pending.get("response_id"))
+        active_audit_task = (
+            self._task_running
+            and self.controller.active_task_name() in {"Start Fresh Audit", "Resume Audit"}
+        )
+        cancel_in_progress = self.controller.cancel_current_chunk_in_progress()
         failed_count = int((failed_verification.get("summary") or {}).get("failed_chunk_count", 0) or 0)
         resumable_statuses = {"paused", "initialized"}
 
@@ -1247,7 +1253,12 @@ class MainWindow(QMainWindow):
         self.resume_button.setEnabled(session_available and not self._task_running and status_name in resumable_statuses)
         self.pause_button.setEnabled(running_status and not pause_requested)
         self.pause_button.setText("Pause Requested" if pause_requested and running_status else "Pause Audit")
-        self.cancel_current_button.setEnabled(session_available and pending_response and not self._task_running)
+        self.cancel_current_button.setEnabled(
+            session_available
+            and pending_response
+            and not cancel_in_progress
+            and (not self._task_running or active_audit_task)
+        )
 
         session_ready = session_available and not self._task_running and not running_status
         self.rebuild_final_button.setEnabled(session_ready)
