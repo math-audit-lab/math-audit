@@ -724,6 +724,8 @@ def cancel_pending_response_for_retry(
     session["last_cancelled_pending"] = cancelled_pending
     session["last_response_id"] = response_id
     session["pending"] = None
+    if session.get("pdf_file_id"):
+        session["pdf_attached_in_conversation"] = False
     session["next_chunk_index"] = chunk_index
     session["updated_at"] = now
     save_session(session)
@@ -4382,6 +4384,54 @@ def _extract_code_interpreter_summary(resp_json: dict[str, Any]) -> dict[str, An
     }
 
 
+def _response_failure_error_text(failure_summary: dict[str, Any]) -> str:
+    error = failure_summary.get("error")
+    parts: list[str] = []
+    if isinstance(error, dict):
+        parts.extend(str(error.get(key) or "") for key in ("code", "message"))
+    elif error:
+        parts.append(str(error))
+    parts.extend(
+        str(failure_summary.get(key) or "")
+        for key in ("incomplete_details", "last_error", "status")
+    )
+    return " ".join(part for part in parts if part).strip()
+
+
+def _is_file_download_timeout_failure(failure_summary: dict[str, Any]) -> bool:
+    text = _response_failure_error_text(failure_summary).lower()
+    return "timeout while downloading" in text and "fileserviceuploads" in text
+
+
+def _retryable_response_failure_reason(failure_summary: dict[str, Any]) -> Optional[str]:
+    if _is_file_download_timeout_failure(failure_summary):
+        return "file_download_timeout"
+    return None
+
+
+def _latest_failed_chunk_event(session: dict[str, Any], chunk_id: str) -> dict[str, Any]:
+    log_path = Path(session["workdir"]) / "logs" / "failed_chunks.jsonl"
+    if not log_path.exists():
+        return {}
+    latest: dict[str, Any] = {}
+    for raw in log_path.read_text(encoding="utf-8").splitlines():
+        try:
+            item = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(item, dict) and str(item.get("chunk_id") or "") == chunk_id:
+            latest = item
+    return latest
+
+
+def _should_reattach_pdf_for_chunk_retry(session: dict[str, Any], chunk: dict[str, Any]) -> bool:
+    chunk_id = str(chunk.get("chunk_id") or "")
+    if not chunk_id or not session.get("pdf_file_id"):
+        return False
+    latest_failure = _latest_failed_chunk_event(session, chunk_id)
+    return _retryable_response_failure_reason(latest_failure) == "file_download_timeout"
+
+
 def _pause_audit_after_chunk_failure(
     session: dict[str, Any],
     chunk: dict[str, Any],
@@ -4430,6 +4480,9 @@ def _pause_audit_after_chunk_failure(
         "discovered_during_recovery": bool(discovered_during_recovery),
         "note": note,
     }
+    retryable_reason = _retryable_response_failure_reason(failure_summary)
+    failure_summary["retryable"] = bool(retryable_reason)
+    failure_summary["retryable_reason"] = retryable_reason
     failure_path = root / "responses" / f"{chunk_id}_{response_id}.failure.json"
     save_json(failure_path, failure_summary)
     failure_summary["failure_summary_path"] = str(failure_path)
@@ -4437,19 +4490,25 @@ def _pause_audit_after_chunk_failure(
     session["last_response_id"] = response_id
     session["pending"] = None
     session["next_chunk_index"] = int(chunk.get("chunk_index") or session.get("next_chunk_index") or 1)
+    if retryable_reason == "file_download_timeout":
+        session["pdf_attached_in_conversation"] = False
+        session["last_retryable_failure_reason"] = retryable_reason
     session["updated_at"] = utc_now()
     save_session(session)
     manifest = load_manifest(session)
+    paused_at = utc_now()
     status = load_status(session)
     status.update({
         "status": "paused",
+        "pause_reason": "retryable_response_failure" if retryable_reason else "chunk_failed",
+        "paused_at": paused_at,
         "current_chunk_id": chunk_id,
         "chunks_total": len(manifest.get("chunks", [])),
         "estimated_pages_total": manifest.get("pdf_page_count", 0),
         "current_chunk_elapsed_seconds": 0.0,
         "audit_started_at": session.get("audit_started_at", session.get("created_at")),
         "audit_finished_at": None,
-        "updated_at": utc_now(),
+        "updated_at": paused_at,
     })
     save_status(session, status)
     return failure_summary
@@ -4714,6 +4773,10 @@ def process_one_chunk(
             "verification_mode='code_interpreter' requested, but this session has use_code_interpreter=False. "
             "Enable use_code_interpreter when creating the session or in audit_the_paper(...)."
         )
+    if _should_reattach_pdf_for_chunk_retry(session, chunk):
+        session["pdf_attached_in_conversation"] = False
+        session["updated_at"] = utc_now()
+        save_session(session)
     user_input = _require_prompt_builder()(session, chunk)
     if not session.get("developer_prompt_seeded", False):
         audit_system_prompt = str(session.get("audit_system_prompt") or AUDIT_SYSTEM_PROMPT)
@@ -4875,6 +4938,12 @@ def process_one_chunk(
                 verification_mode="local_python_only",
                 code_interpreter_file_ids=code_interpreter_file_ids,
                 allow_ci_failure_fallback=False,
+            )
+        if failure_summary.get("retryable_reason") == "file_download_timeout":
+            raise RuntimeError(
+                f"Chunk {chunk['chunk_id']} hit a retryable API file-download timeout. "
+                "Resume Audit will retry this chunk and reattach the PDF. "
+                f"See {failure_summary.get('failure_summary_path')} and logs/failed_chunks.jsonl"
             )
         raise RuntimeError(
             f"Chunk {chunk['chunk_id']} ended with status={getattr(resp, 'status', None)}. "

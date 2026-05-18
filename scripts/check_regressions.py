@@ -17,7 +17,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from audit_chunking import ensure_chunk_display_labels, pdf_chunk_display_label
 from audit_policy_hooks import _build_running_audit_context_for_chunk, build_user_message_for_chunk
-from audit_runtime import get_audit_status, get_report_freshness
+from audit_runtime import (
+    _retryable_response_failure_reason,
+    _should_reattach_pdf_for_chunk_retry,
+    get_audit_status,
+    get_report_freshness,
+)
 from audit_state import save_json, session_paths
 
 
@@ -344,6 +349,33 @@ def test_running_audit_context_block() -> None:
         _assert(len(capped_context) <= 504, f"context cap not respected: {len(capped_context)}")
 
 
+def test_retryable_file_download_timeout_detection() -> None:
+    failure = {
+        "chunk_id": "chunk_005",
+        "status": "failed",
+        "error": {
+            "code": "invalid_value",
+            "message": "Timeout while downloading https://fileserviceuploadsperm.blob.core.windows.net/files/file-example",
+        },
+    }
+    _assert(
+        _retryable_response_failure_reason(failure) == "file_download_timeout",
+        "file download timeout was not classified as retryable",
+    )
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_retryable_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        session["pdf_file_id"] = "file-example"
+        _append_jsonl(workdir / "logs" / "failed_chunks.jsonl", failure)
+
+        chunk = {"chunk_id": "chunk_005", "chunk_index": 5}
+        _assert(
+            _should_reattach_pdf_for_chunk_retry(session, chunk),
+            "retryable file download timeout did not request PDF reattachment",
+        )
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -358,6 +390,7 @@ def main() -> int:
         ("PDF display label heuristics", test_pdf_display_labels),
         ("status backfill does not rewrite manifest", test_status_display_label_backfill_does_not_rewrite_manifest),
         ("running audit context block", test_running_audit_context_block),
+        ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),
     ]
     results = [_run_case(name, func) for name, func in cases]
 
