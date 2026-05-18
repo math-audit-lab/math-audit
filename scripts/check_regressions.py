@@ -18,6 +18,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from audit_chunking import ensure_chunk_display_labels, pdf_chunk_display_label
 from audit_policy_hooks import _build_running_audit_context_for_chunk, build_user_message_for_chunk
 from audit_runtime import (
+    FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH,
+    FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY,
+    PDF_TEXT_ONLY_RETRY_NOTE,
+    _file_download_timeout_retry_mode,
     _retryable_response_failure_reason,
     _should_reattach_pdf_for_chunk_retry,
     get_audit_status,
@@ -371,9 +375,46 @@ def test_retryable_file_download_timeout_detection() -> None:
 
         chunk = {"chunk_id": "chunk_005", "chunk_index": 5}
         _assert(
+            _file_download_timeout_retry_mode(session, chunk) == FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH,
+            "first file download timeout did not select PDF reattachment",
+        )
+        _assert(
             _should_reattach_pdf_for_chunk_retry(session, chunk),
             "retryable file download timeout did not request PDF reattachment",
         )
+        second_failure = dict(failure)
+        second_failure["response_id"] = "resp-second-timeout"
+        _append_jsonl(workdir / "logs" / "failed_chunks.jsonl", second_failure)
+        _assert(
+            _file_download_timeout_retry_mode(session, chunk) == FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY,
+            "repeated file download timeout did not select text-only fallback",
+        )
+
+        text_only_chunk = {
+            "chunk_id": "chunk_005",
+            "chunk_index": 5,
+            "label": "PDF pages 5-5",
+            "boundary": "pages 5-5",
+            "source_kind": "pdf",
+            "page_start": 5,
+            "page_end": 5,
+            "chunk_text": "Lemma 5. This is extracted chunk text for a text-only retry.",
+            "_suppress_pdf_attachment": True,
+            "_pdf_text_only_retry": True,
+            "_pdf_attachment_disabled_note": PDF_TEXT_ONLY_RETRY_NOTE,
+        }
+        message = build_user_message_for_chunk(session, text_only_chunk)
+        content = message[0]["content"]
+        _assert(
+            not any(isinstance(part, dict) and part.get("type") == "input_file" for part in content),
+            "text-only retry still attached the PDF",
+        )
+        prompt_text = "\n".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "input_text"
+        )
+        _assert(PDF_TEXT_ONLY_RETRY_NOTE in prompt_text, "text-only retry caution note missing from prompt")
 
 
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:

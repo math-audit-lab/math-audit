@@ -74,6 +74,14 @@ _DISPLAY_AUDIT_HOOK: Optional[Callable[[dict[str, Any]], None]] = None
 LEGACY_QA_THREAD_ID = "thread_legacy"
 QA_CONTEXT_MODES = ("reduced_audit_context", "full_audit_context")
 DEFAULT_QA_CONTEXT_MODE = "full_audit_context"
+PDF_TEXT_ONLY_RETRY_NOTE = (
+    "PDF attachment disabled for this retry due to repeated API file-download timeout. "
+    "Rely on extracted chunk text, reference-map/page metadata, and running audit context. "
+    "Do not overclaim visual PDF/reference precision."
+)
+FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_NONE = "none"
+FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH = "reattach_pdf"
+FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY = "text_only_fresh_conversation"
 
 
 def _normalize_qa_context_mode(qa_context_mode: Optional[str] = None) -> str:
@@ -4337,6 +4345,12 @@ def _save_request_metadata(
         "audit_system_prompt_metadata": session.get("audit_system_prompt_metadata"),
         "request": to_jsonable(request_kwargs),
     }
+    if chunk.get("_pdf_text_only_retry"):
+        payload["pdf_attachment"] = {
+            "disabled": True,
+            "reason": "repeated_file_download_timeout",
+            "note": chunk.get("_pdf_attachment_disabled_note") or PDF_TEXT_ONLY_RETRY_NOTE,
+        }
     if chunk.get("_rerun_id") or chunk.get("_extra_rerun_instruction"):
         payload["rerun"] = {
             "rerun_id": chunk.get("_rerun_id"),
@@ -4409,27 +4423,52 @@ def _retryable_response_failure_reason(failure_summary: dict[str, Any]) -> Optio
     return None
 
 
-def _latest_failed_chunk_event(session: dict[str, Any], chunk_id: str) -> dict[str, Any]:
+def _failed_chunk_events(session: dict[str, Any], chunk_id: str) -> list[dict[str, Any]]:
     log_path = Path(session["workdir"]) / "logs" / "failed_chunks.jsonl"
     if not log_path.exists():
-        return {}
-    latest: dict[str, Any] = {}
+        return []
+    events: list[dict[str, Any]] = []
     for raw in log_path.read_text(encoding="utf-8").splitlines():
         try:
             item = json.loads(raw)
         except Exception:
             continue
         if isinstance(item, dict) and str(item.get("chunk_id") or "") == chunk_id:
-            latest = item
-    return latest
+            events.append(item)
+    return events
+
+
+def _file_download_timeout_retry_mode(session: dict[str, Any], chunk: dict[str, Any]) -> str:
+    chunk_id = str(chunk.get("chunk_id") or "")
+    if not chunk_id or not session.get("pdf_file_id"):
+        return FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_NONE
+    failures = _failed_chunk_events(session, chunk_id)
+    if not failures:
+        return FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_NONE
+    latest_failure = failures[-1]
+    if _retryable_response_failure_reason(latest_failure) != "file_download_timeout":
+        return FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_NONE
+    timeout_count = _file_download_timeout_failure_count(session, chunk_id, failures=failures)
+    if timeout_count >= 2:
+        return FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY
+    return FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH
+
+
+def _file_download_timeout_failure_count(
+    session: dict[str, Any],
+    chunk_id: str,
+    failures: Optional[list[dict[str, Any]]] = None,
+) -> int:
+    events = failures if failures is not None else _failed_chunk_events(session, chunk_id)
+    return sum(
+        1
+        for failure in events
+        if _retryable_response_failure_reason(failure) == "file_download_timeout"
+    )
 
 
 def _should_reattach_pdf_for_chunk_retry(session: dict[str, Any], chunk: dict[str, Any]) -> bool:
-    chunk_id = str(chunk.get("chunk_id") or "")
-    if not chunk_id or not session.get("pdf_file_id"):
-        return False
-    latest_failure = _latest_failed_chunk_event(session, chunk_id)
-    return _retryable_response_failure_reason(latest_failure) == "file_download_timeout"
+    return _file_download_timeout_retry_mode(session, chunk) == FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH
 
 
 def _pause_audit_after_chunk_failure(
@@ -4480,9 +4519,19 @@ def _pause_audit_after_chunk_failure(
         "discovered_during_recovery": bool(discovered_during_recovery),
         "note": note,
     }
+    if chunk.get("_pdf_text_only_retry"):
+        failure_summary["pdf_attachment"] = {
+            "disabled": True,
+            "reason": "repeated_file_download_timeout",
+            "note": chunk.get("_pdf_attachment_disabled_note") or PDF_TEXT_ONLY_RETRY_NOTE,
+        }
     retryable_reason = _retryable_response_failure_reason(failure_summary)
     failure_summary["retryable"] = bool(retryable_reason)
     failure_summary["retryable_reason"] = retryable_reason
+    if retryable_reason == "file_download_timeout":
+        failure_summary["same_chunk_file_download_timeout_count"] = (
+            _file_download_timeout_failure_count(session, chunk_id) + 1
+        )
     failure_path = root / "responses" / f"{chunk_id}_{response_id}.failure.json"
     save_json(failure_path, failure_summary)
     failure_summary["failure_summary_path"] = str(failure_path)
@@ -4702,6 +4751,12 @@ def finalize_chunk(
         "verification_summary": verification_summary,
         "verification_path": str(verification_path) if verification_path else None,
     }
+    if chunk.get("_pdf_text_only_retry"):
+        record["pdf_attachment"] = {
+            "disabled": True,
+            "reason": "repeated_file_download_timeout",
+            "note": chunk.get("_pdf_attachment_disabled_note") or PDF_TEXT_ONLY_RETRY_NOTE,
+        }
     append_jsonl(session_paths(session["workdir"])["chunk_records"], record)
     latest_session = _resolve_session(session["pdf_path"]) if session.get("pdf_path") else session
     if session.get("code_interpreter_container_id"):
@@ -4710,7 +4765,7 @@ def finalize_chunk(
     latest_session["next_chunk_index"] = chunk["chunk_index"] + 1
     latest_session["pending"] = None
     latest_session["updated_at"] = utc_now()
-    latest_session["pdf_attached_in_conversation"] = True
+    latest_session["pdf_attached_in_conversation"] = not bool(chunk.get("_pdf_text_only_retry"))
     latest_session["developer_prompt_seeded"] = True
     if chunk["chunk_index"] >= len(load_manifest(latest_session)["chunks"]):
         latest_session["audit_finished_at"] = utc_now()
@@ -4773,7 +4828,28 @@ def process_one_chunk(
             "verification_mode='code_interpreter' requested, but this session has use_code_interpreter=False. "
             "Enable use_code_interpreter when creating the session or in audit_the_paper(...)."
         )
-    if _should_reattach_pdf_for_chunk_retry(session, chunk):
+    file_timeout_retry_mode = _file_download_timeout_retry_mode(session, chunk)
+    if file_timeout_retry_mode == FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY:
+        previous_conversation_id = str(session.get("conversation_id") or "")
+        conversation = _get_client().conversations.create()
+        session["conversation_id"] = conversation.id
+        session["pdf_attached_in_conversation"] = False
+        session["developer_prompt_seeded"] = False
+        session["last_text_only_file_timeout_retry"] = {
+            "chunk_id": chunk.get("chunk_id"),
+            "started_at": utc_now(),
+            "previous_conversation_id": previous_conversation_id,
+            "conversation_id": conversation.id,
+            "reason": "repeated_file_download_timeout",
+            "note": PDF_TEXT_ONLY_RETRY_NOTE,
+        }
+        session["updated_at"] = utc_now()
+        save_session(session)
+        chunk = dict(chunk)
+        chunk["_pdf_text_only_retry"] = True
+        chunk["_suppress_pdf_attachment"] = True
+        chunk["_pdf_attachment_disabled_note"] = PDF_TEXT_ONLY_RETRY_NOTE
+    elif file_timeout_retry_mode == FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH:
         session["pdf_attached_in_conversation"] = False
         session["updated_at"] = utc_now()
         save_session(session)
@@ -4869,6 +4945,9 @@ def process_one_chunk(
         "used_code_interpreter_tool": used_code_interpreter_tool,
         "request_path": request_path,
     }
+    if chunk.get("_pdf_text_only_retry"):
+        session["pending"]["pdf_text_only_retry"] = True
+        session["pending"]["pdf_attachment_disabled_note"] = PDF_TEXT_ONLY_RETRY_NOTE
     session["updated_at"] = utc_now()
     save_session(session)
     manifest = load_manifest(session)
@@ -4940,9 +5019,15 @@ def process_one_chunk(
                 allow_ci_failure_fallback=False,
             )
         if failure_summary.get("retryable_reason") == "file_download_timeout":
+            timeout_count = int(failure_summary.get("same_chunk_file_download_timeout_count") or 0)
+            next_retry = (
+                "Resume Audit will retry this chunk in a fresh text-only conversation with degraded PDF visual/reference context."
+                if timeout_count >= 2
+                else "Resume Audit will retry this chunk and reattach the PDF."
+            )
             raise RuntimeError(
                 f"Chunk {chunk['chunk_id']} hit a retryable API file-download timeout. "
-                "Resume Audit will retry this chunk and reattach the PDF. "
+                f"{next_retry} "
                 f"See {failure_summary.get('failure_summary_path')} and logs/failed_chunks.jsonl"
             )
         raise RuntimeError(
@@ -4983,6 +5068,11 @@ def recover_pending_chunk(
     if not matches:
         return None
     chunk = matches[0]
+    if pending.get("pdf_text_only_retry"):
+        chunk = dict(chunk)
+        chunk["_pdf_text_only_retry"] = True
+        chunk["_suppress_pdf_attachment"] = True
+        chunk["_pdf_attachment_disabled_note"] = pending.get("pdf_attachment_disabled_note") or PDF_TEXT_ONLY_RETRY_NOTE
     structured_path = Path(session["workdir"]) / "responses" / f"{chunk_id}.structured.json"
     if structured_path.exists():
         session["pending"] = None

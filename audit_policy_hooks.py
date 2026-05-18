@@ -26,6 +26,7 @@ from audit_verification import (
     load_verification_state,
 )
 from audit_runtime import (
+    PDF_TEXT_ONLY_RETRY_NOTE,
     _coerce_audit_payload,
     _ensure_timing_state,
     _normalize_python_check_entry,
@@ -815,7 +816,8 @@ def _build_running_audit_context_for_chunk(
 
 def build_user_message_for_chunk(session: dict[str, Any], chunk: dict[str, Any]) -> list[dict[str, Any]]:
     content = []
-    if not session.get("pdf_attached_in_conversation", False):
+    suppress_pdf_attachment = bool(chunk.get("_suppress_pdf_attachment"))
+    if not suppress_pdf_attachment and not session.get("pdf_attached_in_conversation", False):
         content.append({"type": "input_file", "file_id": session["pdf_file_id"]})
 
     style = _normalize_reference_mention_style(session.get("reference_mention_style", "auto"))
@@ -841,6 +843,10 @@ def build_user_message_for_chunk(session: dict[str, Any], chunk: dict[str, Any])
             "\nAdditional user guidance for this rerun only:\n"
             f"{extra_rerun_instruction}\n"
         )
+    pdf_attachment_note = ""
+    if suppress_pdf_attachment:
+        note = normalize_whitespace(str(chunk.get("_pdf_attachment_disabled_note") or PDF_TEXT_ONLY_RETRY_NOTE))
+        pdf_attachment_note = f"\nPDF attachment note for this retry:\n{note}\n"
     running_context = _build_running_audit_context_for_chunk(session, chunk)
     prompt_text = f"""Audit this mathematics-paper chunk rigorously.
 
@@ -869,6 +875,7 @@ Do NOT reuse source-local numbering from pasted TeX unless the reference guidanc
 Reference guidance for this chunk:
 {ref_context}
 {rerun_guidance}
+{pdf_attachment_note}
 {running_context}
 
 Chunk text:
