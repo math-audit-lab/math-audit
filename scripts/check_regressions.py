@@ -353,6 +353,84 @@ def test_running_audit_context_block() -> None:
         _assert(len(capped_context) <= 504, f"context cap not respected: {len(capped_context)}")
 
 
+def test_tex_macro_glossary_in_chunk_prompt() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_macros_") as tmp:
+        tmp_path = Path(tmp)
+        workdir = tmp_path / "paper_audit"
+        session = _seed_state(workdir)
+        tex_path = tmp_path / "paper.tex"
+        _write_text(
+            tex_path,
+            r"""
+\documentclass{article}
+\newcommand{\Lpa}[1]{\left(#1\right)}
+\newcommand{\lpa}[1]{(#1)}
+\newcommand{\Unused}[1]{\mathbf{#1}}
+\DeclareRobustCommand{\Stirling}[2]{\left\{#1\atop #2\right\}}
+\DeclareMathOperator{\Var}{Var}
+\def\tr#1{\lfloor #1\rfloor}
+\newcommand{\unsafe}[1]{\begin{tikzpicture}#1\end{tikzpicture}}
+\begin{document}
+""",
+        )
+        session["tex_path"] = str(tex_path)
+        session["pdf_attached_in_conversation"] = True
+        paths = session_paths(workdir)
+        _write_json(
+            paths["ledger"],
+            {
+                "assumptions": ["Previous chunks use $\\tr{x}$ for the floor of $x$."],
+                "notes": [],
+                "updated_at": NEW,
+            },
+        )
+
+        chunk = {
+            "chunk_id": "chunk_002",
+            "chunk_index": 2,
+            "label": "TeX chunk 2",
+            "boundary": "Approx. pages 2-2 based on TeX order",
+            "source_kind": "tex",
+            "page_start": 2,
+            "page_end": 2,
+            "chunk_text": r"The estimate uses $\Lpa{1+x}$, $\lpa{1+y}$, and $\Stirling{n}{k}$.",
+        }
+        message = build_user_message_for_chunk(session, chunk)
+        prompt_text = "\n".join(
+            str(part.get("text") or "")
+            for part in message[0]["content"]
+            if isinstance(part, dict) and part.get("type") == "input_text"
+        )
+        glossary_index = prompt_text.find("Paper macro glossary for this chunk:")
+        chunk_text_index = prompt_text.find("Chunk text:")
+        _assert(glossary_index >= 0, "macro glossary block was not inserted")
+        _assert(chunk_text_index > glossary_index, "macro glossary does not appear before chunk text")
+        _assert(r"\newcommand{\Lpa}" in prompt_text, "used macro \\Lpa missing from glossary")
+        _assert(r"\newcommand{\lpa}" in prompt_text, "used macro \\lpa missing from glossary")
+        _assert(r"\DeclareRobustCommand{\Stirling}" in prompt_text, "used macro \\Stirling missing from glossary")
+        _assert(r"\def\tr" in prompt_text, "running-context macro \\tr missing from glossary")
+        _assert(r"\Unused" not in prompt_text, "unused macro leaked into glossary")
+        _assert("tikzpicture" not in prompt_text, "unsafe macro leaked into glossary")
+
+        pdf_chunk = dict(chunk)
+        pdf_chunk["source_kind"] = "pdf"
+        pdf_prompt = "\n".join(
+            str(part.get("text") or "")
+            for part in build_user_message_for_chunk(session, pdf_chunk)[0]["content"]
+            if isinstance(part, dict) and part.get("type") == "input_text"
+        )
+        _assert("Paper macro glossary for this chunk:" not in pdf_prompt, "PDF chunk unexpectedly received macro glossary")
+
+        no_tex_session = dict(session)
+        no_tex_session["tex_path"] = None
+        no_tex_prompt = "\n".join(
+            str(part.get("text") or "")
+            for part in build_user_message_for_chunk(no_tex_session, chunk)[0]["content"]
+            if isinstance(part, dict) and part.get("type") == "input_text"
+        )
+        _assert("Paper macro glossary for this chunk:" not in no_tex_prompt, "no-TeX session received macro glossary")
+
+
 def test_retryable_file_download_timeout_detection() -> None:
     failure = {
         "chunk_id": "chunk_005",
@@ -431,6 +509,7 @@ def main() -> int:
         ("PDF display label heuristics", test_pdf_display_labels),
         ("status backfill does not rewrite manifest", test_status_display_label_backfill_does_not_rewrite_manifest),
         ("running audit context block", test_running_audit_context_block),
+        ("TeX macro glossary prompt block", test_tex_macro_glossary_in_chunk_prompt),
         ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),
     ]
     results = [_run_case(name, func) for name, func in cases]

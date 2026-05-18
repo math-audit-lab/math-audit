@@ -692,6 +692,153 @@ def _load_record_audit_for_running_context(rec: dict[str, Any]) -> dict[str, Any
         return {}
 
 
+_LATEX_COMMAND_NAME_RE = re.compile(r"(?<!\\)\\([A-Za-z@]+)\b")
+_TEX_MACRO_GLOSSARY_UNSAFE_TOKENS = (
+    r"\write18",
+    r"\openout",
+    r"\input",
+    r"\include",
+    r"\catcode",
+    r"\read",
+    r"\documentclass",
+    r"\usepackage",
+    r"\graphicspath",
+    r"\bibliography",
+    r"\bibliographystyle",
+    r"\begin",
+    r"\end",
+    r"\newtheorem",
+    r"\hypersetup",
+    r"\makeatletter",
+    r"\makeatother",
+    r"\maketitle",
+    r"\author",
+    r"\title",
+    r"\date",
+    r"\section",
+    r"\subsection",
+    "tikzpicture",
+)
+
+
+def _latex_command_names(text: str) -> set[str]:
+    return set(_LATEX_COMMAND_NAME_RE.findall(str(text or "")))
+
+
+def _macro_name_from_definition_start(line: str) -> Optional[str]:
+    patterns = [
+        r"^\s*\\def\s*\\([A-Za-z@]+)\b",
+        r"^\s*\\(?:newcommand|renewcommand|providecommand|DeclareRobustCommand)\*?\s*(?:\{\\([A-Za-z@]+)\}|\\([A-Za-z@]+))",
+        r"^\s*\\DeclareMathOperator\*?\s*(?:\{\\([A-Za-z@]+)\}|\\([A-Za-z@]+))",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, line)
+        if match:
+            return next((group for group in match.groups() if group), None)
+    return None
+
+
+def _tex_macro_definition_is_safe(block: str, max_definition_chars: int = 700) -> bool:
+    text = str(block or "").strip()
+    if not text or len(text) > max_definition_chars:
+        return False
+    return not any(token in text for token in _TEX_MACRO_GLOSSARY_UNSAFE_TOKENS)
+
+
+def _extract_tex_macro_definitions(tex_path: str | Path | None) -> list[tuple[str, str]]:
+    if not tex_path:
+        return []
+    path = Path(tex_path)
+    if not path.exists():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        try:
+            text = path.read_text(encoding="latin-1")
+        except Exception:
+            return []
+
+    preamble = strip_tex_comments(text.split(r"\begin{document}", 1)[0])
+    definitions: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    collecting = False
+    current: list[str] = []
+    current_name: Optional[str] = None
+    balance = 0
+
+    def flush_current() -> None:
+        nonlocal collecting, current, current_name, balance
+        if current_name and current:
+            block = normalize_whitespace("\n".join(current))
+            if current_name not in seen and _tex_macro_definition_is_safe(block):
+                definitions.append((current_name, block))
+                seen.add(current_name)
+        collecting = False
+        current = []
+        current_name = None
+        balance = 0
+
+    for line in preamble.splitlines():
+        if not collecting:
+            name = _macro_name_from_definition_start(line)
+            if not name:
+                continue
+            collecting = True
+            current_name = name
+            current = [line]
+            balance = line.count("{") - line.count("}")
+            if balance <= 0:
+                flush_current()
+            continue
+
+        current.append(line)
+        balance += line.count("{") - line.count("}")
+        if balance <= 0:
+            flush_current()
+
+    if collecting:
+        flush_current()
+    return definitions
+
+
+def _build_tex_macro_glossary_for_chunk(
+    session: dict[str, Any],
+    chunk: dict[str, Any],
+    context_text: str = "",
+    max_chars: int = 4000,
+) -> str:
+    source_kind = str(chunk.get("source_kind") or "").lower()
+    if not source_kind.startswith("tex"):
+        return ""
+
+    definitions = _extract_tex_macro_definitions(session.get("tex_path"))
+    if not definitions:
+        return ""
+
+    used_names = _latex_command_names(str(chunk.get("chunk_text") or "") + "\n" + str(context_text or ""))
+    selected = [(name, definition) for name, definition in definitions if name in used_names]
+    if not selected:
+        return ""
+
+    lines = [
+        "Paper macro glossary for this chunk:",
+        "Use this only as source-syntax aid, not as independent mathematical truth.",
+    ]
+    omitted = False
+    for name, definition in selected:
+        line = f"- \\{name}: {definition}"
+        candidate = "\n".join(lines + [line, "End paper macro glossary."])
+        if len(candidate) > max_chars:
+            omitted = True
+            break
+        lines.append(line)
+    if omitted:
+        lines.append("- Additional relevant macro definitions omitted by glossary size cap.")
+    lines.append("End paper macro glossary.")
+    return _truncate_text(_strip_unsafe_control_chars("\n".join(lines).strip()), limit=max_chars)
+
+
 def _build_running_audit_context_for_chunk(
     session: dict[str, Any],
     chunk: dict[str, Any],
@@ -848,6 +995,7 @@ def build_user_message_for_chunk(session: dict[str, Any], chunk: dict[str, Any])
         note = normalize_whitespace(str(chunk.get("_pdf_attachment_disabled_note") or PDF_TEXT_ONLY_RETRY_NOTE))
         pdf_attachment_note = f"\nPDF attachment note for this retry:\n{note}\n"
     running_context = _build_running_audit_context_for_chunk(session, chunk)
+    macro_glossary = _build_tex_macro_glossary_for_chunk(session, chunk, context_text=running_context)
     prompt_text = f"""Audit this mathematics-paper chunk rigorously.
 
 Chunk label: {chunk['label']}
@@ -877,6 +1025,7 @@ Reference guidance for this chunk:
 {rerun_guidance}
 {pdf_attachment_note}
 {running_context}
+{macro_glossary}
 
 Chunk text:
 {chunk['chunk_text']}
