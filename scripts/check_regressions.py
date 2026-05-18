@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from audit_chunking import ensure_chunk_display_labels, pdf_chunk_display_label
+from audit_policy_hooks import _build_running_audit_context_for_chunk, build_user_message_for_chunk
 from audit_runtime import get_audit_status, get_report_freshness
 from audit_state import save_json, session_paths
 
@@ -236,6 +237,113 @@ def test_status_display_label_backfill_does_not_rewrite_manifest() -> None:
         _assert(all(chunk.get("display_label") for chunk in payload_chunks), "status payload did not backfill labels")
 
 
+def test_running_audit_context_block() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_context_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        session["pdf_attached_in_conversation"] = True
+        session["tex_path"] = None
+        paths = session_paths(workdir)
+        _write_json(paths["session"], session)
+        _write_json(
+            paths["ledger"],
+            {
+                "assumptions": [
+                    "Throughout the previous argument, $n$ tends to infinity with $r$ fixed.",
+                    "The function $G$ denotes the normalized generating function introduced in chunk_001.",
+                ],
+                "notes": [
+                    "Definition note: admissible weights are assumed nonnegative unless explicitly stated otherwise.",
+                    "Dependency note: Lemma 1 is used to justify the saddle-point localization.",
+                ],
+                "updated_at": NEW,
+            },
+        )
+        _write_json(
+            paths["issues"],
+            {
+                "next_issue_id": 2,
+                "issues": [
+                    {
+                        "issue_id": "ISSUE-001",
+                        "status": "open",
+                        "severity": "critical",
+                        "chunk_id": "chunk_001",
+                        "title": "Uniformity gap in Lemma 1",
+                        "location": "Lemma 1",
+                        "description": "The bound is used later outside the stated compact regime.",
+                        "evidence": "The proof only treats bounded $t$.",
+                        "proposed_fix": "State and prove the uniform range.",
+                        "tags": ["dependency-gap"],
+                    }
+                ],
+                "updated_at": NEW,
+            },
+        )
+        structured_path = workdir / "responses" / "chunk_001.structured.json"
+        _write_json(
+            structured_path,
+            {
+                "label": "chunk_001",
+                "boundary": "pages 1-2",
+                "chunk_too_large": False,
+                "chunk_split_suggestions": [],
+                "assumptions_and_notation": ["Notation: $G(z)$ is the normalized generating function."],
+                "verified_steps": ["Lemma 1 is used as the localization input for later asymptotics."],
+                "issues": [],
+                "python_checks": [],
+                "latex_patch": "",
+                "ledger_updates": {"assumptions": [], "notes": []},
+                "next_boundary_hint": "Next chunk begins the main saddle-point estimate.",
+                "confidence": "medium",
+            },
+        )
+        _append_jsonl(
+            paths["chunk_records"],
+            {
+                "time": OLD,
+                "chunk_id": "chunk_001",
+                "chunk_index": 1,
+                "label": "PDF pages 1-2: Lemma 1",
+                "boundary": "pages 1-2",
+                "source_kind": "pdf",
+                "page_start": 1,
+                "page_end": 2,
+                "structured_response_path": str(structured_path),
+                "issue_ids": ["ISSUE-001"],
+            },
+        )
+
+        chunk = {
+            "chunk_id": "chunk_002",
+            "chunk_index": 2,
+            "label": "PDF pages 3-4: Main estimate",
+            "boundary": "pages 3-4",
+            "source_kind": "pdf",
+            "page_start": 3,
+            "page_end": 4,
+            "chunk_text": "The main estimate now applies Lemma 1 to the sequence under study.",
+        }
+        message = build_user_message_for_chunk(session, chunk)
+        text_parts = [
+            part.get("text", "")
+            for part in message[0]["content"]
+            if isinstance(part, dict) and part.get("type") == "input_text"
+        ]
+        prompt_text = "\n".join(text_parts)
+        context_index = prompt_text.find("Running audit context from earlier chunks:")
+        chunk_text_index = prompt_text.find("Chunk text:")
+        _assert(context_index >= 0, "running context block was not inserted")
+        _assert(chunk_text_index > context_index, "running context block does not appear before chunk text")
+        _assert("Throughout the previous argument" in prompt_text, "ledger assumption missing from context")
+        _assert("Notation: $G(z)$" in prompt_text, "recent chunk notation missing from context")
+        _assert("ISSUE-001" in prompt_text and "Uniformity gap" in prompt_text, "priority issue missing from context")
+        _assert("Do not overclaim exact theorem/equation labels" in prompt_text, "PDF-only precision caution missing")
+
+        capped_context = _build_running_audit_context_for_chunk(session, chunk, max_chars=500)
+        _assert(len(capped_context) <= 504, f"context cap not respected: {len(capped_context)}")
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -249,6 +357,7 @@ def main() -> int:
         ("report freshness detection", test_report_freshness_detection),
         ("PDF display label heuristics", test_pdf_display_labels),
         ("status backfill does not rewrite manifest", test_status_display_label_backfill_does_not_rewrite_manifest),
+        ("running audit context block", test_running_audit_context_block),
     ]
     results = [_run_case(name, func) for name, func in cases]
 

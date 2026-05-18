@@ -660,6 +660,159 @@ def _reference_prompt_rule_for_style(style: str) -> str:
     )
 
 
+def _running_context_items(items: Any, limit: int, item_limit: int = 260) -> list[str]:
+    out: list[str] = []
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        text = normalize_whitespace(str(item or ""))
+        if not text:
+            continue
+        out.append(_truncate_text(text, limit=item_limit))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _chunk_index_value(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _load_record_audit_for_running_context(rec: dict[str, Any]) -> dict[str, Any]:
+    path_text = str(rec.get("structured_response_path") or "").strip()
+    if not path_text:
+        return {}
+    try:
+        return _coerce_audit_payload(load_json(path_text))
+    except Exception:
+        return {}
+
+
+def _build_running_audit_context_for_chunk(
+    session: dict[str, Any],
+    chunk: dict[str, Any],
+    max_chars: int = 7000,
+) -> str:
+    """Build a compact saved-state context block for the next chunk prompt."""
+
+    lines = [
+        "Running audit context from earlier chunks:",
+        "Use this compact saved-state context conservatively; the current chunk text below is authoritative.",
+    ]
+    has_context = False
+
+    source_kind = str(chunk.get("source_kind") or "").lower()
+    if not session.get("tex_path") or source_kind.startswith("pdf"):
+        lines.append(
+            "- PDF/reference precision note: TeX, AUX, or source labels may be unavailable or incomplete. "
+            "Do not overclaim exact theorem/equation labels; use visible PDF numbering or approximate page/chunk locations when needed."
+        )
+
+    try:
+        ledger = load_ledger(session)
+    except Exception:
+        ledger = {}
+
+    assumptions = _running_context_items((ledger or {}).get("assumptions"), limit=8, item_limit=260)
+    notes = _running_context_items((ledger or {}).get("notes"), limit=6, item_limit=260)
+    if assumptions:
+        has_context = True
+        lines.extend(["", "Standing assumptions / regimes / notation from the saved ledger:"])
+        lines.extend(f"- {item}" for item in assumptions)
+    if notes:
+        has_context = True
+        lines.extend(["", "Ledger notes that may affect later chunks:"])
+        lines.extend(f"- {item}" for item in notes)
+
+    current_index = _chunk_index_value(chunk.get("chunk_index"))
+    try:
+        records = _read_chunk_records(session)
+    except Exception:
+        records = []
+    prior_records = []
+    for rec in records:
+        rec_index = _chunk_index_value(rec.get("chunk_index"))
+        if current_index is not None and rec_index is not None and rec_index >= current_index:
+            continue
+        prior_records.append(rec)
+    prior_records.sort(key=lambda rec: (_chunk_index_value(rec.get("chunk_index")) or 0, str(rec.get("chunk_id") or "")))
+    recent_records = prior_records[-4:]
+    if recent_records:
+        has_context = True
+        lines.extend(["", "Recent chunk context:"])
+        for rec in recent_records:
+            audit = _load_record_audit_for_running_context(rec)
+            heading = " | ".join(
+                part
+                for part in [
+                    str(rec.get("chunk_id") or ""),
+                    normalize_whitespace(str(rec.get("label") or rec.get("boundary") or "")),
+                    f"pages {rec.get('page_start', '')}-{rec.get('page_end', '')}",
+                ]
+                if part.strip()
+            )
+            lines.append(f"- {heading}")
+            recent_assumptions = _running_context_items(audit.get("assumptions_and_notation"), limit=2, item_limit=170)
+            if recent_assumptions:
+                lines.append("  assumptions/notation: " + "; ".join(recent_assumptions))
+            recent_verified = _running_context_items(audit.get("verified_steps"), limit=1, item_limit=180)
+            if recent_verified:
+                lines.append("  verified/contextual step: " + recent_verified[0])
+            hint = normalize_whitespace(str(audit.get("next_boundary_hint") or ""))
+            if hint:
+                lines.append("  next-boundary hint: " + _truncate_text(hint, limit=180))
+
+    try:
+        issues_state = load_issues(session)
+    except Exception:
+        issues_state = {}
+    issue_chunk_indices = {
+        str(rec.get("chunk_id") or ""): _chunk_index_value(rec.get("chunk_index"))
+        for rec in records
+        if str(rec.get("chunk_id") or "")
+    }
+    priority_issues = []
+    for issue in (issues_state.get("issues") or []):
+        if not isinstance(issue, dict):
+            continue
+        severity = normalize_whitespace(str(issue.get("severity") or "")).lower()
+        status = normalize_whitespace(str(issue.get("status") or "open")).lower()
+        if severity not in {"critical", "high"} or status == "resolved":
+            continue
+        issue_chunk_id = str(issue.get("chunk_id") or "")
+        issue_index = issue_chunk_indices.get(issue_chunk_id)
+        if current_index is not None and issue_index is not None and issue_index >= current_index:
+            continue
+        priority_issues.append(issue)
+    if priority_issues:
+        has_context = True
+        severity_rank = {"critical": 0, "high": 1}
+        priority_issues.sort(
+            key=lambda issue: (
+                severity_rank.get(normalize_whitespace(str(issue.get("severity") or "")).lower(), 9),
+                str(issue.get("chunk_id") or ""),
+                str(issue.get("issue_id") or ""),
+            )
+        )
+        lines.extend(["", "Open critical/high issues that may affect later chunks:"])
+        for issue in priority_issues[:6]:
+            lines.extend(
+                [
+                    f"- {issue.get('issue_id', 'issue')} | {issue.get('severity', 'high')} | {issue.get('title', '')}",
+                    f"  chunk: {issue.get('chunk_id', '')}; location: {_truncate_text(str(issue.get('location') or ''), limit=180)}",
+                    f"  impact: {_truncate_text(str(issue.get('description') or ''), limit=240)}",
+                ]
+            )
+
+    if not has_context:
+        lines.append("- No prior running context has been recorded yet.")
+    lines.append("End running audit context.")
+    return _truncate_text(_strip_unsafe_control_chars("\n".join(lines).strip()), limit=max_chars)
+
+
 def build_user_message_for_chunk(session: dict[str, Any], chunk: dict[str, Any]) -> list[dict[str, Any]]:
     content = []
     if not session.get("pdf_attached_in_conversation", False):
@@ -688,6 +841,7 @@ def build_user_message_for_chunk(session: dict[str, Any], chunk: dict[str, Any])
             "\nAdditional user guidance for this rerun only:\n"
             f"{extra_rerun_instruction}\n"
         )
+    running_context = _build_running_audit_context_for_chunk(session, chunk)
     prompt_text = f"""Audit this mathematics-paper chunk rigorously.
 
 Chunk label: {chunk['label']}
@@ -715,6 +869,7 @@ Do NOT reuse source-local numbering from pasted TeX unless the reference guidanc
 Reference guidance for this chunk:
 {ref_context}
 {rerun_guidance}
+{running_context}
 
 Chunk text:
 {chunk['chunk_text']}
