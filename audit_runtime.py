@@ -4343,6 +4343,7 @@ def _save_request_metadata(
         "used_code_interpreter_tool": bool(used_code_interpreter_tool),
         "code_interpreter_file_ids": list(code_interpreter_file_ids or []),
         "audit_system_prompt_metadata": session.get("audit_system_prompt_metadata"),
+        "request_size_diagnostics": _audit_request_size_diagnostics(session, chunk, request_kwargs),
         "request": to_jsonable(request_kwargs),
     }
     if chunk.get("_pdf_text_only_retry"):
@@ -4627,6 +4628,103 @@ def _build_code_interpreter_tools(
     if include_memory_limit and memory_limit:
         container["memory_limit"] = str(memory_limit)
     return [{"type": "code_interpreter", "container": container}]
+
+
+def _request_input_text_parts(request_kwargs: dict[str, Any], role: Optional[str] = None) -> list[str]:
+    input_payload = request_kwargs.get("input")
+    if not isinstance(input_payload, list):
+        return []
+    out: list[str] = []
+    for message in input_payload:
+        if not isinstance(message, dict):
+            continue
+        if role is not None and message.get("role") != role:
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "input_text":
+                out.append(str(item.get("text") or ""))
+    return out
+
+
+def _request_includes_pdf_attachment(request_kwargs: dict[str, Any]) -> bool:
+    input_payload = request_kwargs.get("input")
+    if not isinstance(input_payload, list):
+        return False
+    for message in input_payload:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "input_file":
+                return True
+    return False
+
+
+def _prompt_section_length(text: str, start_marker: str, end_markers: list[str]) -> int:
+    start = text.find(start_marker)
+    if start < 0:
+        return 0
+    end_candidates = [
+        idx
+        for marker in end_markers
+        if (idx := text.find(marker, start + len(start_marker))) >= 0
+    ]
+    end = min(end_candidates) if end_candidates else len(text)
+    return len(text[start:end].strip())
+
+
+def _audit_request_size_diagnostics(
+    session: dict[str, Any],
+    chunk: dict[str, Any],
+    request_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    developer_texts = _request_input_text_parts(request_kwargs, role="developer")
+    user_texts = _request_input_text_parts(request_kwargs, role="user")
+    user_prompt_text = "\n".join(user_texts)
+    system_prompt = str(session.get("audit_system_prompt") or AUDIT_SYSTEM_PROMPT)
+    text_only_retry = bool(chunk.get("_pdf_text_only_retry") or chunk.get("_suppress_pdf_attachment"))
+    developer_prompt_included = bool(developer_texts)
+    conversation_state = "reused_seeded_conversation"
+    if text_only_retry:
+        conversation_state = "fresh_text_only_retry_conversation"
+    elif developer_prompt_included:
+        conversation_state = "unseeded_or_new_conversation"
+
+    previous_conversation_id = None
+    last_text_only = session.get("last_text_only_file_timeout_retry")
+    if text_only_retry and isinstance(last_text_only, dict) and last_text_only.get("chunk_id") == chunk.get("chunk_id"):
+        previous_conversation_id = last_text_only.get("previous_conversation_id")
+
+    return {
+        "audit_system_prompt_length": len(system_prompt),
+        "developer_prompt_included": developer_prompt_included,
+        "developer_prompt_payload_length": sum(len(text) for text in developer_texts),
+        "user_prompt_length": sum(len(text) for text in user_texts),
+        "total_input_text_length": sum(len(text) for text in developer_texts + user_texts),
+        "chunk_text_length": len(str(chunk.get("chunk_text") or "")),
+        "running_audit_context_length": _prompt_section_length(
+            user_prompt_text,
+            "Running audit context from earlier chunks:",
+            ["Paper macro glossary for this chunk:", "Chunk text:"],
+        ),
+        "tex_macro_glossary_length": _prompt_section_length(
+            user_prompt_text,
+            "Paper macro glossary for this chunk:",
+            ["Chunk text:"],
+        ),
+        "pdf_attachment_included": _request_includes_pdf_attachment(request_kwargs),
+        "pdf_attached_in_conversation_before_request": bool(session.get("pdf_attached_in_conversation", False)),
+        "text_only_fallback_active": text_only_retry,
+        "conversation_id": request_kwargs.get("conversation"),
+        "conversation_state": conversation_state,
+        "fresh_conversation_for_text_only_retry": text_only_retry,
+        "previous_conversation_id": previous_conversation_id,
+    }
 
 
 def update_usage_from_response(session: dict[str, Any], chunk_id: str, resp, elapsed_seconds: float = 0.0) -> dict[str, Any]:

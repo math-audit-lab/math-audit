@@ -21,6 +21,7 @@ from audit_runtime import (
     FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH,
     FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY,
     PDF_TEXT_ONLY_RETRY_NOTE,
+    _audit_request_size_diagnostics,
     _file_download_timeout_retry_mode,
     _retryable_response_failure_reason,
     _should_reattach_pdf_for_chunk_retry,
@@ -431,6 +432,75 @@ def test_tex_macro_glossary_in_chunk_prompt() -> None:
         _assert("Paper macro glossary for this chunk:" not in no_tex_prompt, "no-TeX session received macro glossary")
 
 
+def test_request_size_diagnostics() -> None:
+    session = {
+        "audit_system_prompt": "Developer audit instructions.",
+        "conversation_id": "conv-existing",
+        "pdf_attached_in_conversation": False,
+    }
+    chunk = {
+        "chunk_id": "chunk_002",
+        "chunk_index": 2,
+        "chunk_text": "Chunk body with $x$.",
+    }
+    user_prompt = "\n".join(
+        [
+            "Audit this mathematics-paper chunk rigorously.",
+            "",
+            "Running audit context from earlier chunks:",
+            "- Prior notation: $G(z)$.",
+            "End running audit context.",
+            "Paper macro glossary for this chunk:",
+            "- \\Lpa: \\newcommand{\\Lpa}[1]{(#1)}",
+            "End paper macro glossary.",
+            "",
+            "Chunk text:",
+            chunk["chunk_text"],
+        ]
+    )
+    request_kwargs = {
+        "conversation": "conv-existing",
+        "input": [
+            {"role": "developer", "content": [{"type": "input_text", "text": session["audit_system_prompt"]}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_file", "file_id": "file-paper"},
+                    {"type": "input_text", "text": user_prompt},
+                ],
+            },
+        ],
+    }
+    diagnostics = _audit_request_size_diagnostics(session, chunk, request_kwargs)
+    _assert(diagnostics["audit_system_prompt_length"] == len(session["audit_system_prompt"]), diagnostics)
+    _assert(diagnostics["developer_prompt_included"], diagnostics)
+    _assert(diagnostics["developer_prompt_payload_length"] == len(session["audit_system_prompt"]), diagnostics)
+    _assert(diagnostics["user_prompt_length"] == len(user_prompt), diagnostics)
+    _assert(diagnostics["chunk_text_length"] == len(chunk["chunk_text"]), diagnostics)
+    _assert(diagnostics["running_audit_context_length"] > 0, diagnostics)
+    _assert(diagnostics["tex_macro_glossary_length"] > 0, diagnostics)
+    _assert(diagnostics["pdf_attachment_included"], diagnostics)
+    _assert(diagnostics["conversation_state"] == "unseeded_or_new_conversation", diagnostics)
+
+    text_only_chunk = dict(chunk)
+    text_only_chunk["_pdf_text_only_retry"] = True
+    text_only_session = dict(session)
+    text_only_session["last_text_only_file_timeout_retry"] = {
+        "chunk_id": chunk["chunk_id"],
+        "previous_conversation_id": "conv-old",
+    }
+    text_only_request = {
+        "conversation": "conv-fresh",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": user_prompt}]}],
+    }
+    text_only_diagnostics = _audit_request_size_diagnostics(text_only_session, text_only_chunk, text_only_request)
+    _assert(not text_only_diagnostics["pdf_attachment_included"], text_only_diagnostics)
+    _assert(text_only_diagnostics["text_only_fallback_active"], text_only_diagnostics)
+    _assert(text_only_diagnostics["fresh_conversation_for_text_only_retry"], text_only_diagnostics)
+    _assert(text_only_diagnostics["previous_conversation_id"] == "conv-old", text_only_diagnostics)
+    _assert(text_only_diagnostics["conversation_state"] == "fresh_text_only_retry_conversation", text_only_diagnostics)
+
+
 def test_retryable_file_download_timeout_detection() -> None:
     failure = {
         "chunk_id": "chunk_005",
@@ -510,6 +580,7 @@ def main() -> int:
         ("status backfill does not rewrite manifest", test_status_display_label_backfill_does_not_rewrite_manifest),
         ("running audit context block", test_running_audit_context_block),
         ("TeX macro glossary prompt block", test_tex_macro_glossary_in_chunk_prompt),
+        ("request size diagnostics", test_request_size_diagnostics),
         ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),
     ]
     results = [_run_case(name, func) for name, func in cases]
