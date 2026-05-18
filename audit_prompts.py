@@ -39,6 +39,10 @@ SEVERITY LABEL RULES
 AUDIT POLICY
 - Do not summarize casually.
 - State the assumptions, notation, dependencies, and regime conditions needed for the chunk.
+- Use ledger_updates to maintain compact running context for later chunks.
+- In ledger_updates.assumptions, record only new or corrected notation, definitions, standing assumptions, and parameter regimes from the current chunk that future chunks may need.
+- In ledger_updates.notes, record only new or corrected theorem/lemma dependencies, unresolved notation/reference ambiguities, and corrections or conflicts with earlier context.
+- Do not repeat the entire previous ledger; ledger_updates should include only new or corrected information from the current chunk.
 - Distinguish clearly between:
   - what the paper itself states,
   - what the audit can conclude from the chunk and saved context,
