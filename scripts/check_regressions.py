@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import audit_runtime as runtime
 from audit_chunking import ensure_chunk_display_labels, pdf_chunk_display_label
 from audit_policy_hooks import _build_running_audit_context_for_chunk, build_user_message_for_chunk
 from audit_runtime import (
@@ -238,20 +239,38 @@ def test_invalidated_verification_inventory_warning() -> None:
             "result_path": str(workdir / "verification_results" / "chunk_002_check_01.result.json"),
             "conclusion": "synthetic failure before rerun",
         }
+        removed_result_still_needs_rerun = {
+            "chunk_id": "chunk_003",
+            "chunk_index": 3,
+            "script_name": "chunk_003_check_01.py",
+            "status": "failed",
+            "result_path": str(workdir / "verification_results" / "chunk_003_check_01.result.json"),
+            "conclusion": "synthetic failure before rerun",
+        }
         _append_jsonl(
             workdir / "logs" / "selected_chunk_reruns.jsonl",
             {
                 "time": NEW,
                 "action": "failed",
                 "rerun_id": "rerun_failed",
-                "chunk_ids": ["chunk_002"],
+                "chunk_ids": ["chunk_002", "chunk_003"],
                 "replacement_summary": {
                     "removed_verification_results": {
-                        "removed_result_count": 1,
-                        "removed_results": [removed_result],
+                        "removed_result_count": 2,
+                        "removed_results": [removed_result, removed_result_still_needs_rerun],
                     }
                 },
                 "error": "RuntimeError('replacement chunk failed')",
+            },
+        )
+        _append_jsonl(
+            workdir / "logs" / "selected_chunk_reruns.jsonl",
+            {
+                "time": LATEST,
+                "action": "finished",
+                "rerun_id": "rerun_repaired_chunk_002",
+                "chunk_ids": ["chunk_002"],
+                "replacement_summary": {},
             },
         )
 
@@ -259,14 +278,120 @@ def test_invalidated_verification_inventory_warning() -> None:
         _assert(status["scripts_total"] == 1, status)
         warning = status.get("inventory_warning") or {}
         _assert(warning.get("has_invalidated_obligations"), warning)
-        _assert(warning.get("invalidated_script_count") == 1, warning)
-        _assert(warning.get("affected_chunks") == ["chunk_002"], warning)
+        _assert(warning.get("invalidated_script_count") == 2, warning)
+        _assert(warning.get("affected_chunks") == ["chunk_002", "chunk_003"], warning)
+        _assert(warning.get("rerun_missing_script_count") == 1, warning)
+        _assert(warning.get("rerun_missing_chunks") == ["chunk_002"], warning)
+        _assert(warning.get("needs_rerun_script_count") == 1, warning)
+        _assert(warning.get("needs_rerun_chunks") == ["chunk_003"], warning)
+        _assert("currently active verification scripts" in warning.get("message", ""), warning)
+        _assert("were rerun but did not regenerate" in warning.get("message", ""), warning)
+        _assert("script still needs a successful replacement chunk rerun" in warning.get("message", ""), warning)
 
         _write_text(workdir / "python_checks" / "chunk_002_check_01.py", "print('repaired')\n")
         _write_json(workdir / "verification_results" / "chunk_002_check_01.result.json", {**removed_result, "status": "passed"})
+        _write_text(workdir / "python_checks" / "chunk_003_check_01.py", "print('repaired')\n")
+        _write_json(
+            workdir / "verification_results" / "chunk_003_check_01.result.json",
+            {**removed_result_still_needs_rerun, "status": "passed"},
+        )
         status = get_verification_suite_status(session)
         warning = status.get("inventory_warning") or {}
         _assert(not warning.get("has_invalidated_obligations"), warning)
+
+
+def test_successful_selected_rerun_restores_completed_status() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_selected_rerun_status_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        paths = session_paths(workdir)
+        chunks = [
+            {
+                "chunk_id": "chunk_001",
+                "chunk_index": 1,
+                "label": "PDF pages 1-1",
+                "source_kind": "pdf",
+                "page_start": 1,
+                "page_end": 1,
+                "chunk_text": "Chunk one.",
+            },
+            {
+                "chunk_id": "chunk_002",
+                "chunk_index": 2,
+                "label": "PDF pages 2-2",
+                "source_kind": "pdf",
+                "page_start": 2,
+                "page_end": 2,
+                "chunk_text": "Chunk two.",
+            },
+        ]
+        save_json(paths["manifest"], {"chunks": chunks, "pdf_page_count": 2, "updated_at": OLD})
+        session["audit_finished_at"] = MID
+        session["next_chunk_index"] = 1
+        _write_json(paths["session"], session)
+        _write_json(
+            paths["status"],
+            {
+                "status": "paused",
+                "current_chunk_id": "chunk_001",
+                "chunks_completed": 1,
+                "chunks_total": 2,
+                "progress_pct": 50.0,
+                "estimated_pages_completed": 1,
+                "estimated_pages_total": 2,
+                "audit_finished_at": MID,
+                "updated_at": NEW,
+            },
+        )
+        _write_text(
+            paths["chunk_records"],
+            "\n".join(
+                json.dumps(
+                    {
+                        "time": OLD,
+                        "chunk_id": chunk["chunk_id"],
+                        "chunk_index": chunk["chunk_index"],
+                        "label": chunk["label"],
+                        "structured_response_path": "",
+                        "issue_ids": [],
+                    },
+                    ensure_ascii=False,
+                )
+                for chunk in chunks
+            )
+            + "\n",
+        )
+
+        original_process_one_chunk = runtime.process_one_chunk
+
+        def fake_process_one_chunk(session_arg: dict[str, Any], chunk: dict[str, Any], **_: Any) -> dict[str, Any]:
+            record = {
+                "time": LATEST,
+                "chunk_id": chunk["chunk_id"],
+                "chunk_index": chunk["chunk_index"],
+                "label": chunk.get("label"),
+                "structured_response_path": "",
+                "issue_ids": [],
+                "response_id": "resp_synthetic_rerun",
+            }
+            _append_jsonl(Path(session_arg["workdir"]) / "state" / "chunks.jsonl", record)
+            return {"record": record}
+
+        runtime.process_one_chunk = fake_process_one_chunk
+        try:
+            result = runtime.rerun_selected_chunks(session, ["chunk_001"], rebuild_reports=False)
+        finally:
+            runtime.process_one_chunk = original_process_one_chunk
+
+        saved_session = json.loads(paths["session"].read_text(encoding="utf-8"))
+        saved_status = json.loads(paths["status"].read_text(encoding="utf-8"))
+        _assert(result["status"]["status"] == "completed", result["status"])
+        _assert(saved_status["status"] == "completed", saved_status)
+        _assert(saved_status["chunks_completed"] == 2, saved_status)
+        _assert(saved_status["chunks_total"] == 2, saved_status)
+        _assert(saved_status["current_chunk_id"] is None, saved_status)
+        _assert(saved_session["next_chunk_index"] == 3, saved_session)
+        _assert(saved_session.get("audit_finished_at") == MID, saved_session)
 
 
 def _old_manifest_chunks() -> list[dict[str, Any]]:
@@ -757,6 +882,7 @@ def main() -> int:
     cases: list[tuple[str, Callable[[], None]]] = [
         ("report freshness detection", test_report_freshness_detection),
         ("invalidated verification inventory warning", test_invalidated_verification_inventory_warning),
+        ("successful selected rerun restores completed status", test_successful_selected_rerun_restores_completed_status),
         ("PDF display label heuristics", test_pdf_display_labels),
         ("status backfill does not rewrite manifest", test_status_display_label_backfill_does_not_rewrite_manifest),
         ("running audit context block", test_running_audit_context_block),

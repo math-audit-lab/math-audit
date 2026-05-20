@@ -1164,13 +1164,13 @@ class MainWindow(QMainWindow):
             preview = ", ".join(str(chunk_id) for chunk_id in affected_chunks[:6])
             if len(affected_chunks) > 6:
                 preview += ", ..."
-            self.verification_inventory_warning_value.setText(
-                "Warning: "
+            message = str(inventory_warning.get("message") or "").strip()
+            fallback = (
                 f"{int(inventory_warning.get('invalidated_script_count', 0) or 0)} archived/invalidated "
-                "verification script(s) from failed chunk rerun(s) are not in the active suite. "
-                f"Affected chunks: {preview or 'unknown'}. "
-                "Verification is incomplete until those chunks are successfully rerun and verification is regenerated."
+                "verification script(s) are not represented in the currently active verification suite. "
+                f"Affected chunks: {preview or 'unknown'}."
             )
+            self.verification_inventory_warning_value.setText("Warning: " + (message or fallback))
         else:
             self.verification_inventory_warning_value.setText("")
 

@@ -35,6 +35,7 @@ from audit_runtime import (
     _read_chunk_records,
     _repair_json_escape_artifacts,
     _strip_unsafe_control_chars,
+    _verification_inventory_warning,
     build_verification_report as runtime_build_verification_report,
     format_list_for_markdown,
     normalize_math_delimiters,
@@ -1926,7 +1927,7 @@ def _compact_verification_summary_markdown(session: dict[str, Any]) -> str:
     lines = [
         "## Verification summary",
         "",
-        f"- Scripts run: {counts['scripts_total']}",
+        f"- Currently active verification scripts run: {counts['scripts_total']}",
         f"- Passed: {counts['passed']}",
         f"- Failed: {counts['failed']}",
         f"- Timed out: {counts['timeout']}",
@@ -1938,6 +1939,9 @@ def _compact_verification_summary_markdown(session: dict[str, Any]) -> str:
     skipped = [item.get("script_name") for item in results if item.get("status") == "skipped"]
     if skipped:
         lines.append(f"- Skipped scripts: {', '.join(skipped[:10])}")
+    warning = _verification_inventory_warning(session)
+    if warning.get("has_invalidated_obligations"):
+        lines.append(f"- Verification inventory warning: {warning.get('message')}")
     lines.append("")
     return "\n".join(lines)
 
@@ -1958,7 +1962,7 @@ def _compact_verification_summary_tex(session: dict[str, Any]) -> str:
     parts = [
         r"\section*{Verification summary}",
         r"\begin{itemize}",
-        r"\item Scripts run: " + str(counts["scripts_total"]),
+        r"\item Currently active verification scripts run: " + str(counts["scripts_total"]),
         r"\item Passed: " + str(counts["passed"]),
         r"\item Failed: " + str(counts["failed"]),
         r"\item Timed out: " + str(counts["timeout"]),
@@ -1970,6 +1974,12 @@ def _compact_verification_summary_tex(session: dict[str, Any]) -> str:
     skipped = [item.get("script_name") for item in results if item.get("status") == "skipped"]
     if skipped:
         parts.append(r"\item Skipped scripts: " + _report_latex_paragraph_local(", ".join(skipped[:10])))
+    warning = _verification_inventory_warning(session)
+    if warning.get("has_invalidated_obligations"):
+        parts.append(
+            r"\item Verification inventory warning: "
+            + _report_latex_paragraph_local(str(warning.get("message") or ""))
+        )
     parts.append(r"\end{itemize}")
     return "\n".join(parts) + "\n"
 
@@ -2043,13 +2053,16 @@ def _audit_summary_items(session: dict[str, Any], include_verification_summary: 
     if verification_counts:
         items.extend(
             [
-                ("Verification scripts total", str(verification_counts.get("scripts_total", 0))),
+                ("Currently active verification scripts total", str(verification_counts.get("scripts_total", 0))),
                 ("Verification passed", str(verification_counts.get("passed", 0))),
                 ("Verification failed", str(verification_counts.get("failed", 0))),
                 ("Verification timed out", str(verification_counts.get("timeout", 0))),
                 ("Verification skipped", str(verification_counts.get("skipped", 0))),
             ]
         )
+        verification_warning = _verification_inventory_warning(session)
+        if verification_warning.get("has_invalidated_obligations"):
+            items.append(("Verification inventory warning", str(verification_warning.get("message") or "")))
     return items
 
 

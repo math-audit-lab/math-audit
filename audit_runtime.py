@@ -1065,6 +1065,13 @@ def _verification_inventory_warning(session: dict[str, Any]) -> dict[str, Any]:
         for item in events
         if item.get("action") == "finished" and str(item.get("rerun_id") or "").strip()
     }
+    finished_rerun_chunks = {
+        str(chunk_id).strip()
+        for item in events
+        if item.get("action") == "finished"
+        for chunk_id in (item.get("chunk_ids") or [])
+        if str(chunk_id).strip()
+    }
     invalidated_by_name: dict[str, dict[str, Any]] = {}
     failed_rerun_ids: set[str] = set()
     affected_chunks: set[str] = set()
@@ -1096,6 +1103,11 @@ def _verification_inventory_warning(session: dict[str, Any]) -> dict[str, Any]:
             active_now = script_name in active_script_names or script_name in active_result_script_names
             if active_now:
                 continue
+            replacement_state = (
+                "chunk_rerun_finished_but_script_missing"
+                if chunk_id and chunk_id in finished_rerun_chunks
+                else "chunk_still_needs_successful_rerun"
+            )
             invalidated_by_name[script_name] = {
                 "script_name": script_name,
                 "chunk_id": chunk_id,
@@ -1103,6 +1115,7 @@ def _verification_inventory_warning(session: dict[str, Any]) -> dict[str, Any]:
                 "result_path": str(item.get("result_path") or "").strip(),
                 "rerun_id": rerun_id,
                 "chunk_record_active": chunk_id in active_chunk_ids if chunk_id else False,
+                "replacement_state": replacement_state,
             }
 
     invalidated = sorted(
@@ -1119,11 +1132,39 @@ def _verification_inventory_warning(session: dict[str, Any]) -> dict[str, Any]:
         {str(item.get("chunk_id") or "") for item in invalidated if str(item.get("chunk_id") or "")},
         key=lambda chunk_id: (_chunk_index_from_chunk_id(chunk_id), chunk_id),
     )
+    rerun_missing_scripts = [
+        item for item in invalidated if item.get("replacement_state") == "chunk_rerun_finished_but_script_missing"
+    ]
+    needs_rerun_scripts = [
+        item for item in invalidated if item.get("replacement_state") == "chunk_still_needs_successful_rerun"
+    ]
+    rerun_missing_chunks = sorted(
+        {str(item.get("chunk_id") or "") for item in rerun_missing_scripts if str(item.get("chunk_id") or "")},
+        key=lambda chunk_id: (_chunk_index_from_chunk_id(chunk_id), chunk_id),
+    )
+    needs_rerun_chunks = sorted(
+        {str(item.get("chunk_id") or "") for item in needs_rerun_scripts if str(item.get("chunk_id") or "")},
+        key=lambda chunk_id: (_chunk_index_from_chunk_id(chunk_id), chunk_id),
+    )
+    detail_sentences: list[str] = []
+    if needs_rerun_scripts:
+        noun = "script still needs" if len(needs_rerun_scripts) == 1 else "scripts still need"
+        detail_sentences.append(
+            f"{len(needs_rerun_scripts)} {noun} a successful replacement chunk rerun"
+        )
+    if rerun_missing_scripts:
+        noun = "is" if len(rerun_missing_scripts) == 1 else "are"
+        detail_sentences.append(
+            f"{len(rerun_missing_scripts)} {noun} from chunks that were rerun but did not regenerate equivalent active scripts"
+        )
+    detail = "; ".join(detail_sentences)
+    detail_clause = f"{detail[0].upper()}{detail[1:]}. " if detail else ""
     message = (
-        f"{len(invalidated)} archived/invalidated verification script(s) from failed chunk rerun(s) "
-        f"are not in the current active suite. Affected chunks: {', '.join(invalidated_chunks[:10])}"
+        f"{len(invalidated)} archived/invalidated verification script(s) from earlier rerun activity "
+        f"are not represented in the currently active verification suite. Affected chunks: {', '.join(invalidated_chunks[:10])}"
         f"{', ...' if len(invalidated_chunks) > 10 else ''}. "
-        "Verification is incomplete until those chunks are successfully rerun and verification is regenerated."
+        f"{detail_clause}"
+        "Active-suite pass counts describe only currently active verification scripts, not the full historical verification inventory."
     )
     return {
         "has_invalidated_obligations": True,
@@ -1133,6 +1174,10 @@ def _verification_inventory_warning(session: dict[str, Any]) -> dict[str, Any]:
         "invalidated_script_count": len(invalidated),
         "affected_chunk_count": len(invalidated_chunks),
         "affected_chunks": invalidated_chunks,
+        "needs_rerun_script_count": len(needs_rerun_scripts),
+        "needs_rerun_chunks": needs_rerun_chunks,
+        "rerun_missing_script_count": len(rerun_missing_scripts),
+        "rerun_missing_chunks": rerun_missing_chunks,
         "failed_rerun_count": len(failed_rerun_ids),
         "failed_rerun_ids": sorted(failed_rerun_ids),
         "message": message,
@@ -1293,6 +1338,16 @@ def rerun_selected_chunks(
 
     original_next_chunk_index = int(session.get("next_chunk_index") or len(chunks) + 1)
     original_audit_finished_at = session.get("audit_finished_at")
+    original_active_chunk_ids = {
+        str(record.get("chunk_id") or "").strip()
+        for record in all_records
+        if str(record.get("chunk_id") or "").strip()
+    }
+    base_audit_was_complete = (
+        str(status_before.get("status") or "").strip().lower() == "completed"
+        or bool(original_audit_finished_at)
+        or (bool(chunks) and len(original_active_chunk_ids) >= len(chunks))
+    )
     results = []
     report_paths: dict[str, str] = {}
     try:
@@ -1336,9 +1391,9 @@ def rerun_selected_chunks(
         session = _resolve_session(session["pdf_path"])
         _sort_active_chunk_records(session)
         usage = load_usage(session)
-        session["next_chunk_index"] = original_next_chunk_index
+        session["next_chunk_index"] = len(chunks) + 1 if base_audit_was_complete else original_next_chunk_index
         session["pending"] = None
-        if status_before.get("status") == "completed":
+        if base_audit_was_complete:
             session["audit_finished_at"] = original_audit_finished_at or utc_now()
         else:
             session["audit_finished_at"] = original_audit_finished_at
@@ -1356,7 +1411,7 @@ def rerun_selected_chunks(
         restored_status["current_chunk_id"] = None
         restored_status["current_chunk_elapsed_seconds"] = 0.0
         restored_status["updated_at"] = utc_now()
-        if status_before.get("status") == "completed":
+        if base_audit_was_complete:
             restored_status.update({
                 "status": "completed",
                 "progress_pct": 100.0,
