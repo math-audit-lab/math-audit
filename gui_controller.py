@@ -109,6 +109,7 @@ class GuiController(QObject):
         self._cancel_thread: Optional[QThread] = None
         self._cancel_worker: Optional[BackendWorker] = None
         self._last_status_signature: Optional[tuple[Any, ...]] = None
+        self._last_auto_retry_signature: Optional[tuple[Any, ...]] = None
         self._shutdown_prepared = False
         self._saved_session_model: Optional[str] = None
         self._saved_session_reasoning_effort: Optional[str] = None
@@ -1102,6 +1103,19 @@ class GuiController(QObject):
     def _log_status_change(self, payload: dict[str, Any]) -> None:
         status = payload.get("status") or {}
         pause = payload.get("pause") or {}
+        auto_retry = status.get("last_file_download_timeout_auto_retry") or {}
+        if isinstance(auto_retry, dict) and auto_retry:
+            auto_retry_signature = (
+                auto_retry.get("time"),
+                auto_retry.get("chunk_id"),
+                auto_retry.get("action"),
+                auto_retry.get("attempt"),
+            )
+            if auto_retry_signature != self._last_auto_retry_signature:
+                self._last_auto_retry_signature = auto_retry_signature
+                message = str(auto_retry.get("message") or "").strip()
+                if message:
+                    self.log_message.emit(message)
         signature = (
             status.get("status"),
             status.get("current_chunk_id"),

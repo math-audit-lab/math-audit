@@ -85,6 +85,8 @@ PDF_TEXT_ONLY_RETRY_NOTE = (
 FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_NONE = "none"
 FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH = "reattach_pdf"
 FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY = "text_only_fresh_conversation"
+FILE_DOWNLOAD_TIMEOUT_AUTO_RETRY_MAX = 2
+FILE_DOWNLOAD_TIMEOUT_AUTO_RETRY_DELAY_SECONDS = 5.0
 
 
 def _normalize_qa_context_mode(qa_context_mode: Optional[str] = None) -> str:
@@ -4759,6 +4761,109 @@ def _should_reattach_pdf_for_chunk_retry(session: dict[str, Any], chunk: dict[st
     return _file_download_timeout_retry_mode(session, chunk) == FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH
 
 
+def _file_download_timeout_auto_retry_decision(
+    session: dict[str, Any],
+    chunk: dict[str, Any],
+    attempts_used: int,
+    max_retries: int = FILE_DOWNLOAD_TIMEOUT_AUTO_RETRY_MAX,
+    delay_seconds: float = FILE_DOWNLOAD_TIMEOUT_AUTO_RETRY_DELAY_SECONDS,
+) -> dict[str, Any]:
+    chunk_id = str(chunk.get("chunk_id") or "")
+    if session.get("pause_requested_at"):
+        return {"auto_retry": False, "reason": "pause_requested"}
+    failures = _failed_chunk_events(session, chunk_id) if chunk_id else []
+    latest_failure = failures[-1] if failures else None
+    if not chunk_id or not isinstance(latest_failure, dict):
+        return {"auto_retry": False, "reason": "no_failed_chunk_event"}
+    if _retryable_response_failure_reason(latest_failure) != "file_download_timeout":
+        return {"auto_retry": False, "reason": "not_file_download_timeout"}
+    if int(attempts_used or 0) >= int(max_retries):
+        return {
+            "auto_retry": False,
+            "reason": "max_auto_retries_exhausted",
+            "attempts_used": int(attempts_used or 0),
+            "max_retries": int(max_retries),
+            "latest_failure_path": latest_failure.get("failure_summary_path"),
+        }
+    retry_mode = _file_download_timeout_retry_mode(session, chunk)
+    if retry_mode == FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH:
+        strategy = "pdf_reattachment_retry"
+        strategy_label = "PDF reattachment retry"
+    elif retry_mode == FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY:
+        strategy = "fresh_conversation_text_only_retry"
+        strategy_label = "fresh-conversation text-only retry"
+    else:
+        return {
+            "auto_retry": False,
+            "reason": "no_retry_mode",
+            "latest_failure_path": latest_failure.get("failure_summary_path"),
+        }
+    attempt = int(attempts_used or 0) + 1
+    return {
+        "auto_retry": True,
+        "reason": "file_download_timeout",
+        "attempt": attempt,
+        "max_retries": int(max_retries),
+        "delay_seconds": float(delay_seconds),
+        "retry_mode": retry_mode,
+        "strategy": strategy,
+        "strategy_label": strategy_label,
+        "file_download_timeout_count": _file_download_timeout_failure_count(
+            session,
+            chunk_id,
+            failures=failures,
+        ),
+        "latest_failure_path": latest_failure.get("failure_summary_path"),
+    }
+
+
+def _record_file_download_timeout_auto_retry_event(
+    session: dict[str, Any],
+    chunk: dict[str, Any],
+    decision: dict[str, Any],
+    action: str,
+) -> dict[str, Any]:
+    root = Path(session["workdir"])
+    chunk_id = str(chunk.get("chunk_id") or "")
+    attempt = int(decision.get("attempt") or decision.get("attempts_used") or 0)
+    max_retries = int(decision.get("max_retries") or FILE_DOWNLOAD_TIMEOUT_AUTO_RETRY_MAX)
+    strategy_label = str(decision.get("strategy_label") or decision.get("strategy") or "automatic retry")
+    if action == "scheduled":
+        message = (
+            f"{chunk_id} hit a retryable API file-download timeout. "
+            f"Automatic retry {attempt}/{max_retries} scheduled after "
+            f"{float(decision.get('delay_seconds') or 0.0):.0f}s: {strategy_label}."
+        )
+    else:
+        message = (
+            f"{chunk_id} hit retryable API file-download timeouts, but automatic retries are exhausted "
+            f"({max_retries}/{max_retries}). Audit paused; manual Resume Audit or inspection is required."
+        )
+    event = {
+        "time": utc_now(),
+        "action": action,
+        "chunk_id": chunk_id,
+        "chunk_index": chunk.get("chunk_index"),
+        "attempt": attempt,
+        "max_retries": max_retries,
+        "retry_mode": decision.get("retry_mode"),
+        "strategy": decision.get("strategy"),
+        "delay_seconds": decision.get("delay_seconds"),
+        "file_download_timeout_count": decision.get("file_download_timeout_count"),
+        "latest_failure_path": decision.get("latest_failure_path"),
+        "message": message,
+    }
+    append_jsonl(root / "logs" / "file_download_timeout_auto_retries.jsonl", event)
+    session["last_file_download_timeout_auto_retry"] = event
+    session["updated_at"] = utc_now()
+    save_session(session)
+    status = load_status(session)
+    status["last_file_download_timeout_auto_retry"] = event
+    status["updated_at"] = event["time"]
+    save_status(session, status)
+    return event
+
+
 def _pause_audit_after_chunk_failure(
     session: dict[str, Any],
     chunk: dict[str, Any],
@@ -5906,6 +6011,7 @@ def audit_the_paper(
     chunks = manifest["chunks"]
     if not chunks:
         raise RuntimeError("Chunk manifest is empty.")
+    file_download_auto_retry_counts: dict[str, int] = {}
     recovery_result = None
     if session.get("pending"):
         if verbose:
@@ -5918,21 +6024,62 @@ def audit_the_paper(
         )
         paused_status = load_status(session)
         if paused_status.get("status") == "paused":
-            if verbose:
-                failure_path = None
-                if isinstance(recovery_result, dict):
-                    failure_path = recovery_result.get("failure_summary_path")
-                if failure_path:
-                    print(f"Audit paused after recovery detected a previously submitted request failed remotely. See: {failure_path}")
-                else:
-                    print("Audit paused during recovery of a previously submitted request. Inspect logs/ and responses/ for details.")
-            return {
-                "session": session,
-                "status": paused_status,
-                "usage": load_usage(session),
-                "report_paths": None,
-                "recovery_result": recovery_result,
-            }
+            retry_after_recovery = False
+            if isinstance(recovery_result, dict):
+                failure_summary = recovery_result.get("failure_summary") or {}
+                recovery_chunk_id = str(
+                    recovery_result.get("chunk_id")
+                    or failure_summary.get("chunk_id")
+                    or ""
+                )
+                matches = [chunk for chunk in chunks if str(chunk.get("chunk_id") or "") == recovery_chunk_id]
+                if matches and _retryable_response_failure_reason(failure_summary) == "file_download_timeout":
+                    decision = _file_download_timeout_auto_retry_decision(
+                        session,
+                        matches[0],
+                        file_download_auto_retry_counts.get(recovery_chunk_id, 0),
+                    )
+                    if decision.get("auto_retry"):
+                        file_download_auto_retry_counts[recovery_chunk_id] = int(decision.get("attempt") or 0)
+                        event = _record_file_download_timeout_auto_retry_event(
+                            session,
+                            matches[0],
+                            decision,
+                            action="scheduled",
+                        )
+                        if verbose:
+                            print(event["message"])
+                        delay = float(decision.get("delay_seconds") or 0.0)
+                        if delay > 0:
+                            time.sleep(delay)
+                        session = _resolve_session(pdf_path)
+                        pause_result = _pause_audit_if_requested(session, verbose=verbose)
+                        if pause_result is not None:
+                            return {
+                                "session": session,
+                                "status": load_status(session),
+                                "usage": load_usage(session),
+                                "report_paths": None,
+                                "pause_result": pause_result,
+                                "recovery_result": recovery_result,
+                            }
+                        retry_after_recovery = True
+            if not retry_after_recovery:
+                if verbose:
+                    failure_path = None
+                    if isinstance(recovery_result, dict):
+                        failure_path = recovery_result.get("failure_summary_path")
+                    if failure_path:
+                        print(f"Audit paused after recovery detected a previously submitted request failed remotely. See: {failure_path}")
+                    else:
+                        print("Audit paused during recovery of a previously submitted request. Inspect logs/ and responses/ for details.")
+                return {
+                    "session": session,
+                    "status": paused_status,
+                    "usage": load_usage(session),
+                    "report_paths": None,
+                    "recovery_result": recovery_result,
+                }
     session = _resolve_session(pdf_path)
     pause_result = _pause_audit_if_requested(session, verbose=verbose)
     if pause_result is not None:
@@ -5956,14 +6103,60 @@ def audit_the_paper(
             and _is_obviously_noncomputational_chunk(chunk)
         ):
             chunk_verification_mode = "local_python_only"
-        process_one_chunk(
-            session,
-            chunk,
-            poll_every=poll_every,
-            max_wait_seconds=max_wait_seconds,
-            display_output=True,
-            verification_mode=chunk_verification_mode,
-        )
+        while True:
+            try:
+                process_one_chunk(
+                    session,
+                    chunk,
+                    poll_every=poll_every,
+                    max_wait_seconds=max_wait_seconds,
+                    display_output=True,
+                    verification_mode=chunk_verification_mode,
+                )
+            except RuntimeError as exc:
+                session = _resolve_session(pdf_path)
+                chunk_id = str(chunk.get("chunk_id") or "")
+                decision = _file_download_timeout_auto_retry_decision(
+                    session,
+                    chunk,
+                    file_download_auto_retry_counts.get(chunk_id, 0),
+                )
+                if decision.get("auto_retry"):
+                    file_download_auto_retry_counts[chunk_id] = int(decision.get("attempt") or 0)
+                    event = _record_file_download_timeout_auto_retry_event(
+                        session,
+                        chunk,
+                        decision,
+                        action="scheduled",
+                    )
+                    if verbose:
+                        print(event["message"])
+                    delay = float(decision.get("delay_seconds") or 0.0)
+                    if delay > 0:
+                        time.sleep(delay)
+                    session = _resolve_session(pdf_path)
+                    pause_result = _pause_audit_if_requested(session, verbose=verbose)
+                    if pause_result is not None:
+                        return {
+                            "session": session,
+                            "status": load_status(session),
+                            "usage": load_usage(session),
+                            "report_paths": None,
+                            "pause_result": pause_result,
+                        }
+                    continue
+                if decision.get("reason") == "max_auto_retries_exhausted":
+                    event = _record_file_download_timeout_auto_retry_event(
+                        session,
+                        chunk,
+                        decision,
+                        action="giving_up",
+                    )
+                    if verbose:
+                        print(event["message"])
+                    raise RuntimeError(event["message"]) from exc
+                raise
+            break
         processed += 1
         session = _resolve_session(pdf_path)
         pause_result = _pause_audit_if_requested(session, verbose=verbose)

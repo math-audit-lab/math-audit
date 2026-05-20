@@ -29,6 +29,7 @@ from audit_runtime import (
     FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY,
     PDF_TEXT_ONLY_RETRY_NOTE,
     _audit_request_size_diagnostics,
+    _file_download_timeout_auto_retry_decision,
     _file_download_timeout_retry_mode,
     _retryable_response_failure_reason,
     _save_request_metadata,
@@ -940,6 +941,43 @@ def test_retryable_file_download_timeout_detection() -> None:
         _assert(PDF_TEXT_ONLY_RETRY_NOTE in prompt_text, "text-only retry caution note missing from prompt")
 
 
+def test_file_download_timeout_auto_retry_decisions() -> None:
+    failure = {
+        "chunk_id": "chunk_006",
+        "status": "failed",
+        "error": {
+            "code": "invalid_value",
+            "message": "Timeout while downloading https://fileserviceuploadsperm.blob.core.windows.net/files/file-example",
+        },
+    }
+    with tempfile.TemporaryDirectory(prefix="math_audit_auto_retry_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        session["pdf_file_id"] = "file-example"
+        chunk = {"chunk_id": "chunk_006", "chunk_index": 6}
+
+        no_failure = _file_download_timeout_auto_retry_decision(session, chunk, attempts_used=0)
+        _assert(not no_failure["auto_retry"], no_failure)
+
+        _append_jsonl(workdir / "logs" / "failed_chunks.jsonl", failure)
+        first_retry = _file_download_timeout_auto_retry_decision(session, chunk, attempts_used=0)
+        _assert(first_retry["auto_retry"], first_retry)
+        _assert(first_retry["attempt"] == 1, first_retry)
+        _assert(first_retry["retry_mode"] == FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH, first_retry)
+
+        second_failure = dict(failure)
+        second_failure["response_id"] = "resp-second-timeout"
+        _append_jsonl(workdir / "logs" / "failed_chunks.jsonl", second_failure)
+        second_retry = _file_download_timeout_auto_retry_decision(session, chunk, attempts_used=1)
+        _assert(second_retry["auto_retry"], second_retry)
+        _assert(second_retry["attempt"] == 2, second_retry)
+        _assert(second_retry["retry_mode"] == FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY, second_retry)
+
+        exhausted = _file_download_timeout_auto_retry_decision(session, chunk, attempts_used=2)
+        _assert(not exhausted["auto_retry"], exhausted)
+        _assert(exhausted["reason"] == "max_auto_retries_exhausted", exhausted)
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -963,6 +1001,7 @@ def main() -> int:
         ("fresh rerun request metadata", test_fresh_rerun_request_metadata),
         ("usage cache diagnostics", test_usage_cache_diagnostics),
         ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),
+        ("file download timeout auto-retry decisions", test_file_download_timeout_auto_retry_decisions),
     ]
     results = [_run_case(name, func) for name, func in cases]
 
