@@ -24,6 +24,7 @@ from audit_runtime import (
     _audit_request_size_diagnostics,
     _file_download_timeout_retry_mode,
     _retryable_response_failure_reason,
+    _save_request_metadata,
     _should_reattach_pdf_for_chunk_retry,
     get_audit_status,
     get_report_freshness,
@@ -589,6 +590,65 @@ def test_request_size_diagnostics() -> None:
     _assert(text_only_diagnostics["conversation_state"] == "fresh_text_only_retry_conversation", text_only_diagnostics)
 
 
+def test_fresh_rerun_request_metadata() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_fresh_rerun_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        session["audit_system_prompt"] = "Developer audit instructions."
+        session["conversation_id"] = "conv-main"
+        session["pdf_file_id"] = "file-paper"
+        session["pdf_attached_in_conversation"] = True
+        chunk = {
+            "chunk_id": "chunk_002",
+            "chunk_index": 2,
+            "label": "TeX chunk 2",
+            "boundary": "Approx. pages 2-2 based on TeX order",
+            "source_kind": "tex",
+            "page_start": 2,
+            "page_end": 2,
+            "paper_progress_end": 0.2,
+            "chunk_text": "Chunk body with $x$.",
+            "_rerun_id": "rerun_001",
+            "_rerun_kind": "failed_verification",
+            "_rerun_requested_at": NEW,
+            "_extra_rerun_instruction": "Rerun because a verification script failed.",
+            "_fresh_rerun_conversation": True,
+            "_main_conversation_id": "conv-main",
+            "_fresh_rerun_conversation_id": "conv-rerun",
+        }
+        request_kwargs = {
+            "model": "gpt-5.4",
+            "reasoning": {"effort": "high"},
+            "conversation": "conv-rerun",
+            "input": [
+                {"role": "developer", "content": [{"type": "input_text", "text": session["audit_system_prompt"]}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "Chunk text:\n" + chunk["chunk_text"]}]},
+            ],
+        }
+        request_path = Path(
+            _save_request_metadata(
+                session,
+                chunk,
+                request_kwargs,
+                verification_mode="local_python_only",
+                used_code_interpreter_tool=False,
+                attempt_label="synthetic",
+            )
+        )
+        payload = json.loads(request_path.read_text(encoding="utf-8"))
+        diagnostics = payload.get("request_size_diagnostics") or {}
+        rerun = payload.get("rerun") or {}
+        _assert(diagnostics.get("fresh_rerun_conversation"), diagnostics)
+        _assert(diagnostics.get("conversation_state") == "fresh_rerun_conversation", diagnostics)
+        _assert(diagnostics.get("conversation_id") == "conv-rerun", diagnostics)
+        _assert(diagnostics.get("original_conversation_id") == "conv-main", diagnostics)
+        _assert(diagnostics.get("rerun_kind") == "failed_verification", diagnostics)
+        _assert(rerun.get("fresh_rerun_conversation"), rerun)
+        _assert(rerun.get("main_conversation_id") == "conv-main", rerun)
+        _assert(rerun.get("rerun_conversation_id") == "conv-rerun", rerun)
+        _assert(session["conversation_id"] == "conv-main", "metadata save mutated main conversation id")
+
+
 def test_retryable_file_download_timeout_detection() -> None:
     failure = {
         "chunk_id": "chunk_005",
@@ -670,6 +730,7 @@ def main() -> int:
         ("running audit context block", test_running_audit_context_block),
         ("TeX macro glossary prompt block", test_tex_macro_glossary_in_chunk_prompt),
         ("request size diagnostics", test_request_size_diagnostics),
+        ("fresh rerun request metadata", test_fresh_rerun_request_metadata),
         ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),
     ]
     results = [_run_case(name, func) for name, func in cases]

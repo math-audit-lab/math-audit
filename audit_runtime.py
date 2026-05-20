@@ -1207,6 +1207,7 @@ def rerun_selected_chunks(
     max_wait_seconds: Optional[float] = None,
     display_output: bool = False,
     _per_chunk_extra_rerun_instructions: Optional[dict[str, str]] = None,
+    _rerun_kind: str = "selected_chunk",
 ) -> dict[str, Any]:
     if not replace_existing:
         raise NotImplementedError("replace_existing=False is not supported in the V1 selective rerun flow.")
@@ -1297,6 +1298,8 @@ def rerun_selected_chunks(
             if instruction_parts:
                 chunk["_extra_rerun_instruction"] = "\n\n".join(instruction_parts)
             chunk["_rerun_id"] = rerun_id
+            chunk["_rerun_kind"] = str(_rerun_kind or "selected_chunk")
+            chunk["_fresh_rerun_conversation"] = True
             chunk["_rerun_requested_at"] = started_at
             previous_records = old_records_by_chunk.get(chunk_id) or []
             previous_mode = str((previous_records[-1] if previous_records else {}).get("verification_mode") or "local_python_only")
@@ -1469,6 +1472,7 @@ def rerun_failed_verification_chunks(
             reasoning_effort=reasoning_effort,
             rebuild_reports=bool(rebuild_reports),
             _per_chunk_extra_rerun_instructions=context_map,
+            _rerun_kind="failed_verification",
         )
     except Exception as exc:
         append_jsonl(
@@ -4538,8 +4542,12 @@ def _save_request_metadata(
     if chunk.get("_rerun_id") or chunk.get("_extra_rerun_instruction"):
         payload["rerun"] = {
             "rerun_id": chunk.get("_rerun_id"),
+            "rerun_kind": chunk.get("_rerun_kind"),
             "rerun_requested_at": chunk.get("_rerun_requested_at"),
             "extra_rerun_instruction": chunk.get("_extra_rerun_instruction"),
+            "fresh_rerun_conversation": bool(chunk.get("_fresh_rerun_conversation")),
+            "main_conversation_id": chunk.get("_main_conversation_id"),
+            "rerun_conversation_id": chunk.get("_fresh_rerun_conversation_id"),
         }
     save_json(request_path, payload)
     return str(request_path)
@@ -4709,6 +4717,13 @@ def _pause_audit_after_chunk_failure(
             "reason": "repeated_file_download_timeout",
             "note": chunk.get("_pdf_attachment_disabled_note") or PDF_TEXT_ONLY_RETRY_NOTE,
         }
+    if chunk.get("_fresh_rerun_conversation"):
+        failure_summary["rerun_conversation"] = {
+            "fresh_rerun_conversation": True,
+            "rerun_kind": chunk.get("_rerun_kind"),
+            "main_conversation_id": chunk.get("_main_conversation_id"),
+            "rerun_conversation_id": chunk.get("_fresh_rerun_conversation_id"),
+        }
     retryable_reason = _retryable_response_failure_reason(failure_summary)
     failure_summary["retryable"] = bool(retryable_reason)
     failure_summary["retryable_reason"] = retryable_reason
@@ -4724,7 +4739,8 @@ def _pause_audit_after_chunk_failure(
     session["pending"] = None
     session["next_chunk_index"] = int(chunk.get("chunk_index") or session.get("next_chunk_index") or 1)
     if retryable_reason == "file_download_timeout":
-        session["pdf_attached_in_conversation"] = False
+        if not chunk.get("_fresh_rerun_conversation"):
+            session["pdf_attached_in_conversation"] = False
         session["last_retryable_failure_reason"] = retryable_reason
     session["updated_at"] = utc_now()
     save_session(session)
@@ -4871,10 +4887,15 @@ def _audit_request_size_diagnostics(
     user_prompt_text = "\n".join(user_texts)
     system_prompt = str(session.get("audit_system_prompt") or AUDIT_SYSTEM_PROMPT)
     text_only_retry = bool(chunk.get("_pdf_text_only_retry") or chunk.get("_suppress_pdf_attachment"))
+    fresh_rerun = bool(chunk.get("_fresh_rerun_conversation"))
     developer_prompt_included = bool(developer_texts)
     conversation_state = "reused_seeded_conversation"
-    if text_only_retry:
+    if text_only_retry and fresh_rerun:
+        conversation_state = "fresh_rerun_text_only_retry_conversation"
+    elif text_only_retry:
         conversation_state = "fresh_text_only_retry_conversation"
+    elif fresh_rerun:
+        conversation_state = "fresh_rerun_conversation"
     elif developer_prompt_included:
         conversation_state = "unseeded_or_new_conversation"
 
@@ -4906,6 +4927,10 @@ def _audit_request_size_diagnostics(
         "conversation_id": request_kwargs.get("conversation"),
         "conversation_state": conversation_state,
         "fresh_conversation_for_text_only_retry": text_only_retry,
+        "fresh_rerun_conversation": fresh_rerun,
+        "rerun_kind": chunk.get("_rerun_kind"),
+        "original_conversation_id": chunk.get("_main_conversation_id"),
+        "rerun_conversation_id": chunk.get("_fresh_rerun_conversation_id"),
         "previous_conversation_id": previous_conversation_id,
     }
 
@@ -5038,6 +5063,13 @@ def finalize_chunk(
             "reason": "repeated_file_download_timeout",
             "note": chunk.get("_pdf_attachment_disabled_note") or PDF_TEXT_ONLY_RETRY_NOTE,
         }
+    if chunk.get("_fresh_rerun_conversation"):
+        record["rerun_conversation"] = {
+            "fresh_rerun_conversation": True,
+            "rerun_kind": chunk.get("_rerun_kind"),
+            "main_conversation_id": chunk.get("_main_conversation_id"),
+            "rerun_conversation_id": chunk.get("_fresh_rerun_conversation_id"),
+        }
     append_jsonl(session_paths(session["workdir"])["chunk_records"], record)
     latest_session = _resolve_session(session["pdf_path"]) if session.get("pdf_path") else session
     if session.get("code_interpreter_container_id"):
@@ -5046,8 +5078,9 @@ def finalize_chunk(
     latest_session["next_chunk_index"] = chunk["chunk_index"] + 1
     latest_session["pending"] = None
     latest_session["updated_at"] = utc_now()
-    latest_session["pdf_attached_in_conversation"] = not bool(chunk.get("_pdf_text_only_retry"))
-    latest_session["developer_prompt_seeded"] = True
+    if not chunk.get("_fresh_rerun_conversation"):
+        latest_session["pdf_attached_in_conversation"] = not bool(chunk.get("_pdf_text_only_retry"))
+        latest_session["developer_prompt_seeded"] = True
     if chunk["chunk_index"] >= len(load_manifest(latest_session)["chunks"]):
         latest_session["audit_finished_at"] = utc_now()
     save_session(latest_session)
@@ -5110,7 +5143,32 @@ def process_one_chunk(
             "Enable use_code_interpreter when creating the session or in audit_the_paper(...)."
         )
     file_timeout_retry_mode = _file_download_timeout_retry_mode(session, chunk)
-    if file_timeout_retry_mode == FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY:
+    fresh_rerun_conversation = bool(chunk.get("_fresh_rerun_conversation"))
+    main_conversation_id = str(session.get("conversation_id") or "")
+    request_session = session
+    if fresh_rerun_conversation:
+        conversation = _get_client().conversations.create()
+        chunk = dict(chunk)
+        chunk["_fresh_rerun_conversation"] = True
+        chunk["_fresh_rerun_conversation_id"] = conversation.id
+        chunk["_main_conversation_id"] = main_conversation_id
+        request_session = dict(session)
+        request_session["conversation_id"] = conversation.id
+        request_session["pdf_attached_in_conversation"] = False
+        request_session["developer_prompt_seeded"] = False
+        if file_timeout_retry_mode == FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY:
+            chunk["_pdf_text_only_retry"] = True
+            chunk["_suppress_pdf_attachment"] = True
+            chunk["_pdf_attachment_disabled_note"] = PDF_TEXT_ONLY_RETRY_NOTE
+            request_session["last_text_only_file_timeout_retry"] = {
+                "chunk_id": chunk.get("chunk_id"),
+                "started_at": utc_now(),
+                "previous_conversation_id": main_conversation_id,
+                "conversation_id": conversation.id,
+                "reason": "repeated_file_download_timeout",
+                "note": PDF_TEXT_ONLY_RETRY_NOTE,
+            }
+    elif file_timeout_retry_mode == FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY:
         previous_conversation_id = str(session.get("conversation_id") or "")
         conversation = _get_client().conversations.create()
         session["conversation_id"] = conversation.id
@@ -5134,9 +5192,9 @@ def process_one_chunk(
         session["pdf_attached_in_conversation"] = False
         session["updated_at"] = utc_now()
         save_session(session)
-    user_input = _require_prompt_builder()(session, chunk)
-    if not session.get("developer_prompt_seeded", False):
-        audit_system_prompt = str(session.get("audit_system_prompt") or AUDIT_SYSTEM_PROMPT)
+    user_input = _require_prompt_builder()(request_session, chunk)
+    if not request_session.get("developer_prompt_seeded", False):
+        audit_system_prompt = str(request_session.get("audit_system_prompt") or AUDIT_SYSTEM_PROMPT)
         input_payload = [{"role": "developer", "content": [{"type": "input_text", "text": audit_system_prompt}]}] + user_input
     else:
         input_payload = user_input
@@ -5163,9 +5221,9 @@ def process_one_chunk(
     save_json(prompt_path, input_payload)
     chunk_started_at = utc_now()
     request_kwargs = {
-        "model": session["model"],
-        "reasoning": {"effort": session["reasoning_effort"]},
-        "conversation": session["conversation_id"],
+        "model": request_session["model"],
+        "reasoning": {"effort": request_session["reasoning_effort"]},
+        "conversation": request_session["conversation_id"],
         "input": input_payload,
         "text": {
             "format": {
@@ -5175,19 +5233,19 @@ def process_one_chunk(
                 "schema": AUDIT_RESPONSE_SCHEMA,
             }
         },
-        "background": session["background"],
-        "store": session["store"],
+        "background": request_session["background"],
+        "store": request_session["store"],
     }
     used_code_interpreter_tool = False
     if verification_mode == "code_interpreter":
         request_kwargs["tools"] = _build_code_interpreter_tools(
-            session,
+            request_session,
             extra_file_ids=code_interpreter_file_ids,
             include_memory_limit=True,
         )
         used_code_interpreter_tool = True
     request_path = _save_request_metadata(
-        session,
+        request_session,
         chunk,
         request_kwargs,
         verification_mode=verification_mode,
@@ -5201,12 +5259,12 @@ def process_one_chunk(
     except Exception as e:
         if used_code_interpreter_tool and "memory" in str(e).lower():
             request_kwargs["tools"] = _build_code_interpreter_tools(
-                session,
+                request_session,
                 extra_file_ids=code_interpreter_file_ids,
                 include_memory_limit=False,
             )
             request_path = _save_request_metadata(
-                session,
+                request_session,
                 chunk,
                 request_kwargs,
                 verification_mode=verification_mode,
@@ -5226,6 +5284,11 @@ def process_one_chunk(
         "used_code_interpreter_tool": used_code_interpreter_tool,
         "request_path": request_path,
     }
+    if fresh_rerun_conversation:
+        session["pending"]["fresh_rerun_conversation"] = True
+        session["pending"]["rerun_kind"] = chunk.get("_rerun_kind")
+        session["pending"]["main_conversation_id"] = main_conversation_id
+        session["pending"]["rerun_conversation_id"] = chunk.get("_fresh_rerun_conversation_id")
     if chunk.get("_pdf_text_only_retry"):
         session["pending"]["pdf_text_only_retry"] = True
         session["pending"]["pdf_attachment_disabled_note"] = PDF_TEXT_ONLY_RETRY_NOTE
