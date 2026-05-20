@@ -859,9 +859,15 @@ class GuiController(QObject):
         timed_out = int(summary.get("timeout", 0) or 0)
         skipped = int(summary.get("skipped", 0) or 0)
         self.log_message.emit(
-            "Verification suite finished: "
+            "Verification suite finished for currently active scripts: "
             f"{total} scripts, {passed} passed, {failed} failed, {timed_out} timed out, {skipped} skipped."
         )
+        inventory_warning = result.get("inventory_warning") or {}
+        if inventory_warning.get("has_invalidated_obligations"):
+            warning_text = str(inventory_warning.get("message") or "").strip()
+            if warning_text:
+                self.log_message.emit("Verification inventory warning: " + warning_text)
+                self.report_output.emit("Verification inventory warning:\n" + warning_text)
         report_paths = result.get("report_paths") or {}
         if report_paths:
             primary_path = self._primary_output_path(report_paths)
@@ -1030,6 +1036,7 @@ class GuiController(QObject):
                 "scripts_total": 0,
                 "scripts": [],
                 "last_run": None,
+                "inventory_warning": {"has_invalidated_obligations": False},
                 "error": f"{type(exc).__name__}: {exc}",
             }
         return self._normalize_status_payload(info)
@@ -1070,6 +1077,7 @@ class GuiController(QObject):
                 "scripts_total": 0,
                 "scripts": [],
                 "last_run": None,
+                "inventory_warning": {"has_invalidated_obligations": False},
             },
             "report_freshness": {
                 "reports": {

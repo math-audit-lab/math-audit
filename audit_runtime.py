@@ -41,6 +41,8 @@ from audit_state import (
     workdir_from_pdf,
 )
 from audit_verification import (
+    _chunk_id_from_script_name,
+    _chunk_index_from_chunk_id,
     _collect_verification_scripts,
     _load_verification_results,
     _truncate_text,
@@ -495,6 +497,27 @@ def _jsonl_event_timestamp(path: Path) -> Optional[datetime]:
     if candidates:
         return max(candidates)
     return _file_mtime_datetime(path)
+
+
+def _read_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(item, dict):
+                    entries.append(item)
+    except OSError:
+        return []
+    return entries
 
 
 def _session_rerun_timestamp(session: dict[str, Any], key: str) -> Optional[datetime]:
@@ -989,6 +1012,121 @@ def _compact_failed_verification_result(result: dict[str, Any]) -> dict[str, Any
     }
 
 
+def _verification_result_script_name(item: dict[str, Any]) -> str:
+    return Path(str(item.get("script_name") or item.get("script_path") or "")).name
+
+
+def _verification_inventory_warning(session: dict[str, Any]) -> dict[str, Any]:
+    """Detect verification obligations archived by failed chunk reruns.
+
+    This is intentionally conservative: if a failed rerun removed verification
+    results and the corresponding script name is not present in the current
+    active inventory, the GUI/report should avoid saying the whole historical
+    verification inventory is clean.
+    """
+    root = Path(session["workdir"])
+    events = _read_jsonl_dicts(root / "logs" / "selected_chunk_reruns.jsonl")
+    if not events:
+        return {"has_invalidated_obligations": False}
+
+    active_scripts = _collect_verification_scripts(session)
+    active_script_names = {
+        str(item.get("script_name") or "").strip()
+        for item in active_scripts
+        if str(item.get("script_name") or "").strip()
+    }
+    active_results = _load_verification_results(session, state=load_verification_state(session))
+    active_result_script_names = {
+        _verification_result_script_name(item)
+        for item in active_results
+        if _verification_result_script_name(item)
+    }
+    active_chunk_ids = {
+        str(record.get("chunk_id") or "").strip()
+        for record in _read_chunk_records(session)
+        if str(record.get("chunk_id") or "").strip()
+    }
+
+    finished_rerun_ids = {
+        str(item.get("rerun_id") or "").strip()
+        for item in events
+        if item.get("action") == "finished" and str(item.get("rerun_id") or "").strip()
+    }
+    invalidated_by_name: dict[str, dict[str, Any]] = {}
+    failed_rerun_ids: set[str] = set()
+    affected_chunks: set[str] = set()
+    removed_result_count = 0
+
+    for event in events:
+        if event.get("action") != "failed":
+            continue
+        rerun_id = str(event.get("rerun_id") or "").strip()
+        if rerun_id and rerun_id in finished_rerun_ids:
+            continue
+        replacement = event.get("replacement_summary") or {}
+        removed_info = replacement.get("removed_verification_results") or {}
+        removed_results = removed_info.get("removed_results") or []
+        if not isinstance(removed_results, list) or not removed_results:
+            continue
+        if rerun_id:
+            failed_rerun_ids.add(rerun_id)
+        for item in removed_results:
+            if not isinstance(item, dict):
+                continue
+            removed_result_count += 1
+            script_name = _verification_result_script_name(item)
+            chunk_id = str(item.get("chunk_id") or "").strip() or _chunk_id_from_script_name(script_name)
+            if chunk_id:
+                affected_chunks.add(chunk_id)
+            if not script_name:
+                continue
+            active_now = script_name in active_script_names or script_name in active_result_script_names
+            if active_now:
+                continue
+            invalidated_by_name[script_name] = {
+                "script_name": script_name,
+                "chunk_id": chunk_id,
+                "status": str(item.get("status") or "").strip(),
+                "result_path": str(item.get("result_path") or "").strip(),
+                "rerun_id": rerun_id,
+                "chunk_record_active": chunk_id in active_chunk_ids if chunk_id else False,
+            }
+
+    invalidated = sorted(
+        invalidated_by_name.values(),
+        key=lambda item: (_chunk_index_from_chunk_id(str(item.get("chunk_id") or "")), str(item.get("script_name") or "")),
+    )
+    if not invalidated:
+        return {
+            "has_invalidated_obligations": False,
+            "active_scripts_total": len(active_scripts),
+        }
+
+    invalidated_chunks = sorted(
+        {str(item.get("chunk_id") or "") for item in invalidated if str(item.get("chunk_id") or "")},
+        key=lambda chunk_id: (_chunk_index_from_chunk_id(chunk_id), chunk_id),
+    )
+    message = (
+        f"{len(invalidated)} archived/invalidated verification script(s) from failed chunk rerun(s) "
+        f"are not in the current active suite. Affected chunks: {', '.join(invalidated_chunks[:10])}"
+        f"{', ...' if len(invalidated_chunks) > 10 else ''}. "
+        "Verification is incomplete until those chunks are successfully rerun and verification is regenerated."
+    )
+    return {
+        "has_invalidated_obligations": True,
+        "active_scripts_total": len(active_scripts),
+        "active_results_total": len(active_results),
+        "removed_result_count": removed_result_count,
+        "invalidated_script_count": len(invalidated),
+        "affected_chunk_count": len(invalidated_chunks),
+        "affected_chunks": invalidated_chunks,
+        "failed_rerun_count": len(failed_rerun_ids),
+        "failed_rerun_ids": sorted(failed_rerun_ids),
+        "message": message,
+        "invalidated_scripts": invalidated[:50],
+    }
+
+
 def get_failed_verification_chunks(session_or_pdf: dict[str, Any] | str | Path) -> dict[str, Any]:
     session = _resolve_session(session_or_pdf)
     state = load_verification_state(session)
@@ -1428,9 +1566,15 @@ def _verification_conclusion_for_display(result: dict[str, Any], limit: int = 16
     return _truncate_text(text, limit=limit).replace("\\n", " ")
 
 
-def _verification_report_markdown(session: dict[str, Any], state: dict[str, Any], results: list[dict[str, Any]]) -> str:
+def _verification_report_markdown(
+    session: dict[str, Any],
+    state: dict[str, Any],
+    results: list[dict[str, Any]],
+    inventory_warning: Optional[dict[str, Any]] = None,
+) -> str:
     counts = _verification_summary_counts(results)
     last_run = state.get("last_run") or {}
+    inventory_warning = inventory_warning or {"has_invalidated_obligations": False}
     title = Path(session["pdf_path"]).stem
     lines = [
         f"# Verification report -- {title}",
@@ -1440,13 +1584,26 @@ def _verification_report_markdown(session: dict[str, Any], state: dict[str, Any]
         f"- Python interpreter: {last_run.get('python_executable', sys.executable)}",
         f"- Safe only mode: {last_run.get('safe_only', True)}",
         f"- Timeout per script: {last_run.get('timeout_seconds', 0)}s",
-        f"- Scripts run: {counts['scripts_total']}",
+        f"- Currently active scripts run: {counts['scripts_total']}",
         f"- Passed: {counts['passed']}",
         f"- Failed: {counts['failed']}",
         f"- Timed out: {counts['timeout']}",
         f"- Skipped: {counts['skipped']}",
         "",
     ]
+    if inventory_warning.get("has_invalidated_obligations"):
+        lines.extend(
+            [
+                "## Verification inventory warning",
+                "",
+                "The counts above refer only to currently active verification scripts.",
+                str(inventory_warning.get("message") or "").strip(),
+                f"- Active scripts: {int(inventory_warning.get('active_scripts_total', counts['scripts_total']) or 0)}",
+                f"- Archived/invalidated scripts: {int(inventory_warning.get('invalidated_script_count', 0) or 0)}",
+                f"- Affected chunks: {', '.join(inventory_warning.get('affected_chunks') or [])}",
+                "",
+            ]
+        )
     if not results:
         lines.append("No verification results found.")
         return "\n".join(lines).strip() + "\n"
@@ -1473,9 +1630,15 @@ def _verification_report_markdown(session: dict[str, Any], state: dict[str, Any]
     return _strip_unsafe_control_chars("\n".join(lines).strip() + "\n")
 
 
-def _verification_report_tex(session: dict[str, Any], state: dict[str, Any], results: list[dict[str, Any]]) -> str:
+def _verification_report_tex(
+    session: dict[str, Any],
+    state: dict[str, Any],
+    results: list[dict[str, Any]],
+    inventory_warning: Optional[dict[str, Any]] = None,
+) -> str:
     counts = _verification_summary_counts(results)
     last_run = state.get("last_run") or {}
+    inventory_warning = inventory_warning or {"has_invalidated_obligations": False}
     title = report_latex_paragraph(f"Verification report -- {Path(session['pdf_path']).stem}")
     parts = [
         r"""\documentclass[11pt]{article}
@@ -1501,12 +1664,26 @@ def _verification_report_tex(session: dict[str, Any], state: dict[str, Any], res
     parts.append(r"\item Python interpreter: " + report_latex_paragraph(str(last_run.get("python_executable", sys.executable))) + "\n")
     parts.append(r"\item Safe only mode: " + report_latex_paragraph(str(last_run.get("safe_only", True))) + "\n")
     parts.append(r"\item Timeout per script: " + str(last_run.get("timeout_seconds", 0)) + "s\n")
-    parts.append(r"\item Scripts run: " + str(counts["scripts_total"]) + "\n")
+    parts.append(r"\item Currently active scripts run: " + str(counts["scripts_total"]) + "\n")
     parts.append(r"\item Passed: " + str(counts["passed"]) + "\n")
     parts.append(r"\item Failed: " + str(counts["failed"]) + "\n")
     parts.append(r"\item Timed out: " + str(counts["timeout"]) + "\n")
     parts.append(r"\item Skipped: " + str(counts["skipped"]) + "\n")
     parts.append(r"\end{itemize}" + "\n")
+    if inventory_warning.get("has_invalidated_obligations"):
+        parts.append(r"\section*{Verification inventory warning}" + "\n")
+        parts.append(
+            report_latex_paragraph(
+                "The counts above refer only to currently active verification scripts. "
+                + str(inventory_warning.get("message") or "").strip()
+            )
+            + "\n"
+        )
+        parts.append(r"\begin{itemize}" + "\n")
+        parts.append(r"\item Active scripts: " + str(int(inventory_warning.get("active_scripts_total", counts["scripts_total"]) or 0)) + "\n")
+        parts.append(r"\item Archived/invalidated scripts: " + str(int(inventory_warning.get("invalidated_script_count", 0) or 0)) + "\n")
+        parts.append(r"\item Affected chunks: " + report_latex_paragraph(", ".join(inventory_warning.get("affected_chunks") or [])) + "\n")
+        parts.append(r"\end{itemize}" + "\n")
     if not results:
         parts.append("No verification results found.\n")
     else:
@@ -1538,6 +1715,7 @@ def build_verification_report(session_or_pdf: dict[str, Any] | str | Path) -> di
     session = _resolve_session(session_or_pdf)
     state = load_verification_state(session)
     results = _load_verification_results(session, state=state)
+    inventory_warning = _verification_inventory_warning(session)
     if not state.get("last_run") and not results:
         return {}
     root = Path(session["workdir"])
@@ -1547,14 +1725,15 @@ def build_verification_report(session_or_pdf: dict[str, Any] | str | Path) -> di
     md_path = reports_dir / f"{report_stem}.md"
     tex_path = reports_dir / f"{report_stem}.tex"
     json_path = reports_dir / f"{report_stem}.json"
-    md_path.write_text(_verification_report_markdown(session, state, results), encoding="utf-8")
-    tex_path.write_text(_verification_report_tex(session, state, results), encoding="utf-8")
+    md_path.write_text(_verification_report_markdown(session, state, results, inventory_warning), encoding="utf-8")
+    tex_path.write_text(_verification_report_tex(session, state, results, inventory_warning), encoding="utf-8")
     save_json(
         json_path,
         {
             "session": load_session_from_pdf(session["pdf_path"]),
             "verification_state": state,
             "results": results,
+            "inventory_warning": inventory_warning,
             "generated_at": utc_now(),
         },
     )
@@ -1582,11 +1761,13 @@ def run_verification_suite_and_build_report(
         progress_callback=progress_callback,
     )
     report_paths = build_verification_report(session)
+    inventory_warning = _verification_inventory_warning(session)
     return {
         "session": load_session_from_pdf(session["pdf_path"]) or session,
         "summary": verification_run.get("summary", {}),
         "report_paths": report_paths,
         "state": verification_run.get("state", {}),
+        "inventory_warning": inventory_warning,
     }
 
 
@@ -1594,6 +1775,7 @@ def get_verification_suite_status(session_or_pdf: dict[str, Any] | str | Path) -
     session = _resolve_session(session_or_pdf)
     scripts = _collect_verification_scripts(session)
     state = load_verification_state(session)
+    inventory_warning = _verification_inventory_warning(session)
     return {
         "scripts_total": len(scripts),
         "scripts": [
@@ -1606,6 +1788,7 @@ def get_verification_suite_status(session_or_pdf: dict[str, Any] | str | Path) -
             for item in scripts
         ],
         "last_run": state.get("last_run") if isinstance(state.get("last_run"), dict) else None,
+        "inventory_warning": inventory_warning,
     }
 
 

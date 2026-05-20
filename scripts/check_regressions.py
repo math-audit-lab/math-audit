@@ -27,6 +27,7 @@ from audit_runtime import (
     _should_reattach_pdf_for_chunk_retry,
     get_audit_status,
     get_report_freshness,
+    get_verification_suite_status,
 )
 from audit_state import save_json, session_paths
 
@@ -178,6 +179,93 @@ def test_report_freshness_detection() -> None:
         _write_report_metadata(session, "verification", MID)
         freshness = get_report_freshness(session)
         _assert(freshness["reports"]["verification"]["status"] == "current", freshness["reports"]["verification"]["reason"])
+
+
+def test_invalidated_verification_inventory_warning() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_verification_inventory_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        paths = session_paths(workdir)
+
+        _write_text(workdir / "python_checks" / "chunk_001_check_01.py", "print('ok')\n")
+        active_result = {
+            "time": NEW,
+            "chunk_id": "chunk_001",
+            "chunk_index": 1,
+            "script_name": "chunk_001_check_01.py",
+            "script_path": str(workdir / "python_checks" / "chunk_001_check_01.py"),
+            "result_path": str(workdir / "verification_results" / "chunk_001_check_01.result.json"),
+            "status": "passed",
+            "returncode": 0,
+            "elapsed_seconds": 0.01,
+            "conclusion": "ok",
+        }
+        _write_json(workdir / "verification_results" / "chunk_001_check_01.result.json", active_result)
+        _write_json(
+            paths["verification_state"],
+            {
+                "updated_at": NEW,
+                "last_run": {
+                    "started_at": NEW,
+                    "finished_at": NEW,
+                    "scripts_total": 1,
+                    "passed": 1,
+                    "failed": 0,
+                    "timeout": 0,
+                    "skipped": 0,
+                },
+                "results": [active_result],
+            },
+        )
+        _write_text(
+            paths["chunk_records"],
+            json.dumps(
+                {
+                    "chunk_id": "chunk_001",
+                    "chunk_index": 1,
+                    "python_paths": [str(workdir / "python_checks" / "chunk_001_check_01.py")],
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+        )
+        removed_result = {
+            "chunk_id": "chunk_002",
+            "chunk_index": 2,
+            "script_name": "chunk_002_check_01.py",
+            "status": "failed",
+            "result_path": str(workdir / "verification_results" / "chunk_002_check_01.result.json"),
+            "conclusion": "synthetic failure before rerun",
+        }
+        _append_jsonl(
+            workdir / "logs" / "selected_chunk_reruns.jsonl",
+            {
+                "time": NEW,
+                "action": "failed",
+                "rerun_id": "rerun_failed",
+                "chunk_ids": ["chunk_002"],
+                "replacement_summary": {
+                    "removed_verification_results": {
+                        "removed_result_count": 1,
+                        "removed_results": [removed_result],
+                    }
+                },
+                "error": "RuntimeError('replacement chunk failed')",
+            },
+        )
+
+        status = get_verification_suite_status(session)
+        _assert(status["scripts_total"] == 1, status)
+        warning = status.get("inventory_warning") or {}
+        _assert(warning.get("has_invalidated_obligations"), warning)
+        _assert(warning.get("invalidated_script_count") == 1, warning)
+        _assert(warning.get("affected_chunks") == ["chunk_002"], warning)
+
+        _write_text(workdir / "python_checks" / "chunk_002_check_01.py", "print('repaired')\n")
+        _write_json(workdir / "verification_results" / "chunk_002_check_01.result.json", {**removed_result, "status": "passed"})
+        status = get_verification_suite_status(session)
+        warning = status.get("inventory_warning") or {}
+        _assert(not warning.get("has_invalidated_obligations"), warning)
 
 
 def _old_manifest_chunks() -> list[dict[str, Any]]:
@@ -576,6 +664,7 @@ def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
 def main() -> int:
     cases: list[tuple[str, Callable[[], None]]] = [
         ("report freshness detection", test_report_freshness_detection),
+        ("invalidated verification inventory warning", test_invalidated_verification_inventory_warning),
         ("PDF display label heuristics", test_pdf_display_labels),
         ("status backfill does not rewrite manifest", test_status_display_label_backfill_does_not_rewrite_manifest),
         ("running audit context block", test_running_audit_context_block),

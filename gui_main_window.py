@@ -781,9 +781,13 @@ class MainWindow(QMainWindow):
         )
         self.verification_scripts_available_value = QLabel("Verification scripts available: 0")
         self.verification_last_run_value = QLabel("Last run: none")
+        self.verification_inventory_warning_value = QLabel("")
+        self.verification_inventory_warning_value.setWordWrap(True)
+        self.verification_inventory_warning_value.setStyleSheet("color: #8a4b00; font-weight: 600;")
         self.verification_live_progress_value = QLabel("Verification progress: idle")
         verification_layout.addWidget(self.verification_scripts_available_value)
         verification_layout.addWidget(self.verification_last_run_value)
+        verification_layout.addWidget(self.verification_inventory_warning_value)
         verification_layout.addWidget(self.verification_live_progress_value)
         verification_buttons = QHBoxLayout()
         verification_buttons.addWidget(self.run_verification_button)
@@ -1138,11 +1142,11 @@ class MainWindow(QMainWindow):
         self._set_failed_verification_rerun_compact(failed_count)
 
         scripts_total = int(verification_suite.get("scripts_total", 0) or 0)
-        self.verification_scripts_available_value.setText(f"Verification scripts available: {scripts_total}")
+        self.verification_scripts_available_value.setText(f"Currently active verification scripts: {scripts_total}")
         last_run = verification_suite.get("last_run")
         if isinstance(last_run, dict) and last_run:
             self.verification_last_run_value.setText(
-                "Last run: "
+                "Last run (active scripts): "
                 f"passed {int(last_run.get('passed', 0) or 0)}, "
                 f"failed {int(last_run.get('failed', 0) or 0)}, "
                 f"timed out {int(last_run.get('timeout', 0) or 0)}, "
@@ -1150,6 +1154,21 @@ class MainWindow(QMainWindow):
             )
         else:
             self.verification_last_run_value.setText("Last run: none")
+        inventory_warning = verification_suite.get("inventory_warning") or {}
+        if inventory_warning.get("has_invalidated_obligations"):
+            affected_chunks = inventory_warning.get("affected_chunks") or []
+            preview = ", ".join(str(chunk_id) for chunk_id in affected_chunks[:6])
+            if len(affected_chunks) > 6:
+                preview += ", ..."
+            self.verification_inventory_warning_value.setText(
+                "Warning: "
+                f"{int(inventory_warning.get('invalidated_script_count', 0) or 0)} archived/invalidated "
+                "verification script(s) from failed chunk rerun(s) are not in the active suite. "
+                f"Affected chunks: {preview or 'unknown'}. "
+                "Verification is incomplete until those chunks are successfully rerun and verification is regenerated."
+            )
+        else:
+            self.verification_inventory_warning_value.setText("")
 
         self._update_report_freshness_labels(payload.get("report_freshness") or {})
         self._apply_button_states()
