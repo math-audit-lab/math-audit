@@ -1988,7 +1988,45 @@ def _verification_counts_for_summary(session: dict[str, Any]) -> Optional[dict[s
     }
 
 
-def _audit_summary_items(session: dict[str, Any], include_verification_summary: bool = True) -> list[tuple[str, str]]:
+_ISSUE_SEVERITY_SUMMARY_ORDER = ("critical", "high", "medium", "low")
+
+
+def _issue_severity_summary(session: dict[str, Any], only_open_issues: bool = False) -> dict[str, Any]:
+    counts = {severity: 0 for severity in _ISSUE_SEVERITY_SUMMARY_ORDER}
+    unknown = 0
+    try:
+        issues_state = load_issues(session)
+        issues = list(issues_state.get("issues", []) or [])
+    except Exception:
+        issues = []
+    if only_open_issues:
+        issues = [
+            issue
+            for issue in issues
+            if normalize_whitespace(str(issue.get("status", "open") or "open")).lower() == "open"
+        ]
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        severity = normalize_whitespace(str(issue.get("severity") or "")).lower()
+        if severity in counts:
+            counts[severity] += 1
+        else:
+            unknown += 1
+    total = sum(counts.values()) + unknown
+    return {
+        "only_open_issues": bool(only_open_issues),
+        "counts": counts,
+        "unknown": unknown,
+        "total": total,
+    }
+
+
+def _audit_summary_items(
+    session: dict[str, Any],
+    include_verification_summary: bool = True,
+    issue_summary_open_only: bool = False,
+) -> list[tuple[str, str]]:
     _ensure_timing_state(session)
     try:
         status = load_status(session)
@@ -2033,6 +2071,19 @@ def _audit_summary_items(session: dict[str, Any], include_verification_summary: 
     if str(status.get("status") or "").strip().lower() in {"paused", "failed"} and pause_reason != "not available":
         items.append(("Pause reason", pause_reason))
 
+    severity_summary = _issue_severity_summary(session, only_open_issues=issue_summary_open_only)
+    counts = severity_summary["counts"]
+    if issue_summary_open_only:
+        items.append(("Open issue severity summary", "open issues only"))
+    else:
+        items.append(("Issue severity summary", "all saved issues"))
+    for severity in _ISSUE_SEVERITY_SUMMARY_ORDER:
+        items.append((severity.title(), str(counts.get(severity, 0))))
+    if severity_summary.get("unknown"):
+        items.append(("Unknown severity", str(severity_summary["unknown"])))
+    total_label = "Total open issues" if issue_summary_open_only else "Total issues"
+    items.append((total_label, str(severity_summary["total"])))
+
     verification_counts = _verification_counts_for_summary(session) if include_verification_summary else None
     if verification_counts:
         items.extend(
@@ -2050,22 +2101,38 @@ def _audit_summary_items(session: dict[str, Any], include_verification_summary: 
     return items
 
 
-def _audit_summary_markdown(session: dict[str, Any], include_verification_summary: bool = True) -> str:
+def _audit_summary_markdown(
+    session: dict[str, Any],
+    include_verification_summary: bool = True,
+    issue_summary_open_only: bool = False,
+) -> str:
     lines = ["## Audit summary", ""]
-    for label, value in _audit_summary_items(session, include_verification_summary=include_verification_summary):
+    for label, value in _audit_summary_items(
+        session,
+        include_verification_summary=include_verification_summary,
+        issue_summary_open_only=issue_summary_open_only,
+    ):
         lines.append(f"- {label}: {normalize_math_delimiters(value)}")
     lines.append("")
     return "\n".join(lines)
 
 
-def _audit_summary_tex(session: dict[str, Any], include_verification_summary: bool = True) -> str:
+def _audit_summary_tex(
+    session: dict[str, Any],
+    include_verification_summary: bool = True,
+    issue_summary_open_only: bool = False,
+) -> str:
     parts = [
         r"\phantomsection",
         r"\addcontentsline{toc}{section}{Audit summary}",
         r"\section*{Audit summary}",
         r"\begin{itemize}",
     ]
-    for label, value in _audit_summary_items(session, include_verification_summary=include_verification_summary):
+    for label, value in _audit_summary_items(
+        session,
+        include_verification_summary=include_verification_summary,
+        issue_summary_open_only=issue_summary_open_only,
+    ):
         parts.append(r"\item " + _report_latex_paragraph_local(f"{label}: {value}"))
     parts.append(r"\end{itemize}")
     return "\n".join(parts) + "\n"
@@ -2108,6 +2175,7 @@ def _insert_markdown_report_front_matter(
     session: dict[str, Any],
     include_audit_summary: bool = True,
     include_verification_summary: bool = True,
+    issue_summary_open_only: bool = False,
 ) -> str:
     text = str(text or "").strip() + "\n"
     lines = text.splitlines()
@@ -2115,7 +2183,13 @@ def _insert_markdown_report_front_matter(
         body = text.strip()
         front_parts = [_markdown_toc(body).strip()]
         if include_audit_summary:
-            front_parts.append(_audit_summary_markdown(session, include_verification_summary=include_verification_summary).strip())
+            front_parts.append(
+                _audit_summary_markdown(
+                    session,
+                    include_verification_summary=include_verification_summary,
+                    issue_summary_open_only=issue_summary_open_only,
+                ).strip()
+            )
         return ("\n\n".join(part for part in front_parts if part) + "\n\n" + body).strip() + "\n"
 
     body_start = 1
@@ -2136,7 +2210,13 @@ def _insert_markdown_report_front_matter(
     body = "\n".join(lines[body_start:]).strip()
     front_parts = [_markdown_toc(body).strip()]
     if include_audit_summary:
-        front_parts.append(_audit_summary_markdown(session, include_verification_summary=include_verification_summary).strip())
+        front_parts.append(
+            _audit_summary_markdown(
+                session,
+                include_verification_summary=include_verification_summary,
+                issue_summary_open_only=issue_summary_open_only,
+            ).strip()
+        )
     front_matter = "\n\n".join(part for part in front_parts if part)
     return (header + "\n\n" + front_matter + "\n\n" + body).strip() + "\n"
 
@@ -2173,6 +2253,7 @@ def _insert_tex_report_front_matter(
     session: dict[str, Any],
     include_audit_summary: bool = True,
     include_verification_summary: bool = True,
+    issue_summary_open_only: bool = False,
 ) -> str:
     text = str(text or "")
     if r"\tableofcontents" in text and r"\section*{Audit summary}" in text:
@@ -2190,7 +2271,11 @@ def _insert_tex_report_front_matter(
     if include_audit_summary:
         front_lines.extend(
             [
-                _audit_summary_tex(session, include_verification_summary=include_verification_summary).strip(),
+                _audit_summary_tex(
+                    session,
+                    include_verification_summary=include_verification_summary,
+                    issue_summary_open_only=issue_summary_open_only,
+                ).strip(),
                 r"\clearpage",
             ]
         )
@@ -2539,6 +2624,7 @@ def build_final_report(
     report_json = {
         "session": load_session_from_pdf(session["pdf_path"]),
         "status": load_status(session),
+        "audit_summary": [{"label": label, "value": value} for label, value in _audit_summary_items(session)],
         "ledger": load_ledger(session),
         "issues": load_issues(session),
         "usage": load_usage(session),
@@ -2847,6 +2933,7 @@ def build_concise_report_markdown(
         session,
         include_audit_summary=normalized_options.get("include_audit_summary", True),
         include_verification_summary=normalized_options.get("include_verification_summary", True),
+        issue_summary_open_only=normalized_options.get("only_open_issues", True),
     ).rstrip() + "\n"
 
 
@@ -2909,6 +2996,7 @@ def build_concise_report_tex(
         session,
         include_audit_summary=normalized_options.get("include_audit_summary", True),
         include_verification_summary=normalized_options.get("include_verification_summary", True),
+        issue_summary_open_only=normalized_options.get("only_open_issues", True),
     )
 
 
@@ -2932,6 +3020,7 @@ def build_concise_report_json(
                 for label, value in _audit_summary_items(
                     session,
                     include_verification_summary=normalized_options.get("include_verification_summary", True),
+                    issue_summary_open_only=normalized_options.get("only_open_issues", True),
                 )
             ]
             if normalized_options.get("include_audit_summary", True)

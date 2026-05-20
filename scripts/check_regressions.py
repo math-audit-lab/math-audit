@@ -17,7 +17,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import audit_runtime as runtime
 from audit_chunking import ensure_chunk_display_labels, pdf_chunk_display_label
-from audit_policy_hooks import _build_running_audit_context_for_chunk, _report_latex_paragraph_local, build_user_message_for_chunk
+from audit_policy_hooks import (
+    _audit_summary_markdown,
+    _audit_summary_tex,
+    _build_running_audit_context_for_chunk,
+    _report_latex_paragraph_local,
+    build_user_message_for_chunk,
+)
 from audit_runtime import (
     FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH,
     FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY,
@@ -735,6 +741,50 @@ def test_report_latex_unicode_math_safety() -> None:
         _assert("\\\\lambda" not in rendered, rendered)
 
 
+def test_issue_severity_summary_in_audit_summary() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_issue_summary_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        paths = session_paths(workdir)
+        _write_json(
+            paths["issues"],
+            {
+                "next_issue_id": 7,
+                "issues": [
+                    {"issue_id": "I001", "severity": "critical", "status": "open"},
+                    {"issue_id": "I002", "severity": "high", "status": "open"},
+                    {"issue_id": "I003", "severity": "medium", "status": "resolved"},
+                    {"issue_id": "I004", "severity": "low", "status": "open"},
+                    {"issue_id": "I005", "severity": "severe", "status": "open"},
+                    {"issue_id": "I006", "severity": "high", "status": "closed"},
+                ],
+                "updated_at": NEW,
+            },
+        )
+
+        full_summary = _audit_summary_markdown(session)
+        _assert("- Issue severity summary: all saved issues" in full_summary, full_summary)
+        _assert("- Critical: 1" in full_summary, full_summary)
+        _assert("- High: 2" in full_summary, full_summary)
+        _assert("- Medium: 1" in full_summary, full_summary)
+        _assert("- Low: 1" in full_summary, full_summary)
+        _assert("- Unknown severity: 1" in full_summary, full_summary)
+        _assert("- Total issues: 6" in full_summary, full_summary)
+
+        concise_summary = _audit_summary_markdown(session, issue_summary_open_only=True)
+        _assert("- Open issue severity summary: open issues only" in concise_summary, concise_summary)
+        _assert("- Critical: 1" in concise_summary, concise_summary)
+        _assert("- High: 1" in concise_summary, concise_summary)
+        _assert("- Medium: 0" in concise_summary, concise_summary)
+        _assert("- Low: 1" in concise_summary, concise_summary)
+        _assert("- Unknown severity: 1" in concise_summary, concise_summary)
+        _assert("- Total open issues: 4" in concise_summary, concise_summary)
+
+        concise_tex = _audit_summary_tex(session, issue_summary_open_only=True)
+        _assert(r"\item Open issue severity summary: open issues only" in concise_tex, concise_tex)
+        _assert(r"\item Total open issues: 4" in concise_tex, concise_tex)
+
+
 def test_fresh_rerun_request_metadata() -> None:
     with tempfile.TemporaryDirectory(prefix="math_audit_fresh_rerun_") as tmp:
         workdir = Path(tmp) / "paper_audit"
@@ -909,6 +959,7 @@ def main() -> int:
         ("TeX macro glossary prompt block", test_tex_macro_glossary_in_chunk_prompt),
         ("request size diagnostics", test_request_size_diagnostics),
         ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
+        ("issue severity summary in audit summary", test_issue_severity_summary_in_audit_summary),
         ("fresh rerun request metadata", test_fresh_rerun_request_metadata),
         ("usage cache diagnostics", test_usage_cache_diagnostics),
         ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),
