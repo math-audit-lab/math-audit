@@ -39,6 +39,7 @@ from audit_runtime import (
     build_verification_report as runtime_build_verification_report,
     format_list_for_markdown,
     normalize_math_delimiters,
+    normalize_report_latex_unicode_math,
     report_latex_paragraph,
     sanitize_ascii_punctuation,
     _verbatim_block,
@@ -1442,24 +1443,7 @@ def _extract_safe_report_preamble(tex_path: str | Path | None) -> str:
 
 
 def _normalize_report_latex_unicode_math(s: str) -> str:
-    s = "" if s is None else str(s)
-    repl = {
-        "∇": r"\\nabla",
-        "ρ": r"\\rho",
-        "λ": r"\\lambda",
-        "Λ": r"\\Lambda",
-        "≤": r" \\le ",
-        "≥": r" \\ge ",
-        "≪": r" \\ll ",
-        "≫": r" \\gg ",
-        "≍": r" \\asymp ",
-        "≈": r" \\approx ",
-        "→": r" \\to ",
-        "∞": r"\\infty",
-    }
-    for k, v in repl.items():
-        s = s.replace(k, v)
-    return s
+    return normalize_report_latex_unicode_math(s)
 
 
 def _report_escape_text(s: str) -> str:

@@ -211,6 +211,7 @@ def _repair_json_escape_artifacts(text: str) -> str:
     text = "" if text is None else str(text)
     for bad, replacement in _JSON_ESCAPE_ARTIFACTS.items():
         text = text.replace(bad, replacement)
+    text = text.replace(r"\u000b", " ").replace(r"\u000B", " ")
     return text
 
 
@@ -252,6 +253,31 @@ def sanitize_ascii_punctuation(text: str) -> str:
     return text
 
 
+def normalize_report_latex_unicode_math(text: str) -> str:
+    text = "" if text is None else str(text)
+    text = re.sub(r"√\s*\{([^{}]+)\}", r"\\sqrt{\1}", text)
+    text = re.sub(r"√\s*\(([^()]+)\)", r"\\sqrt{\1}", text)
+    text = re.sub(r"√\s*([A-Za-z0-9]+)", r"\\sqrt{\1}", text)
+    text = text.replace("√", r"\sqrt{}")
+    repl = {
+        "∇": r"\nabla",
+        "ρ": r"\rho",
+        "λ": r"\lambda",
+        "Λ": r"\Lambda",
+        "≤": r" \le ",
+        "≥": r" \ge ",
+        "≪": r" \ll ",
+        "≫": r" \gg ",
+        "≍": r" \asymp ",
+        "≈": r" \approx ",
+        "→": r" \to ",
+        "∞": r"\infty",
+    }
+    for k, v in repl.items():
+        text = text.replace(k, v)
+    return text
+
+
 _DANGEROUS_MATH_COMMAND_RE = re.compile(
     r"\\(?:usepackage|documentclass|begin|end|input|include|newcommand|renewcommand|providecommand|def|write18|openout|catcode|usetikzlibrary|ref|eqref|autoref|cref|Cref|cite)\b"
 )
@@ -259,6 +285,7 @@ _DANGEROUS_MATH_COMMAND_RE = re.compile(
 
 def _report_escape_text(s: str) -> str:
     s = sanitize_ascii_punctuation("" if s is None else str(s))
+    s = normalize_report_latex_unicode_math(s)
     repl = {
         "\\": r"\textbackslash{}",
         "&": r"\&",
@@ -286,6 +313,7 @@ def report_latex_paragraph(text: str) -> str:
             delim = "$$" if part.startswith("$$") else "$"
             body = part[len(delim) : -len(delim)]
             body = sanitize_ascii_punctuation(body)
+            body = normalize_report_latex_unicode_math(body)
             if _DANGEROUS_MATH_COMMAND_RE.search(body):
                 out.append(r"\texttt{" + _report_escape_text(part) + "}")
             else:

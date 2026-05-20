@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import audit_runtime as runtime
 from audit_chunking import ensure_chunk_display_labels, pdf_chunk_display_label
-from audit_policy_hooks import _build_running_audit_context_for_chunk, build_user_message_for_chunk
+from audit_policy_hooks import _build_running_audit_context_for_chunk, _report_latex_paragraph_local, build_user_message_for_chunk
 from audit_runtime import (
     FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH,
     FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY,
@@ -30,6 +30,7 @@ from audit_runtime import (
     get_audit_status,
     get_report_freshness,
     get_verification_suite_status,
+    report_latex_paragraph,
 )
 from audit_state import save_json, session_paths, usage_cache_diagnostics
 
@@ -715,6 +716,25 @@ def test_request_size_diagnostics() -> None:
     _assert(text_only_diagnostics["conversation_state"] == "fresh_text_only_retry_conversation", text_only_diagnostics)
 
 
+def test_report_latex_unicode_math_safety() -> None:
+    text = (
+        "The bound is $c_2√nΛ≤1/2$ and $√(n+1)≥λ$. "
+        "Literal control-escape artifact: $\\rho k\\u000b\\lambda$."
+    )
+    for renderer in (_report_latex_paragraph_local, report_latex_paragraph):
+        rendered = renderer(text)
+        _assert("√" not in rendered, rendered)
+        _assert(r"\sqrt{n}" in rendered, rendered)
+        _assert(r"\sqrt{n+1}" in rendered, rendered)
+        _assert(r"\Lambda" in rendered, rendered)
+        _assert(r"\lambda" in rendered, rendered)
+        _assert(r"\le" in rendered, rendered)
+        _assert(r"\ge" in rendered, rendered)
+        _assert(r"\u000b" not in rendered, rendered)
+        _assert("\\\\Lambda" not in rendered, rendered)
+        _assert("\\\\lambda" not in rendered, rendered)
+
+
 def test_fresh_rerun_request_metadata() -> None:
     with tempfile.TemporaryDirectory(prefix="math_audit_fresh_rerun_") as tmp:
         workdir = Path(tmp) / "paper_audit"
@@ -888,6 +908,7 @@ def main() -> int:
         ("running audit context block", test_running_audit_context_block),
         ("TeX macro glossary prompt block", test_tex_macro_glossary_in_chunk_prompt),
         ("request size diagnostics", test_request_size_diagnostics),
+        ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
         ("fresh rerun request metadata", test_fresh_rerun_request_metadata),
         ("usage cache diagnostics", test_usage_cache_diagnostics),
         ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),
