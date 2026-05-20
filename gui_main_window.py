@@ -571,6 +571,7 @@ class MainWindow(QMainWindow):
         self.cost_value = QLabel("$0.0000")
         self.tokens_value = QLabel("0")
         self.elapsed_value = QLabel("0s")
+        self.cache_reuse_value = QLabel("-")
         self.pause_state_value = QLabel("Not requested")
         self.discussion_cost_value = QLabel("Cost: $0.0000")
         self.discussion_tokens_value = QLabel("Tokens: 0")
@@ -614,10 +615,12 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.elapsed_value, 3, 3)
         grid.addWidget(QLabel("Pause"), 4, 0)
         grid.addWidget(self.pause_state_value, 4, 1, 1, 3)
-        grid.addWidget(QLabel("Discussion usage"), 5, 0)
-        grid.addWidget(self.discussion_cost_value, 5, 1)
-        grid.addWidget(self.discussion_tokens_value, 5, 2)
-        grid.addWidget(self.discussion_turns_value, 5, 3)
+        grid.addWidget(QLabel("Last chunk cache"), 5, 0)
+        grid.addWidget(self.cache_reuse_value, 5, 1, 1, 3)
+        grid.addWidget(QLabel("Discussion usage"), 6, 0)
+        grid.addWidget(self.discussion_cost_value, 6, 1)
+        grid.addWidget(self.discussion_tokens_value, 6, 2)
+        grid.addWidget(self.discussion_turns_value, 6, 3)
 
         layout.addLayout(grid)
         return box
@@ -1113,6 +1116,7 @@ class MainWindow(QMainWindow):
         self.cost_value.setText(f"${display_cost:.4f}")
         self.tokens_value.setText(str(int(totals.get("total_tokens", 0) or 0)))
         self.elapsed_value.setText(self._format_duration(float(totals.get("audit_seconds", 0.0) or 0.0)))
+        self._update_cache_reuse_status(status.get("last_chunk_usage_diagnostics") or {})
         self.discussion_cost_value.setText(f"Cost: ${float(discussion_usage.get('cost_usd', 0.0) or 0.0):.4f}")
         self.discussion_tokens_value.setText(f"Tokens: {int(discussion_usage.get('total_tokens', 0) or 0)}")
         self.discussion_turns_value.setText(f"Turns: {int(discussion_usage.get('turns', 0) or 0)}")
@@ -1172,6 +1176,39 @@ class MainWindow(QMainWindow):
 
         self._update_report_freshness_labels(payload.get("report_freshness") or {})
         self._apply_button_states()
+
+    def _update_cache_reuse_status(self, diagnostics: dict[str, Any]) -> None:
+        if not isinstance(diagnostics, dict) or not diagnostics:
+            self.cache_reuse_value.setText("-")
+            self.cache_reuse_value.setToolTip("")
+            self.cache_reuse_value.setStyleSheet("")
+            return
+        input_tokens = int(diagnostics.get("input_tokens", 0) or 0)
+        if input_tokens <= 0:
+            self.cache_reuse_value.setText("n/a")
+            self.cache_reuse_value.setToolTip("")
+            self.cache_reuse_value.setStyleSheet("")
+            return
+        cached_tokens = int(diagnostics.get("cached_input_tokens", 0) or 0)
+        percent = diagnostics.get("cached_input_percent")
+        if percent is None:
+            percent = float(diagnostics.get("cached_input_ratio", 0.0) or 0.0) * 100.0
+        chunk_id = str(diagnostics.get("chunk_id") or "last chunk")
+        warning = str(diagnostics.get("warning") or "").strip()
+        if warning:
+            self.cache_reuse_value.setText(
+                f"{chunk_id}: {float(percent):.1f}% cached - cost may be higher"
+            )
+            self.cache_reuse_value.setToolTip(
+                f"{warning}\nInput tokens: {input_tokens:,}\nCached input tokens: {cached_tokens:,}"
+            )
+            self.cache_reuse_value.setStyleSheet("color: #b06000; font-weight: 600;")
+        else:
+            self.cache_reuse_value.setText(
+                f"{chunk_id}: {float(percent):.1f}% cached ({cached_tokens:,}/{input_tokens:,})"
+            )
+            self.cache_reuse_value.setToolTip("")
+            self.cache_reuse_value.setStyleSheet("")
 
     def _update_report_freshness_labels(self, freshness: dict[str, Any]) -> None:
         reports = freshness.get("reports") if isinstance(freshness, dict) else {}

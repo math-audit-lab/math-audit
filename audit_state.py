@@ -19,6 +19,10 @@ PRICING_USD_PER_1M = {
 }
 
 LONG_CONTEXT_INPUT_TOKEN_THRESHOLD = 270_000
+LOW_CACHED_INPUT_RATIO_WARNING_THRESHOLD = 0.10
+LOW_CACHED_INPUT_REUSE_WARNING = (
+    "Low cached-input reuse for this chunk; cost may be higher, especially after resume/relaunch."
+)
 
 LONG_CONTEXT_PRICING_USD_PER_1M = {
     "gpt-5.5": {"input": 10.00, "cached_input": 1.00, "output": 45.00},
@@ -229,6 +233,36 @@ def compute_usage_cost(model: str, usage_obj: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def usage_cache_diagnostics(usage_obj: dict[str, Any]) -> dict[str, Any]:
+    usage_obj = usage_obj or {}
+    input_tokens = int(usage_obj.get("input_tokens", 0) or 0)
+    cached_tokens = int(((usage_obj.get("input_tokens_details") or {}).get("cached_tokens", 0)) or 0)
+    output_tokens = int(usage_obj.get("output_tokens", 0) or 0)
+    reasoning_tokens = int(((usage_obj.get("output_tokens_details") or {}).get("reasoning_tokens", 0)) or 0)
+    total_tokens = int(usage_obj.get("total_tokens", 0) or 0)
+    uncached_tokens = max(0, input_tokens - cached_tokens)
+    cached_ratio = (cached_tokens / input_tokens) if input_tokens else None
+    low_cached_input_reuse = (
+        input_tokens > LONG_CONTEXT_INPUT_TOKEN_THRESHOLD
+        and cached_ratio is not None
+        and cached_ratio < LOW_CACHED_INPUT_RATIO_WARNING_THRESHOLD
+    )
+    diagnostics = {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_tokens,
+        "uncached_input_tokens": uncached_tokens,
+        "cached_input_ratio": cached_ratio,
+        "cached_input_percent": round(cached_ratio * 100.0, 1) if cached_ratio is not None else None,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": total_tokens,
+        "low_cached_input_reuse": low_cached_input_reuse,
+    }
+    if low_cached_input_reuse:
+        diagnostics["warning"] = LOW_CACHED_INPUT_REUSE_WARNING
+    return diagnostics
+
+
 def format_duration(seconds: float) -> str:
     try:
         seconds = float(seconds)
@@ -338,6 +372,7 @@ def update_usage_from_usage_obj(
     usage_state = load_usage(session)
     usage_obj = usage_obj or {}
     cost = compute_usage_cost(model or session.get("model") or "gpt-5.4", usage_obj)
+    cache_diagnostics = usage_cache_diagnostics(usage_obj)
 
     totals = usage_state["totals"]
     totals["input_tokens"] += int(usage_obj.get("input_tokens", 0) or 0)
@@ -354,16 +389,19 @@ def update_usage_from_usage_obj(
             "chunk_id": chunk_id,
             "usage": usage_obj,
             "cost": cost,
+            "usage_diagnostics": cache_diagnostics,
             "elapsed_seconds": float(elapsed_seconds or 0.0),
         }
     )
     save_usage(session, usage_state)
-    return {"usage": usage_obj, "cost": cost, "usage_state": usage_state}
+    return {"usage": usage_obj, "cost": cost, "usage_diagnostics": cache_diagnostics, "usage_state": usage_state}
 
 
 __all__ = [
     "LONG_CONTEXT_INPUT_TOKEN_THRESHOLD",
     "LONG_CONTEXT_PRICING_USD_PER_1M",
+    "LOW_CACHED_INPUT_REUSE_WARNING",
+    "LOW_CACHED_INPUT_RATIO_WARNING_THRESHOLD",
     "PRICING_USD_PER_1M",
     "append_jsonl",
     "compute_usage_cost",
@@ -388,6 +426,7 @@ __all__ = [
     "save_usage",
     "session_paths",
     "update_usage_from_usage_obj",
+    "usage_cache_diagnostics",
     "workdir_from_pdf",
     "_ensure_timing_state",
 ]

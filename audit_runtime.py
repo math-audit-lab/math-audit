@@ -37,6 +37,7 @@ from audit_state import (
     save_status,
     session_paths,
     update_usage_from_usage_obj,
+    usage_cache_diagnostics,
     utc_now,
     workdir_from_pdf,
 )
@@ -660,11 +661,23 @@ def get_audit_status(
     status = dict(load_status(session))
     status["pause_requested"] = pause["requested"]
     status["pause_requested_at"] = pause["requested_at"]
+    usage = load_usage(session)
+    if not status.get("last_chunk_usage_diagnostics"):
+        for entry in reversed(usage.get("per_chunk", []) or []):
+            if not isinstance(entry, dict) or not entry.get("usage"):
+                continue
+            diagnostics = entry.get("usage_diagnostics") or usage_cache_diagnostics(entry.get("usage") or {})
+            status["last_chunk_usage_diagnostics"] = {
+                "chunk_id": entry.get("chunk_id"),
+                "cost_usd": (entry.get("cost") or {}).get("total_cost"),
+                **diagnostics,
+            }
+            break
     active_qa_turns = _load_qa_turns(session, active_thread_only=True)
     payload = {
         "session": session,
         "status": status,
-        "usage": load_usage(session),
+        "usage": usage,
         "discussion_usage": _qa_usage_summary_from_turns(active_qa_turns),
         "discussion_thread": _qa_thread_summary(session),
         "report_freshness": get_report_freshness(session),
@@ -4946,6 +4959,18 @@ def update_usage_from_response(session: dict[str, Any], chunk_id: str, resp, ela
     )
 
 
+def _format_cache_diagnostics_for_log(diagnostics: dict[str, Any]) -> str:
+    input_tokens = int(diagnostics.get("input_tokens", 0) or 0)
+    if input_tokens <= 0:
+        return "Cache: n/a"
+    cached_tokens = int(diagnostics.get("cached_input_tokens", 0) or 0)
+    percent = diagnostics.get("cached_input_percent")
+    if percent is None:
+        ratio = diagnostics.get("cached_input_ratio")
+        percent = float(ratio or 0.0) * 100.0
+    return f"Cache: {float(percent):.1f}% ({cached_tokens:,}/{input_tokens:,} input)"
+
+
 def _require_prompt_builder() -> Callable[[dict[str, Any], dict[str, Any]], list[dict[str, Any]]]:
     if _PROMPT_BUILDER_HOOK is None:
         raise RuntimeError(
@@ -5032,6 +5057,7 @@ def finalize_chunk(
     pending = session.get("pending") or {}
     elapsed_seconds = _seconds_since(pending.get("started_at") or pending.get("created_at"))
     usage_update = update_usage_from_response(session, chunk_id, resp, elapsed_seconds=elapsed_seconds)
+    usage_diagnostics = usage_update.get("usage_diagnostics") or usage_cache_diagnostics(usage_update["usage"])
     record = {
         "time": utc_now(),
         "chunk_id": chunk_id,
@@ -5052,6 +5078,7 @@ def finalize_chunk(
         "issue_ids": [x["issue_id"] for x in created_issues],
         "cost_usd": usage_update["cost"]["total_cost"],
         "usage": usage_update["usage"],
+        "usage_diagnostics": usage_diagnostics,
         "elapsed_seconds": float(elapsed_seconds or 0.0),
         "verification_mode": verification_mode,
         "verification_summary": verification_summary,
@@ -5097,6 +5124,11 @@ def finalize_chunk(
         "estimated_pages_completed": chunk["page_end"],
         "estimated_pages_total": manifest["pdf_page_count"],
         "cost_usd": usage_state["totals"]["cost_usd"],
+        "last_chunk_usage_diagnostics": {
+            "chunk_id": chunk_id,
+            "cost_usd": record["cost_usd"],
+            **usage_diagnostics,
+        },
         "total_audit_seconds": float(usage_state["totals"].get("audit_seconds", 0.0) or 0.0),
         "current_chunk_elapsed_seconds": 0.0,
         "audit_started_at": session.get("audit_started_at", session.get("created_at")),
@@ -5113,10 +5145,13 @@ def finalize_chunk(
             f"Pages: {status['estimated_pages_completed']}/{status['estimated_pages_total']} | "
             f"Chunk cost: ${record['cost_usd']:.4f} | "
             f"Chunk time: {format_duration(record['elapsed_seconds'])} | "
+            f"{_format_cache_diagnostics_for_log(usage_diagnostics)} | "
             f"Cumulative cost: ${usage_state['totals']['cost_usd']:.4f} | "
             f"Total audit time: {format_duration(usage_state['totals'].get('audit_seconds', 0.0))} | "
             f"Total tokens: {usage_state['totals']['total_tokens']}"
         )
+        if usage_diagnostics.get("warning"):
+            print(f"[{chunk_id}] Warning: {usage_diagnostics['warning']}")
         if verification_mode != "local_python_only" or verification_summary.get("used_code_interpreter"):
             print(
                 f"[{chunk_id}] Verification mode: {verification_mode} | "

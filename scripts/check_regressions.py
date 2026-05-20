@@ -30,7 +30,7 @@ from audit_runtime import (
     get_report_freshness,
     get_verification_suite_status,
 )
-from audit_state import save_json, session_paths
+from audit_state import save_json, session_paths, usage_cache_diagnostics
 
 
 OLD = "2026-01-01T00:00:00+00:00"
@@ -649,6 +649,38 @@ def test_fresh_rerun_request_metadata() -> None:
         _assert(session["conversation_id"] == "conv-main", "metadata save mutated main conversation id")
 
 
+def test_usage_cache_diagnostics() -> None:
+    low_cache = usage_cache_diagnostics(
+        {
+            "input_tokens": 759_574,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 10_069,
+            "output_tokens_details": {"reasoning_tokens": 6_212},
+            "total_tokens": 769_643,
+        }
+    )
+    _assert(low_cache["cached_input_tokens"] == 0, low_cache)
+    _assert(low_cache["uncached_input_tokens"] == 759_574, low_cache)
+    _assert(low_cache["cached_input_percent"] == 0.0, low_cache)
+    _assert(low_cache["output_tokens"] == 10_069, low_cache)
+    _assert(low_cache["reasoning_tokens"] == 6_212, low_cache)
+    _assert(low_cache["low_cached_input_reuse"], low_cache)
+    _assert("resume/relaunch" in low_cache.get("warning", ""), low_cache)
+
+    healthy_cache = usage_cache_diagnostics(
+        {
+            "input_tokens": 768_079,
+            "input_tokens_details": {"cached_tokens": 749_824},
+            "output_tokens": 8_300,
+            "output_tokens_details": {"reasoning_tokens": 4_137},
+            "total_tokens": 776_379,
+        }
+    )
+    _assert(healthy_cache["cached_input_percent"] == 97.6, healthy_cache)
+    _assert(not healthy_cache["low_cached_input_reuse"], healthy_cache)
+    _assert("warning" not in healthy_cache, healthy_cache)
+
+
 def test_retryable_file_download_timeout_detection() -> None:
     failure = {
         "chunk_id": "chunk_005",
@@ -731,6 +763,7 @@ def main() -> int:
         ("TeX macro glossary prompt block", test_tex_macro_glossary_in_chunk_prompt),
         ("request size diagnostics", test_request_size_diagnostics),
         ("fresh rerun request metadata", test_fresh_rerun_request_metadata),
+        ("usage cache diagnostics", test_usage_cache_diagnostics),
         ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),
     ]
     results = [_run_case(name, func) for name, func in cases]
