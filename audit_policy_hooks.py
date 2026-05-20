@@ -26,9 +26,11 @@ from audit_verification import (
     load_verification_state,
 )
 from audit_runtime import (
+    AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL,
     PDF_TEXT_ONLY_RETRY_NOTE,
     _coerce_audit_payload,
     _ensure_timing_state,
+    _normalize_audit_context_mode,
     _normalize_python_check_entry,
     _normalize_reference_mention_style,
     _normalize_report_reference_style,
@@ -36,6 +38,7 @@ from audit_runtime import (
     _repair_json_escape_artifacts,
     _strip_unsafe_control_chars,
     _verification_inventory_warning,
+    build_fresh_audit_context_for_chunk,
     build_verification_report as runtime_build_verification_report,
     format_list_for_markdown,
     normalize_math_delimiters,
@@ -996,7 +999,15 @@ def build_user_message_for_chunk(session: dict[str, Any], chunk: dict[str, Any])
     if suppress_pdf_attachment:
         note = normalize_whitespace(str(chunk.get("_pdf_attachment_disabled_note") or PDF_TEXT_ONLY_RETRY_NOTE))
         pdf_attachment_note = f"\nPDF attachment note for this retry:\n{note}\n"
-    running_context = _build_running_audit_context_for_chunk(session, chunk)
+    if _normalize_audit_context_mode(session.get("audit_context_mode")) == AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL:
+        fresh_context = build_fresh_audit_context_for_chunk(session, chunk)
+        running_context = str(fresh_context.get("block") or "")
+        chunk["_retrieved_context_entry_count"] = int(fresh_context.get("entry_count") or 0)
+        chunk["_retrieved_context_chars"] = int(fresh_context.get("chars") or len(running_context))
+    else:
+        running_context = _build_running_audit_context_for_chunk(session, chunk)
+        chunk["_retrieved_context_entry_count"] = 0
+        chunk["_retrieved_context_chars"] = 0
     macro_glossary = _build_tex_macro_glossary_for_chunk(session, chunk, context_text=running_context)
     prompt_text = f"""Audit this mathematics-paper chunk rigorously.
 

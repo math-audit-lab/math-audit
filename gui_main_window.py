@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui_controller import DEFAULT_MODEL, MODEL_CHOICES, GuiController
+from gui_controller import AUDIT_CONTEXT_MODE_CHOICES, AUDIT_CONTEXT_MODE_LABELS, DEFAULT_MODEL, MODEL_CHOICES, GuiController
 
 
 class AuditPromptDialog(QDialog):
@@ -455,6 +455,7 @@ class MainWindow(QMainWindow):
         self.controller.task_running_changed.connect(self._on_task_running_changed)
         self.controller.cancel_task_running_changed.connect(lambda _running: self._apply_button_states())
         self.controller.audit_settings_changed.connect(self._on_audit_settings_changed)
+        self.controller.audit_context_mode_changed.connect(self._on_audit_context_mode_changed)
 
         self.model_combo.setCurrentText(DEFAULT_MODEL)
         self._refresh_reasoning_options(DEFAULT_MODEL)
@@ -516,6 +517,16 @@ class MainWindow(QMainWindow):
         self.reasoning_combo = QComboBox()
         self.reasoning_combo.currentTextChanged.connect(self.controller.set_reasoning_effort)
         layout.addRow("Reasoning effort", self.reasoning_combo)
+
+        self.audit_context_mode_combo = QComboBox()
+        self.audit_context_mode_combo.addItems(AUDIT_CONTEXT_MODE_CHOICES)
+        self.audit_context_mode_combo.setToolTip(
+            "Advanced experimental setting. Continuous conversation preserves current behavior. "
+            "Fresh-context mode uses a new Responses conversation per chunk with retrieved saved context; "
+            "it may reduce accumulated-context/file-service fragility but can change behavior and cost."
+        )
+        self.audit_context_mode_combo.currentTextChanged.connect(self.controller.set_audit_context_mode)
+        layout.addRow("Context mode", self.audit_context_mode_combo)
 
         self.audit_prompt_button = QPushButton("Advanced Prompt Settings...")
         self.audit_prompt_button.setToolTip(
@@ -996,6 +1007,14 @@ class MainWindow(QMainWindow):
 
     def _on_audit_settings_changed(self, model: str, reasoning_effort: str) -> None:
         self._set_model_effort_controls(model, reasoning_effort)
+
+    def _on_audit_context_mode_changed(self, mode: str) -> None:
+        label = next((label for label, value in AUDIT_CONTEXT_MODE_LABELS.items() if value == mode), None)
+        if not label:
+            return
+        self.audit_context_mode_combo.blockSignals(True)
+        self.audit_context_mode_combo.setCurrentText(label)
+        self.audit_context_mode_combo.blockSignals(False)
 
     def _on_discussion_threads_loaded(self, threads: list[dict[str, Any]], active_thread_id: str) -> None:
         self.discussion_thread_combo.blockSignals(True)

@@ -77,6 +77,17 @@ _DISPLAY_AUDIT_HOOK: Optional[Callable[[dict[str, Any]], None]] = None
 LEGACY_QA_THREAD_ID = "thread_legacy"
 QA_CONTEXT_MODES = ("reduced_audit_context", "full_audit_context")
 DEFAULT_QA_CONTEXT_MODE = "full_audit_context"
+AUDIT_CONTEXT_MODE_CONTINUOUS = "continuous"
+AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL = "fresh_context_experimental"
+AUDIT_CONTEXT_MODES = (
+    AUDIT_CONTEXT_MODE_CONTINUOUS,
+    AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL,
+)
+DEFAULT_AUDIT_CONTEXT_MODE = AUDIT_CONTEXT_MODE_CONTINUOUS
+FRESH_CONTEXT_TEXT_FIRST_NOTE = (
+    "This audit request uses explicit extracted chunk text and retrieved context instead of accumulated "
+    "PDF conversation context. Do not overclaim visual PDF/reference precision."
+)
 PDF_TEXT_ONLY_RETRY_NOTE = (
     "PDF attachment disabled for this retry due to repeated API file-download timeout. "
     "Rely on extracted chunk text, reference-map/page metadata, and running audit context. "
@@ -87,6 +98,15 @@ FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH = "reattach_pdf"
 FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY = "text_only_fresh_conversation"
 FILE_DOWNLOAD_TIMEOUT_AUTO_RETRY_MAX = 2
 FILE_DOWNLOAD_TIMEOUT_AUTO_RETRY_DELAY_SECONDS = 5.0
+
+
+def _normalize_audit_context_mode(audit_context_mode: Optional[str] = None) -> str:
+    clean = str(audit_context_mode or DEFAULT_AUDIT_CONTEXT_MODE).strip()
+    if clean not in AUDIT_CONTEXT_MODES:
+        raise ValueError(
+            "audit_context_mode must be one of: " + ", ".join(AUDIT_CONTEXT_MODES)
+        )
+    return clean
 
 
 def _normalize_qa_context_mode(qa_context_mode: Optional[str] = None) -> str:
@@ -4574,6 +4594,258 @@ def add_issues_from_audit(session: dict[str, Any], chunk_id: str, issues_payload
     return created
 
 
+def _audit_context_db_path(session: dict[str, Any]) -> Path:
+    return session_paths(session["workdir"])["audit_context_db"]
+
+
+def _compact_context_text(text: Any, limit: int = 900) -> str:
+    clean = re.sub(r"\s+", " ", _strip_unsafe_control_chars(str(text or ""))).strip()
+    return _truncate_text(clean, limit=limit)
+
+
+def _classify_context_entry_kind(text: str, default: str = "assumption") -> str:
+    lower = str(text or "").lower()
+    if any(word in lower for word in ("ambiguous", "ambiguity", "unclear", "not clear", "unresolved")):
+        return "ambiguity"
+    if any(word in lower for word in ("definition", "defined", "denote", "denotes", "write ", "notation", "symbol")):
+        return "definition" if "definition" in lower or "defined" in lower else "notation"
+    if any(word in lower for word in ("regime", "asymptotic", "parameter range", "for all", "uniformly", "assume")):
+        return "regime" if "regime" in lower or "asymptotic" in lower or "uniformly" in lower else "assumption"
+    if any(word in lower for word in ("depends on", "dependency", "uses theorem", "uses lemma", "relies on", "requires")):
+        return "dependency"
+    return default
+
+
+def _context_base_entry(
+    chunk: dict[str, Any],
+    kind: str,
+    text: str,
+    ordinal: int,
+    confidence: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    chunk_id = str(chunk.get("chunk_id") or "chunk")
+    entry = {
+        "entry_id": f"{chunk_id}:{kind}:{ordinal:03d}:{_artifact_timestamp_token()}",
+        "time": utc_now(),
+        "kind": kind,
+        "text": _compact_context_text(text),
+        "source_chunk_id": chunk_id,
+        "source_chunk_index": chunk.get("chunk_index"),
+        "page_start": chunk.get("page_start"),
+        "page_end": chunk.get("page_end"),
+        "label": chunk.get("label"),
+        "boundary": chunk.get("boundary"),
+        "confidence": confidence,
+    }
+    entry.update({key: value for key, value in extra.items() if value is not None})
+    return entry
+
+
+def _append_audit_context_db_entries(
+    session: dict[str, Any],
+    chunk: dict[str, Any],
+    audit: dict[str, Any],
+    created_issues: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    ordinal = 1
+
+    def add(kind: str, text: Any, confidence: str = "source-derived", **extra: Any) -> None:
+        nonlocal ordinal
+        clean = _compact_context_text(text)
+        if not clean:
+            return
+        entries.append(_context_base_entry(chunk, kind, clean, ordinal, confidence, **extra))
+        ordinal += 1
+
+    issue_count = len(audit.get("issues") or [])
+    verified_count = len(audit.get("verified_steps") or [])
+    notation_count = len(audit.get("assumptions_and_notation") or [])
+    summary = (
+        f"{chunk.get('chunk_id')}: {chunk.get('label') or chunk.get('boundary') or 'chunk'}; "
+        f"pages {chunk.get('page_start')}-{chunk.get('page_end')}; "
+        f"{notation_count} notation/assumption items, {verified_count} verified/contextual steps, "
+        f"{issue_count} issues; confidence {audit.get('confidence') or 'unknown'}."
+    )
+    add("chunk_summary", summary, confidence="source-derived")
+
+    for item in audit.get("assumptions_and_notation") or []:
+        clean = _compact_context_text(item)
+        add(_classify_context_entry_kind(clean, default="notation"), clean, confidence="source-derived")
+
+    for item in audit.get("verified_steps") or []:
+        add("verified_step", item, confidence="source-derived")
+
+    ledger = audit.get("ledger_updates") if isinstance(audit.get("ledger_updates"), dict) else {}
+    for item in ledger.get("assumptions", []) or []:
+        clean = _compact_context_text(item)
+        add(_classify_context_entry_kind(clean, default="assumption"), clean, confidence="source-derived")
+    for item in ledger.get("notes", []) or []:
+        clean = _compact_context_text(item)
+        add(_classify_context_entry_kind(clean, default="dependency"), clean, confidence="source-derived")
+
+    for issue in created_issues or []:
+        text = " | ".join(
+            _compact_context_text(issue.get(key), limit=320)
+            for key in ("title", "location", "description")
+            if _compact_context_text(issue.get(key), limit=320)
+        )
+        add(
+            "issue",
+            text,
+            confidence="source-derived",
+            issue_id=issue.get("issue_id"),
+            severity=issue.get("severity"),
+            status=issue.get("status"),
+        )
+
+    hint = _compact_context_text(audit.get("next_boundary_hint"))
+    if hint:
+        add("next_boundary_hint", hint, confidence="source-derived")
+
+    path = _audit_context_db_path(session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for entry in entries:
+        append_jsonl(path, entry)
+    return entries
+
+
+def _read_audit_context_db(session: dict[str, Any]) -> list[dict[str, Any]]:
+    path = _audit_context_db_path(session)
+    if not path.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        try:
+            item = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(item, dict):
+            entries.append(item)
+    return entries
+
+
+def _context_query_terms(chunk: dict[str, Any]) -> set[str]:
+    text = " ".join(
+        str(chunk.get(key) or "")
+        for key in ("chunk_text", "label", "boundary")
+    )
+    terms = {item.lower() for item in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text)}
+    terms.update(item.lower() for item in re.findall(r"\\[A-Za-z]+", text))
+    return terms
+
+
+def _context_entry_score(entry: dict[str, Any], query_terms: set[str]) -> int:
+    haystack = " ".join(
+        str(entry.get(key) or "")
+        for key in ("kind", "text", "label", "boundary", "issue_id", "severity")
+    ).lower()
+    score = sum(1 for term in query_terms if term and term in haystack)
+    kind = str(entry.get("kind") or "")
+    if kind in {"definition", "notation", "assumption", "regime", "dependency", "ambiguity"}:
+        score += 2
+    return score
+
+
+def build_fresh_audit_context_for_chunk(
+    session: dict[str, Any],
+    chunk: dict[str, Any],
+    max_chars: int = 12000,
+    recent_summary_limit: int = 4,
+) -> dict[str, Any]:
+    current_index = _chunk_index_from_chunk_id(chunk.get("chunk_id")) or chunk.get("chunk_index")
+    try:
+        current_index = int(current_index)
+    except Exception:
+        current_index = None
+    prior_entries = []
+    for entry in _read_audit_context_db(session):
+        try:
+            source_index = int(entry.get("source_chunk_index") or 0)
+        except Exception:
+            source_index = 0
+        if current_index is not None and source_index >= current_index:
+            continue
+        prior_entries.append(entry)
+
+    def sort_key(entry: dict[str, Any]) -> tuple[int, str]:
+        try:
+            idx = int(entry.get("source_chunk_index") or 0)
+        except Exception:
+            idx = 0
+        return (idx, str(entry.get("entry_id") or ""))
+
+    summaries = [entry for entry in prior_entries if entry.get("kind") == "chunk_summary"]
+    summaries.sort(key=sort_key)
+    selected: list[dict[str, Any]] = summaries[-recent_summary_limit:]
+
+    priority_issue_entries = [
+        entry
+        for entry in prior_entries
+        if entry.get("kind") == "issue"
+        and str(entry.get("status") or "open").lower() != "resolved"
+        and str(entry.get("severity") or "").lower() in {"critical", "high"}
+    ]
+    priority_issue_entries.sort(
+        key=lambda entry: (
+            0 if str(entry.get("severity") or "").lower() == "critical" else 1,
+            sort_key(entry),
+        )
+    )
+    selected.extend(priority_issue_entries)
+
+    selected_ids = {str(entry.get("entry_id") or "") for entry in selected}
+    query_terms = _context_query_terms(chunk)
+    scored = []
+    for entry in prior_entries:
+        entry_id = str(entry.get("entry_id") or "")
+        if entry_id in selected_ids:
+            continue
+        score = _context_entry_score(entry, query_terms)
+        if score > 0:
+            scored.append((score, entry))
+    scored.sort(key=lambda item: (-item[0], sort_key(item[1])))
+    selected.extend(entry for _score, entry in scored)
+
+    lines = [
+        "Retrieved fresh-context audit database context:",
+        "Use this compact saved-state context conservatively; the current chunk text below is authoritative.",
+        FRESH_CONTEXT_TEXT_FIRST_NOTE,
+    ]
+    included: list[dict[str, Any]] = []
+    for entry in selected:
+        label = " | ".join(
+            part
+            for part in [
+                str(entry.get("kind") or "context"),
+                str(entry.get("source_chunk_id") or ""),
+                f"pages {entry.get('page_start')}-{entry.get('page_end')}",
+                str(entry.get("issue_id") or ""),
+                str(entry.get("severity") or ""),
+            ]
+            if part.strip()
+        )
+        line = f"- {label}: {_compact_context_text(entry.get('text'), limit=420)}"
+        candidate = "\n".join(lines + [line, "End retrieved fresh-context audit database context."])
+        if len(candidate) > int(max_chars):
+            break
+        lines.append(line)
+        included.append(entry)
+
+    if not included:
+        lines.append("- No prior context database entries are available yet.")
+    lines.append("End retrieved fresh-context audit database context.")
+    block = _strip_unsafe_control_chars("\n".join(lines).strip())
+    return {
+        "block": block,
+        "entries": included,
+        "entry_count": len(included),
+        "chars": len(block),
+        "max_chars": int(max_chars),
+    }
+
+
 def _parse_iso_utc(ts: str | None):
     if not ts:
         return None
@@ -4624,6 +4896,7 @@ def _save_request_metadata(
         "chunk_index": chunk.get("chunk_index"),
         "label": chunk.get("label"),
         "boundary": chunk.get("boundary"),
+        "audit_context_mode": _normalize_audit_context_mode(session.get("audit_context_mode")),
         "verification_mode": verification_mode,
         "used_code_interpreter_tool": bool(used_code_interpreter_tool),
         "code_interpreter_file_ids": list(code_interpreter_file_ids or []),
@@ -4636,6 +4909,19 @@ def _save_request_metadata(
             "disabled": True,
             "reason": "repeated_file_download_timeout",
             "note": chunk.get("_pdf_attachment_disabled_note") or PDF_TEXT_ONLY_RETRY_NOTE,
+        }
+    elif chunk.get("_fresh_context_conversation"):
+        payload["pdf_attachment"] = {
+            "disabled": bool(chunk.get("_suppress_pdf_attachment")),
+            "reason": "fresh_context_experimental_text_first",
+            "note": chunk.get("_pdf_attachment_disabled_note") or FRESH_CONTEXT_TEXT_FIRST_NOTE,
+        }
+        payload["fresh_context"] = {
+            "fresh_context_conversation": True,
+            "main_conversation_id": chunk.get("_main_conversation_id"),
+            "fresh_context_conversation_id": chunk.get("_fresh_context_conversation_id"),
+            "retrieved_context_entry_count": int(chunk.get("_retrieved_context_entry_count") or 0),
+            "retrieved_context_chars": int(chunk.get("_retrieved_context_chars") or 0),
         }
     if chunk.get("_rerun_id") or chunk.get("_extra_rerun_instruction"):
         payload["rerun"] = {
@@ -4918,6 +5204,19 @@ def _pause_audit_after_chunk_failure(
             "reason": "repeated_file_download_timeout",
             "note": chunk.get("_pdf_attachment_disabled_note") or PDF_TEXT_ONLY_RETRY_NOTE,
         }
+    elif chunk.get("_fresh_context_conversation"):
+        failure_summary["pdf_attachment"] = {
+            "disabled": bool(chunk.get("_suppress_pdf_attachment")),
+            "reason": "fresh_context_experimental_text_first",
+            "note": chunk.get("_pdf_attachment_disabled_note") or FRESH_CONTEXT_TEXT_FIRST_NOTE,
+        }
+        failure_summary["fresh_context"] = {
+            "fresh_context_conversation": True,
+            "main_conversation_id": chunk.get("_main_conversation_id"),
+            "fresh_context_conversation_id": chunk.get("_fresh_context_conversation_id"),
+            "retrieved_context_entry_count": int(chunk.get("_retrieved_context_entry_count") or 0),
+            "retrieved_context_chars": int(chunk.get("_retrieved_context_chars") or 0),
+        }
     if chunk.get("_fresh_rerun_conversation"):
         failure_summary["rerun_conversation"] = {
             "fresh_rerun_conversation": True,
@@ -5087,11 +5386,16 @@ def _audit_request_size_diagnostics(
     user_texts = _request_input_text_parts(request_kwargs, role="user")
     user_prompt_text = "\n".join(user_texts)
     system_prompt = str(session.get("audit_system_prompt") or AUDIT_SYSTEM_PROMPT)
-    text_only_retry = bool(chunk.get("_pdf_text_only_retry") or chunk.get("_suppress_pdf_attachment"))
+    audit_context_mode = _normalize_audit_context_mode(session.get("audit_context_mode"))
+    fresh_context = bool(chunk.get("_fresh_context_conversation")) or audit_context_mode == AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL
+    text_only_retry = bool(chunk.get("_pdf_text_only_retry"))
+    pdf_suppressed = bool(chunk.get("_suppress_pdf_attachment"))
     fresh_rerun = bool(chunk.get("_fresh_rerun_conversation"))
     developer_prompt_included = bool(developer_texts)
     conversation_state = "reused_seeded_conversation"
-    if text_only_retry and fresh_rerun:
+    if fresh_context:
+        conversation_state = "fresh_context_conversation"
+    elif text_only_retry and fresh_rerun:
         conversation_state = "fresh_rerun_text_only_retry_conversation"
     elif text_only_retry:
         conversation_state = "fresh_text_only_retry_conversation"
@@ -5106,6 +5410,7 @@ def _audit_request_size_diagnostics(
         previous_conversation_id = last_text_only.get("previous_conversation_id")
 
     return {
+        "audit_context_mode": audit_context_mode,
         "audit_system_prompt_length": len(system_prompt),
         "developer_prompt_included": developer_prompt_included,
         "developer_prompt_payload_length": sum(len(text) for text in developer_texts),
@@ -5117,17 +5422,26 @@ def _audit_request_size_diagnostics(
             "Running audit context from earlier chunks:",
             ["Paper macro glossary for this chunk:", "Chunk text:"],
         ),
+        "retrieved_fresh_context_length": _prompt_section_length(
+            user_prompt_text,
+            "Retrieved fresh-context audit database context:",
+            ["Paper macro glossary for this chunk:", "Chunk text:"],
+        ),
         "tex_macro_glossary_length": _prompt_section_length(
             user_prompt_text,
             "Paper macro glossary for this chunk:",
             ["Chunk text:"],
         ),
         "pdf_attachment_included": _request_includes_pdf_attachment(request_kwargs),
+        "pdf_attachment_suppressed": pdf_suppressed,
         "pdf_attached_in_conversation_before_request": bool(session.get("pdf_attached_in_conversation", False)),
         "text_only_fallback_active": text_only_retry,
         "conversation_id": request_kwargs.get("conversation"),
         "conversation_state": conversation_state,
         "fresh_conversation_for_text_only_retry": text_only_retry,
+        "fresh_context_conversation": fresh_context,
+        "retrieved_context_entry_count": int(chunk.get("_retrieved_context_entry_count") or 0),
+        "retrieved_context_chars": int(chunk.get("_retrieved_context_chars") or 0),
         "fresh_rerun_conversation": fresh_rerun,
         "rerun_kind": chunk.get("_rerun_kind"),
         "original_conversation_id": chunk.get("_main_conversation_id"),
@@ -5242,6 +5556,7 @@ def finalize_chunk(
     extracted = save_patch_and_code_files(session, chunk_id, audit)
     created_issues = add_issues_from_audit(session, chunk_id, audit.get("issues", []))
     update_ledger_from_audit(session, audit)
+    context_entries = _append_audit_context_db_entries(session, chunk, audit, created_issues)
     pending = session.get("pending") or {}
     elapsed_seconds = _seconds_since(pending.get("started_at") or pending.get("created_at"))
     usage_update = update_usage_from_response(session, chunk_id, resp, elapsed_seconds=elapsed_seconds)
@@ -5271,6 +5586,7 @@ def finalize_chunk(
         "verification_mode": verification_mode,
         "verification_summary": verification_summary,
         "verification_path": str(verification_path) if verification_path else None,
+        "audit_context_db_entries": len(context_entries),
     }
     if chunk.get("_pdf_text_only_retry"):
         record["pdf_attachment"] = {
@@ -5285,6 +5601,15 @@ def finalize_chunk(
             "main_conversation_id": chunk.get("_main_conversation_id"),
             "rerun_conversation_id": chunk.get("_fresh_rerun_conversation_id"),
         }
+    if chunk.get("_fresh_context_conversation"):
+        record["fresh_context"] = {
+            "fresh_context_conversation": True,
+            "main_conversation_id": chunk.get("_main_conversation_id"),
+            "fresh_context_conversation_id": chunk.get("_fresh_context_conversation_id"),
+            "retrieved_context_entry_count": int(chunk.get("_retrieved_context_entry_count") or 0),
+            "retrieved_context_chars": int(chunk.get("_retrieved_context_chars") or 0),
+            "pdf_attachment_suppressed": bool(chunk.get("_suppress_pdf_attachment")),
+        }
     append_jsonl(session_paths(session["workdir"])["chunk_records"], record)
     latest_session = _resolve_session(session["pdf_path"]) if session.get("pdf_path") else session
     if session.get("code_interpreter_container_id"):
@@ -5293,7 +5618,7 @@ def finalize_chunk(
     latest_session["next_chunk_index"] = chunk["chunk_index"] + 1
     latest_session["pending"] = None
     latest_session["updated_at"] = utc_now()
-    if not chunk.get("_fresh_rerun_conversation"):
+    if not chunk.get("_fresh_rerun_conversation") and not chunk.get("_fresh_context_conversation"):
         latest_session["pdf_attached_in_conversation"] = not bool(chunk.get("_pdf_text_only_retry"))
         latest_session["developer_prompt_seeded"] = True
     if chunk["chunk_index"] >= len(load_manifest(latest_session)["chunks"]):
@@ -5365,11 +5690,29 @@ def process_one_chunk(
             "verification_mode='code_interpreter' requested, but this session has use_code_interpreter=False. "
             "Enable use_code_interpreter when creating the session or in audit_the_paper(...)."
         )
+    audit_context_mode = _normalize_audit_context_mode(session.get("audit_context_mode"))
     file_timeout_retry_mode = _file_download_timeout_retry_mode(session, chunk)
     fresh_rerun_conversation = bool(chunk.get("_fresh_rerun_conversation"))
+    fresh_context_conversation = (
+        audit_context_mode == AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL
+        and not fresh_rerun_conversation
+    )
     main_conversation_id = str(session.get("conversation_id") or "")
     request_session = session
-    if fresh_rerun_conversation:
+    if fresh_context_conversation:
+        conversation = _get_client().conversations.create()
+        chunk = dict(chunk)
+        chunk["_fresh_context_conversation"] = True
+        chunk["_fresh_context_conversation_id"] = conversation.id
+        chunk["_main_conversation_id"] = main_conversation_id
+        chunk["_suppress_pdf_attachment"] = True
+        chunk["_pdf_attachment_disabled_note"] = FRESH_CONTEXT_TEXT_FIRST_NOTE
+        request_session = dict(session)
+        request_session["conversation_id"] = conversation.id
+        request_session["pdf_attached_in_conversation"] = False
+        request_session["developer_prompt_seeded"] = False
+        request_session["audit_context_mode"] = audit_context_mode
+    elif fresh_rerun_conversation:
         conversation = _get_client().conversations.create()
         chunk = dict(chunk)
         chunk["_fresh_rerun_conversation"] = True
@@ -5512,6 +5855,11 @@ def process_one_chunk(
         session["pending"]["rerun_kind"] = chunk.get("_rerun_kind")
         session["pending"]["main_conversation_id"] = main_conversation_id
         session["pending"]["rerun_conversation_id"] = chunk.get("_fresh_rerun_conversation_id")
+    if fresh_context_conversation:
+        session["pending"]["fresh_context_conversation"] = True
+        session["pending"]["main_conversation_id"] = main_conversation_id
+        session["pending"]["fresh_context_conversation_id"] = chunk.get("_fresh_context_conversation_id")
+        session["pending"]["pdf_attachment_disabled_note"] = FRESH_CONTEXT_TEXT_FIRST_NOTE
     if chunk.get("_pdf_text_only_retry"):
         session["pending"]["pdf_text_only_retry"] = True
         session["pending"]["pdf_attachment_disabled_note"] = PDF_TEXT_ONLY_RETRY_NOTE
@@ -5635,6 +5983,13 @@ def recover_pending_chunk(
     if not matches:
         return None
     chunk = matches[0]
+    if pending.get("fresh_context_conversation"):
+        chunk = dict(chunk)
+        chunk["_fresh_context_conversation"] = True
+        chunk["_fresh_context_conversation_id"] = pending.get("fresh_context_conversation_id")
+        chunk["_main_conversation_id"] = pending.get("main_conversation_id")
+        chunk["_suppress_pdf_attachment"] = True
+        chunk["_pdf_attachment_disabled_note"] = pending.get("pdf_attachment_disabled_note") or FRESH_CONTEXT_TEXT_FIRST_NOTE
     if pending.get("pdf_text_only_retry"):
         chunk = dict(chunk)
         chunk["_pdf_text_only_retry"] = True
@@ -5778,10 +6133,12 @@ def create_new_session(
     ci_failure_fallback_mode: str = "off",
     reference_mention_style: str = "auto",
     report_reference_style: str = "match_audit",
+    audit_context_mode: str = DEFAULT_AUDIT_CONTEXT_MODE,
     audit_system_prompt: Optional[str] = None,
     audit_system_prompt_source: Optional[str] = None,
 ) -> dict[str, Any]:
     model, reasoning_effort = normalize_model_and_reasoning_effort(model, reasoning_effort)
+    audit_context_mode = _normalize_audit_context_mode(audit_context_mode)
     resolved_prompt, prompt_metadata = _resolve_audit_system_prompt(
         model,
         audit_system_prompt=audit_system_prompt,
@@ -5826,6 +6183,7 @@ def create_new_session(
         "ci_failure_fallback_mode": _normalize_ci_failure_fallback_mode(ci_failure_fallback_mode),
         "reference_mention_style": _normalize_reference_mention_style(reference_mention_style),
         "report_reference_style": _normalize_report_reference_style(report_reference_style),
+        "audit_context_mode": audit_context_mode,
     }
     manifest = build_auto_chunks(
         pdf_path=pdf_path,
@@ -5922,6 +6280,7 @@ def audit_the_paper(
     ci_failure_fallback_mode: Optional[str] = None,
     reference_mention_style: Optional[str] = None,
     report_reference_style: Optional[str] = None,
+    audit_context_mode: Optional[str] = None,
     verification_mode: str = "local_python_only",
     verification_chunk_indices: Optional[list[int]] = None,
     audit_system_prompt: Optional[str] = None,
@@ -5955,6 +6314,7 @@ def audit_the_paper(
             ci_failure_fallback_mode=_normalize_ci_failure_fallback_mode(ci_failure_fallback_mode) if ci_failure_fallback_mode is not None else "off",
             reference_mention_style=_normalize_reference_mention_style(reference_mention_style) if reference_mention_style is not None else "auto",
             report_reference_style=_normalize_report_reference_style(report_reference_style) if report_reference_style is not None else "match_audit",
+            audit_context_mode=_normalize_audit_context_mode(audit_context_mode),
             audit_system_prompt=audit_system_prompt,
             audit_system_prompt_source=audit_system_prompt_source,
         )
@@ -5988,6 +6348,10 @@ def audit_the_paper(
             session["reference_mention_style"] = _normalize_reference_mention_style(reference_mention_style)
         if report_reference_style is not None:
             session["report_reference_style"] = _normalize_report_reference_style(report_reference_style)
+        if audit_context_mode is not None:
+            session["audit_context_mode"] = _normalize_audit_context_mode(audit_context_mode)
+        else:
+            session["audit_context_mode"] = _normalize_audit_context_mode(session.get("audit_context_mode"))
         if audit_system_prompt is not None:
             resolved_prompt, prompt_metadata = _resolve_audit_system_prompt(
                 session.get("model") or DEFAULT_MODEL,
@@ -6005,6 +6369,7 @@ def audit_the_paper(
     session["verification_timeout_seconds"] = int(verification_timeout_seconds)
     session["include_verification_summary_in_final_report"] = bool(include_verification_summary_in_final_report)
     session["write_separate_verification_report"] = bool(write_separate_verification_report)
+    session["audit_context_mode"] = _normalize_audit_context_mode(session.get("audit_context_mode"))
     session["updated_at"] = utc_now()
     save_session(session)
     manifest = load_manifest(session)
@@ -6222,6 +6587,7 @@ def start_fresh_audit(
     ci_failure_fallback_mode: str = "off",
     reference_mention_style: str = "auto",
     report_reference_style: str = "match_audit",
+    audit_context_mode: str = DEFAULT_AUDIT_CONTEXT_MODE,
     verification_mode: str = "local_python_only",
     verification_chunk_indices: Optional[list[int]] = None,
     audit_system_prompt: Optional[str] = None,
@@ -6251,6 +6617,7 @@ def start_fresh_audit(
         ci_failure_fallback_mode=ci_failure_fallback_mode,
         reference_mention_style=reference_mention_style,
         report_reference_style=report_reference_style,
+        audit_context_mode=audit_context_mode,
         verification_mode=verification_mode,
         verification_chunk_indices=verification_chunk_indices,
         verbose=verbose,
@@ -6276,6 +6643,7 @@ def resume_audit(
     ci_failure_fallback_mode: Optional[str] = None,
     reference_mention_style: Optional[str] = None,
     report_reference_style: Optional[str] = None,
+    audit_context_mode: Optional[str] = None,
     verification_mode: str = "local_python_only",
     verification_chunk_indices: Optional[list[int]] = None,
     audit_system_prompt: Optional[str] = None,
@@ -6305,6 +6673,7 @@ def resume_audit(
         ci_failure_fallback_mode=ci_failure_fallback_mode,
         reference_mention_style=reference_mention_style,
         report_reference_style=report_reference_style,
+        audit_context_mode=audit_context_mode,
         verification_mode=verification_mode,
         verification_chunk_indices=verification_chunk_indices,
         verbose=verbose,
@@ -6314,7 +6683,9 @@ def resume_audit(
 __all__ = [
     "ask_about_audit",
     "ask_about_paper",
+    "AUDIT_CONTEXT_MODES",
     "audit_the_paper",
+    "build_fresh_audit_context_for_chunk",
     "build_concise_report",
     "build_final_report",
     "build_verification_report",
@@ -6334,6 +6705,7 @@ __all__ = [
     "normalize_model_and_reasoning_effort",
     "process_one_chunk",
     "QA_CONTEXT_MODES",
+    "DEFAULT_AUDIT_CONTEXT_MODE",
     "DEFAULT_QA_CONTEXT_MODE",
     "rebuild_qa_report",
     "recover_pending_chunk",

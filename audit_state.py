@@ -68,6 +68,7 @@ def session_paths(workdir: str | Path) -> dict[str, Path]:
         "status": root / "state" / "status.json",
         "manifest": root / "state" / "chunk_manifest.json",
         "chunk_records": root / "state" / "chunks.jsonl",
+        "audit_context_db": root / "state" / "audit_context_db.jsonl",
         "verification_state": root / "state" / "verification.json",
     }
 
@@ -129,6 +130,8 @@ def init_state_files(workdir: str | Path, model: str, reasoning_effort: str) -> 
                 "updated_at": utc_now(),
             },
         )
+    if not paths["audit_context_db"].exists():
+        paths["audit_context_db"].touch()
 
 
 def load_session_from_pdf(pdf_path: str | Path) -> Optional[dict[str, Any]]:

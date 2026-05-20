@@ -25,15 +25,20 @@ from audit_policy_hooks import (
     build_user_message_for_chunk,
 )
 from audit_runtime import (
+    AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL,
+    DEFAULT_AUDIT_CONTEXT_MODE,
     FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH,
     FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY,
+    FRESH_CONTEXT_TEXT_FIRST_NOTE,
     PDF_TEXT_ONLY_RETRY_NOTE,
+    _append_audit_context_db_entries,
     _audit_request_size_diagnostics,
     _file_download_timeout_auto_retry_decision,
     _file_download_timeout_retry_mode,
     _retryable_response_failure_reason,
     _save_request_metadata,
     _should_reattach_pdf_for_chunk_retry,
+    build_fresh_audit_context_for_chunk,
     get_audit_status,
     get_report_freshness,
     get_verification_suite_status,
@@ -723,6 +728,150 @@ def test_request_size_diagnostics() -> None:
     _assert(text_only_diagnostics["conversation_state"] == "fresh_text_only_retry_conversation", text_only_diagnostics)
 
 
+def test_fresh_context_mode_scaffolding() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_fresh_context_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        session["pdf_file_id"] = "file-paper"
+        session["tex_path"] = None
+        chunk_1 = {
+            "chunk_id": "chunk_001",
+            "chunk_index": 1,
+            "label": "PDF pages 1-1",
+            "boundary": "pages 1-1",
+            "source_kind": "pdf",
+            "page_start": 1,
+            "page_end": 1,
+            "chunk_text": "Definition 1. Let alpha be a parameter. Lemma 1 proves stability.",
+        }
+        audit = {
+            "assumptions_and_notation": ["Definition: alpha denotes the main stability parameter."],
+            "verified_steps": ["Lemma 1 depends on Definition 1 and is locally consistent."],
+            "issues": [],
+            "ledger_updates": {
+                "assumptions": ["Assume alpha > 0 throughout the stability argument."],
+                "notes": ["Lemma 1 is a dependency for the next theorem."],
+            },
+            "next_boundary_hint": "The next chunk starts applying Lemma 1.",
+            "confidence": "high",
+        }
+        created_issues = [
+            {
+                "issue_id": "I001",
+                "severity": "high",
+                "status": "open",
+                "title": "Check dependency on Lemma 1",
+                "location": "chunk_001",
+                "description": "Later chunks may rely on this stability dependency.",
+            }
+        ]
+        entries = _append_audit_context_db_entries(session, chunk_1, audit, created_issues)
+        kinds = {entry.get("kind") for entry in entries}
+        _assert("chunk_summary" in kinds, kinds)
+        _assert("definition" in kinds or "notation" in kinds, kinds)
+        _assert("verified_step" in kinds, kinds)
+        _assert("issue" in kinds, kinds)
+        _assert("next_boundary_hint" in kinds, kinds)
+        context_path = session_paths(workdir)["audit_context_db"]
+        _assert(context_path.exists(), "context DB was not written")
+
+        chunk_2 = {
+            "chunk_id": "chunk_002",
+            "chunk_index": 2,
+            "label": "PDF pages 2-2",
+            "boundary": "pages 2-2; Theorem 2",
+            "source_kind": "pdf",
+            "page_start": 2,
+            "page_end": 2,
+            "chunk_text": "Theorem 2 uses alpha and Lemma 1.",
+        }
+        retrieved = build_fresh_audit_context_for_chunk(session, chunk_2)
+        _assert(retrieved["entry_count"] > 0, retrieved)
+        _assert("Retrieved fresh-context audit database context:" in retrieved["block"], retrieved["block"])
+
+        continuous_session = dict(session)
+        continuous_session.pop("audit_context_mode", None)
+        continuous_prompt = build_user_message_for_chunk(continuous_session, dict(chunk_2))
+        explicit_continuous = dict(session)
+        explicit_continuous["audit_context_mode"] = DEFAULT_AUDIT_CONTEXT_MODE
+        explicit_prompt = build_user_message_for_chunk(explicit_continuous, dict(chunk_2))
+        _assert(continuous_prompt == explicit_prompt, "explicit continuous mode changed prompt construction")
+
+        fresh_session = dict(session)
+        fresh_session["audit_context_mode"] = AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL
+        fresh_chunk = dict(chunk_2)
+        fresh_prompt = build_user_message_for_chunk(fresh_session, fresh_chunk)
+        prompt_text = "\n".join(
+            str(part.get("text") or "")
+            for part in fresh_prompt[0]["content"]
+            if isinstance(part, dict) and part.get("type") == "input_text"
+        )
+        _assert("Retrieved fresh-context audit database context:" in prompt_text, prompt_text)
+        _assert(prompt_text.index("Retrieved fresh-context audit database context:") < prompt_text.index("Chunk text:"), prompt_text)
+        _assert(fresh_chunk.get("_retrieved_context_entry_count", 0) > 0, fresh_chunk)
+
+        fresh_chunk["_fresh_context_conversation"] = True
+        fresh_chunk["_fresh_context_conversation_id"] = "conv-fresh"
+        fresh_chunk["_suppress_pdf_attachment"] = True
+        fresh_chunk["_pdf_attachment_disabled_note"] = FRESH_CONTEXT_TEXT_FIRST_NOTE
+        request_kwargs = {
+            "conversation": "conv-fresh",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt_text}]}],
+        }
+        diagnostics = _audit_request_size_diagnostics(fresh_session, fresh_chunk, request_kwargs)
+        _assert(diagnostics["audit_context_mode"] == AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL, diagnostics)
+        _assert(diagnostics["fresh_context_conversation"], diagnostics)
+        _assert(diagnostics["pdf_attachment_suppressed"], diagnostics)
+        _assert(diagnostics["retrieved_context_entry_count"] > 0, diagnostics)
+        request_path = _save_request_metadata(
+            fresh_session,
+            fresh_chunk,
+            request_kwargs,
+            verification_mode="local_python_only",
+            used_code_interpreter_tool=False,
+        )
+        saved_request = json.loads(Path(request_path).read_text(encoding="utf-8"))
+        _assert(saved_request["audit_context_mode"] == AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL, saved_request)
+        _assert(saved_request["fresh_context"]["retrieved_context_entry_count"] > 0, saved_request)
+
+
+def test_resume_preserves_saved_audit_context_mode() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_resume_context_") as tmp:
+        root = Path(tmp)
+        pdf_path = root / "paper.pdf"
+        _write_text(pdf_path, "%PDF synthetic placeholder")
+        workdir = pdf_path.with_name(pdf_path.stem + "_audit")
+        session = _seed_state(workdir)
+        session["pdf_path"] = str(pdf_path)
+        session["reasoning_effort"] = "xhigh"
+        session["audit_context_mode"] = AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL
+        session["pause_requested_at"] = MID
+        _write_json(session_paths(workdir)["session"], session)
+        _write_json(
+            session_paths(workdir)["manifest"],
+            {
+                "chunks": [
+                    {
+                        "chunk_id": "chunk_001",
+                        "chunk_index": 1,
+                        "label": "Synthetic chunk",
+                        "boundary": "pages 1-1",
+                        "source_kind": "pdf",
+                        "page_start": 1,
+                        "page_end": 1,
+                        "paper_progress_end": 1.0,
+                        "chunk_text": "Synthetic text.",
+                    }
+                ],
+                "pdf_page_count": 1,
+            },
+        )
+        result = runtime.resume_audit(pdf_path, verbose=False)
+        saved = json.loads(session_paths(workdir)["session"].read_text(encoding="utf-8"))
+        _assert(result["pause_result"]["reason"] == "requested", result)
+        _assert(saved["audit_context_mode"] == AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL, saved)
+
+
 def test_report_latex_unicode_math_safety() -> None:
     text = (
         "The bound is $c_2√nΛ≤1/2$ and $√(n+1)≥λ$. "
@@ -996,6 +1145,8 @@ def main() -> int:
         ("running audit context block", test_running_audit_context_block),
         ("TeX macro glossary prompt block", test_tex_macro_glossary_in_chunk_prompt),
         ("request size diagnostics", test_request_size_diagnostics),
+        ("fresh context mode scaffolding", test_fresh_context_mode_scaffolding),
+        ("resume preserves saved audit context mode", test_resume_preserves_saved_audit_context_mode),
         ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
         ("issue severity summary in audit summary", test_issue_severity_summary_in_audit_summary),
         ("fresh rerun request metadata", test_fresh_rerun_request_metadata),

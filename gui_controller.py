@@ -16,6 +16,8 @@ from audit_prompts import (
     save_prompt_profiles,
 )
 from audit_runtime import (
+    AUDIT_CONTEXT_MODES,
+    DEFAULT_AUDIT_CONTEXT_MODE,
     DEFAULT_MODEL as RUNTIME_DEFAULT_MODEL,
     DEFAULT_QA_CONTEXT_MODE,
     QA_CONTEXT_MODES,
@@ -56,6 +58,11 @@ DISCUSSION_CONTEXT_MODE_LABELS = {
     "Full audit context": "full_audit_context",
 }
 DISCUSSION_CONTEXT_MODE_CHOICES = list(DISCUSSION_CONTEXT_MODE_LABELS)
+AUDIT_CONTEXT_MODE_LABELS = {
+    "Continuous conversation (default)": "continuous",
+    "Experimental fresh-context per chunk": "fresh_context_experimental",
+}
+AUDIT_CONTEXT_MODE_CHOICES = list(AUDIT_CONTEXT_MODE_LABELS)
 
 
 class BackendWorker(QObject):
@@ -94,6 +101,7 @@ class GuiController(QObject):
     task_running_changed = Signal(bool)
     cancel_task_running_changed = Signal(bool)
     audit_settings_changed = Signal(str, str)
+    audit_context_mode_changed = Signal(str)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -102,6 +110,7 @@ class GuiController(QObject):
         self.model = DEFAULT_MODEL
         self.reasoning_effort = DEFAULT_REASONING_EFFORT
         self.qa_context_mode = DEFAULT_QA_CONTEXT_MODE
+        self.audit_context_mode = DEFAULT_AUDIT_CONTEXT_MODE
 
         self._active_thread: Optional[QThread] = None
         self._active_worker: Optional[BackendWorker] = None
@@ -244,6 +253,17 @@ class GuiController(QObject):
             display = next((label for label, value in DISCUSSION_CONTEXT_MODE_LABELS.items() if value == mode), mode)
             self.log_message.emit(f"Discussion context mode: {display}")
 
+    def set_audit_context_mode(self, label_or_mode: str) -> None:
+        requested = str(label_or_mode or "").strip()
+        mode = AUDIT_CONTEXT_MODE_LABELS.get(requested, requested)
+        if mode not in AUDIT_CONTEXT_MODES:
+            self.log_message.emit(f"Unsupported audit context mode: {requested}")
+            return
+        if mode != self.audit_context_mode:
+            self.audit_context_mode = mode
+            display = next((label for label, value in AUDIT_CONTEXT_MODE_LABELS.items() if value == mode), mode)
+            self.log_message.emit(f"Audit context mode: {display}")
+
     def _load_saved_audit_settings(self) -> None:
         self._saved_session_model = None
         self._saved_session_reasoning_effort = None
@@ -259,10 +279,13 @@ class GuiController(QObject):
         )
         self.model = model
         self.reasoning_effort = effort
+        saved_context_mode = str(session.get("audit_context_mode") or DEFAULT_AUDIT_CONTEXT_MODE)
+        self.audit_context_mode = saved_context_mode if saved_context_mode in AUDIT_CONTEXT_MODES else DEFAULT_AUDIT_CONTEXT_MODE
         self._saved_session_model = model
         self._saved_session_reasoning_effort = effort
         self.audit_settings_changed.emit(model, effort)
-        self.log_message.emit(f"Loaded saved audit settings: {model} / {effort}")
+        self.audit_context_mode_changed.emit(self.audit_context_mode)
+        self.log_message.emit(f"Loaded saved audit settings: {model} / {effort} / context={self.audit_context_mode}")
 
     def _load_saved_discussion_history(self) -> None:
         if not self.pdf_path:
@@ -410,6 +433,7 @@ class GuiController(QObject):
             reasoning_effort=self.reasoning_effort,
             audit_system_prompt=audit_prompt,
             audit_system_prompt_source=audit_prompt_source,
+            audit_context_mode=self.audit_context_mode,
             verbose=False,
         )
 
