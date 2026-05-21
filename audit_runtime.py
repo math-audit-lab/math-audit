@@ -92,6 +92,99 @@ FRESH_CONTEXT_PRIOR_ISSUE_CAUTION = (
     "Prior audit issues are provisional findings. Recheck them when relevant; do not treat them as established facts. "
     "If current context contradicts a prior issue, flag that."
 )
+FRESH_CONTEXT_PRIORITY_ISSUE_MIN_SCORE = 2
+FRESH_CONTEXT_GENERIC_QUERY_TERMS = {
+    "asymptotic",
+    "asymptotics",
+    "bound",
+    "bounds",
+    "case",
+    "cases",
+    "coefficient",
+    "coefficients",
+    "and",
+    "all",
+    "also",
+    "among",
+    "any",
+    "because",
+    "before",
+    "begin",
+    "between",
+    "are",
+    "def",
+    "define",
+    "definition",
+    "definitions",
+    "end",
+    "eqref",
+    "equation",
+    "equations",
+    "error",
+    "errors",
+    "estimate",
+    "estimates",
+    "expression",
+    "expressions",
+    "formula",
+    "formulas",
+    "function",
+    "functions",
+    "for",
+    "frac",
+    "from",
+    "given",
+    "gives",
+    "approx",
+    "approximate",
+    "approximately",
+    "based",
+    "gap",
+    "ge",
+    "has",
+    "have",
+    "its",
+    "label",
+    "lambda",
+    "le",
+    "left",
+    "only",
+    "order",
+    "orders",
+    "other",
+    "over",
+    "page",
+    "pages",
+    "parameter",
+    "parameters",
+    "part",
+    "parts",
+    "pdf",
+    "point",
+    "points",
+    "proof",
+    "range",
+    "ref",
+    "result",
+    "results",
+    "right",
+    "rho",
+    "section",
+    "sign",
+    "sum",
+    "term",
+    "terms",
+    "tex",
+    "text",
+    "the",
+    "this",
+    "where",
+    "with",
+    "value",
+    "values",
+    "variable",
+    "variables",
+}
 PDF_TEXT_ONLY_RETRY_NOTE = (
     "PDF attachment disabled for this retry due to repeated API file-download timeout. "
     "Rely on extracted chunk text, reference-map/page metadata, and running audit context. "
@@ -4730,13 +4823,19 @@ def _read_audit_context_db(session: dict[str, Any]) -> list[dict[str, Any]]:
     return entries
 
 
-def _context_query_terms(chunk: dict[str, Any]) -> set[str]:
+def _context_query_terms(chunk: dict[str, Any], *, include_generic: bool = False) -> set[str]:
     text = " ".join(
         str(chunk.get(key) or "")
         for key in ("chunk_text", "label", "boundary")
     )
     terms = {item.lower() for item in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text)}
     terms.update(item.lower() for item in re.findall(r"\\[A-Za-z]+", text))
+    if not include_generic:
+        terms = {
+            term
+            for term in terms
+            if term.lstrip("\\").lower() not in FRESH_CONTEXT_GENERIC_QUERY_TERMS
+        }
     return terms
 
 
@@ -4792,7 +4891,7 @@ def build_fresh_audit_context_for_chunk(
         and str(entry.get("status") or "open").lower() != "resolved"
         and str(entry.get("severity") or "").lower() in {"critical", "high"}
     ]
-    if current_index is not None and query_terms:
+    if current_index is not None:
         recent_issue_window = max(int(recent_summary_limit), 4)
         filtered_priority_issues: list[dict[str, Any]] = []
         for entry in priority_issue_entries:
@@ -4801,7 +4900,10 @@ def build_fresh_audit_context_for_chunk(
             except Exception:
                 source_index = 0
             is_recent = source_index > 0 and 0 < current_index - source_index <= recent_issue_window
-            if is_recent or _context_entry_score(entry, query_terms) > 0:
+            if is_recent or (
+                query_terms
+                and _context_entry_score(entry, query_terms) >= FRESH_CONTEXT_PRIORITY_ISSUE_MIN_SCORE
+            ):
                 filtered_priority_issues.append(entry)
         priority_issue_entries = filtered_priority_issues
     priority_issue_entries.sort(
@@ -4819,7 +4921,12 @@ def build_fresh_audit_context_for_chunk(
         if entry_id in selected_ids:
             continue
         score = _context_entry_score(entry, query_terms)
-        if score > 0:
+        min_score = (
+            FRESH_CONTEXT_PRIORITY_ISSUE_MIN_SCORE
+            if str(entry.get("kind") or "") == "issue"
+            else 1
+        )
+        if score >= min_score:
             scored.append((score, entry))
     scored.sort(key=lambda item: (-item[0], sort_key(item[1])))
     selected.extend(entry for _score, entry in scored)

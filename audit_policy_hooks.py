@@ -966,6 +966,19 @@ def _build_running_audit_context_for_chunk(
     return _truncate_text(_strip_unsafe_control_chars("\n".join(lines).strip()), limit=max_chars)
 
 
+def _fresh_context_chunk_should_remind_python_checks(chunk: dict[str, Any]) -> bool:
+    text = " ".join(
+        normalize_whitespace(str(chunk.get(key) or ""))
+        for key in ("label", "boundary", "chunk_text")
+    ).lower()
+    return bool(
+        re.search(
+            r"\b(theorem|lemma|proposition|prop\.|corollary|proof)\b",
+            text,
+        )
+    )
+
+
 def build_user_message_for_chunk(session: dict[str, Any], chunk: dict[str, Any]) -> list[dict[str, Any]]:
     content = []
     suppress_pdf_attachment = bool(chunk.get("_suppress_pdf_attachment"))
@@ -999,7 +1012,11 @@ def build_user_message_for_chunk(session: dict[str, Any], chunk: dict[str, Any])
     if suppress_pdf_attachment:
         note = normalize_whitespace(str(chunk.get("_pdf_attachment_disabled_note") or PDF_TEXT_ONLY_RETRY_NOTE))
         pdf_attachment_note = f"\nPDF attachment note for this retry:\n{note}\n"
-    if _normalize_audit_context_mode(session.get("audit_context_mode")) == AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL:
+    is_fresh_context_mode = (
+        _normalize_audit_context_mode(session.get("audit_context_mode"))
+        == AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL
+    )
+    if is_fresh_context_mode:
         fresh_context = build_fresh_audit_context_for_chunk(session, chunk)
         running_context = str(fresh_context.get("block") or "")
         chunk["_retrieved_context_entry_count"] = int(fresh_context.get("entry_count") or 0)
@@ -1009,6 +1026,13 @@ def build_user_message_for_chunk(session: dict[str, Any], chunk: dict[str, Any])
         chunk["_retrieved_context_entry_count"] = 0
         chunk["_retrieved_context_chars"] = 0
     macro_glossary = _build_tex_macro_glossary_for_chunk(session, chunk, context_text=running_context)
+    fresh_context_verification_reminder = ""
+    if is_fresh_context_mode and _fresh_context_chunk_should_remind_python_checks(chunk):
+        fresh_context_verification_reminder = (
+            "\nFresh-context verification reminder:\n"
+            "For theorem, proposition, lemma, or proof chunks, include python_checks when a local symbolic or "
+            "numerical sanity check can materially test a claim or suspected issue. Do not force irrelevant checks.\n"
+        )
     prompt_text = f"""Audit this mathematics-paper chunk rigorously.
 
 Chunk label: {chunk['label']}
@@ -1039,6 +1063,7 @@ Reference guidance for this chunk:
 {pdf_attachment_note}
 {running_context}
 {macro_glossary}
+{fresh_context_verification_reminder}
 
 Chunk text:
 {chunk['chunk_text']}

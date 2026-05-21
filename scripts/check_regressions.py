@@ -812,6 +812,8 @@ def test_fresh_context_mode_scaffolding() -> None:
         _assert("Retrieved fresh-context audit database context:" in prompt_text, prompt_text)
         _assert(FRESH_CONTEXT_PRIOR_ISSUE_CAUTION in prompt_text, prompt_text)
         _assert("prior audit issue (provisional)" in prompt_text, prompt_text)
+        _assert("Fresh-context verification reminder:" in prompt_text, prompt_text)
+        _assert("include python_checks when a local symbolic or numerical sanity check can materially test" in prompt_text, prompt_text)
         _assert(prompt_text.index("Retrieved fresh-context audit database context:") < prompt_text.index("Chunk text:"), prompt_text)
         _assert(fresh_chunk.get("_retrieved_context_entry_count", 0) > 0, fresh_chunk)
 
@@ -838,6 +840,68 @@ def test_fresh_context_mode_scaffolding() -> None:
         saved_request = json.loads(Path(request_path).read_text(encoding="utf-8"))
         _assert(saved_request["audit_context_mode"] == AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL, saved_request)
         _assert(saved_request["fresh_context"]["retrieved_context_entry_count"] > 0, saved_request)
+
+
+def test_fresh_context_issue_retrieval_downweights_generic_terms() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_fresh_issue_scoring_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        session["pdf_file_id"] = "file-paper"
+        session["audit_context_mode"] = AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL
+        source_chunk = {
+            "chunk_id": "chunk_001",
+            "chunk_index": 1,
+            "label": "PDF pages 1-1",
+            "boundary": "pages 1-1",
+            "source_kind": "pdf",
+            "page_start": 1,
+            "page_end": 1,
+            "chunk_text": "Initial estimates.",
+        }
+        audit = {
+            "assumptions_and_notation": [],
+            "verified_steps": [],
+            "issues": [],
+            "ledger_updates": {"assumptions": [], "notes": []},
+            "next_boundary_hint": "",
+        }
+        _append_audit_context_db_entries(
+            session,
+            source_chunk,
+            audit,
+            [
+                {
+                    "issue_id": "I999",
+                    "severity": "critical",
+                    "status": "open",
+                    "title": "Old generic estimate concern",
+                    "description": "Equation lambda k n error bound estimate term expression asymptotic.",
+                },
+                {
+                    "issue_id": "I100",
+                    "severity": "high",
+                    "status": "open",
+                    "title": "Bessel transform dependency",
+                    "description": "The Bessel transform kernel identity may affect later Bessel transform estimates.",
+                },
+            ],
+        )
+        current_chunk = {
+            "chunk_id": "chunk_020",
+            "chunk_index": 20,
+            "label": "PDF pages 20-20",
+            "boundary": "pages 20-20; Proposition 20",
+            "source_kind": "pdf",
+            "page_start": 20,
+            "page_end": 20,
+            "chunk_text": (
+                "Proposition 20 revisits a Bessel transform identity. "
+                "The equation has an asymptotic error bound estimate term expression."
+            ),
+        }
+        retrieved = build_fresh_audit_context_for_chunk(session, current_chunk)
+        _assert("I100" in retrieved["block"], retrieved["block"])
+        _assert("I999" not in retrieved["block"], retrieved["block"])
 
 
 def test_resume_preserves_saved_audit_context_mode() -> None:
@@ -1392,6 +1456,7 @@ def main() -> int:
         ("TeX macro glossary prompt block", test_tex_macro_glossary_in_chunk_prompt),
         ("request size diagnostics", test_request_size_diagnostics),
         ("fresh context mode scaffolding", test_fresh_context_mode_scaffolding),
+        ("fresh context issue generic-term downweighting", test_fresh_context_issue_retrieval_downweights_generic_terms),
         ("resume preserves saved audit context mode", test_resume_preserves_saved_audit_context_mode),
         ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
         ("issue severity summary in audit summary", test_issue_severity_summary_in_audit_summary),

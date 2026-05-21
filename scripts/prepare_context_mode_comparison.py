@@ -250,6 +250,7 @@ def _priority_issue_details(
                 "recent": is_recent,
                 "lexically_relevant": lexical_score > 0,
                 "lexical_score": lexical_score,
+                "lexical_score_note": "computed after downweighting generic mathematical terms",
                 "priority_rule_match": priority_rule_match,
                 "broad_priority_only": broad_priority_only,
                 "reasons": reasons or ["included by retrieved context selection"],
@@ -328,6 +329,7 @@ def _context_summary(
                 f"{issue['severity']} | "
                 f"status: {issue['status']} | "
                 f"source: {issue['source_chunk_id'] or 'unknown'} | "
+                f"lexical score: {issue['lexical_score']} | "
                 f"reasons: {', '.join(issue['reasons'])} | "
                 f"{issue['summary'] or 'no short description available'}"
             )
