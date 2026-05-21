@@ -45,6 +45,7 @@ from audit_runtime import (
     report_latex_paragraph,
 )
 from audit_state import save_json, session_paths, usage_cache_diagnostics
+from scripts.prepare_context_mode_comparison import prepare_context_mode_comparison
 
 
 OLD = "2026-01-01T00:00:00+00:00"
@@ -1127,6 +1128,113 @@ def test_file_download_timeout_auto_retry_decisions() -> None:
         _assert(exhausted["reason"] == "max_auto_retries_exhausted", exhausted)
 
 
+def test_prepare_context_mode_comparison_script() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_context_compare_regression_") as tmp:
+        root = Path(tmp)
+        source = root / "source_audit"
+        output = root / "comparison_out"
+        session = _seed_state(source)
+        session["conversation_id"] = "conv-main"
+        session["pdf_file_id"] = "file-paper"
+        session["pdf_path"] = str(root / "paper.pdf")
+        _write_json(session_paths(source)["session"], session)
+        chunks = [
+            {
+                "chunk_id": "chunk_001",
+                "chunk_index": 1,
+                "label": "Synthetic definition",
+                "boundary": "pages 1-1",
+                "source_kind": "pdf",
+                "page_start": 1,
+                "page_end": 1,
+                "chunk_text": "Definition 1. Let alpha be the main parameter.",
+            },
+            {
+                "chunk_id": "chunk_002",
+                "chunk_index": 2,
+                "label": "Synthetic theorem",
+                "boundary": "pages 2-2; Theorem 2",
+                "source_kind": "pdf",
+                "page_start": 2,
+                "page_end": 2,
+                "chunk_text": "Theorem 2 uses alpha from Definition 1.",
+            },
+        ]
+        _write_json(session_paths(source)["manifest"], {"chunks": chunks})
+        _write_json(
+            session_paths(source)["issues"],
+            {
+                "issues": [
+                    {
+                        "issue_id": "I001",
+                        "chunk_id": "chunk_001",
+                        "severity": "high",
+                        "status": "open",
+                        "title": "Dependency needs care",
+                        "location": "chunk_001",
+                        "description": "Later chunks depend on alpha.",
+                    }
+                ]
+            },
+        )
+        structured = {
+            "assumptions_and_notation": ["Definition: alpha is the main parameter."],
+            "verified_steps": ["Definition 1 is used by later theorem statements."],
+            "issues": [],
+            "ledger_updates": {
+                "assumptions": ["Assume alpha > 0 where stability is discussed."],
+                "notes": ["Theorem 2 depends on Definition 1."],
+            },
+            "next_boundary_hint": "Next chunk states Theorem 2.",
+            "confidence": "high",
+        }
+        structured_path = source / "responses" / "chunk_001.structured.json"
+        _write_json(structured_path, structured)
+        _append_jsonl(
+            session_paths(source)["chunk_records"],
+            {"chunk_id": "chunk_001", "structured_response_path": str(structured_path)},
+        )
+        baseline_request = source / "requests" / "chunk_002_baseline.request.json"
+        _write_json(
+            baseline_request,
+            {
+                "chunk_id": "chunk_002",
+                "request_size_diagnostics": {
+                    "user_prompt_length": 123,
+                    "chunk_text_length": 44,
+                    "running_audit_context_length": 22,
+                    "pdf_attachment_included": False,
+                },
+            },
+        )
+
+        before_files = {
+            path: path.read_text(encoding="utf-8")
+            for path in [
+                session_paths(source)["session"],
+                session_paths(source)["manifest"],
+                session_paths(source)["issues"],
+                session_paths(source)["chunk_records"],
+                structured_path,
+                baseline_request,
+            ]
+        }
+        manifest = prepare_context_mode_comparison(source, ["chunk_002"], output)
+        _assert(manifest["source_unmodified_by_script"], manifest)
+        _assert(manifest["total_backfilled_context_entries"] > 0, manifest)
+        _assert(not session_paths(source)["audit_context_db"].exists(), "source context DB was mutated")
+        for path, text in before_files.items():
+            _assert(path.read_text(encoding="utf-8") == text, f"source file changed: {path}")
+        prompt = (output / "chunk_002" / "fresh_context_prompt.txt").read_text(encoding="utf-8")
+        _assert("Retrieved fresh-context audit database context:" in prompt, prompt)
+        _assert(prompt.index("Retrieved fresh-context audit database context:") < prompt.index("Chunk text:"), prompt)
+        metadata = json.loads((output / "chunk_002" / "fresh_context_request_metadata.json").read_text(encoding="utf-8"))
+        _assert(metadata["dry_run"] is True, metadata)
+        _assert(metadata["would_call_api"] is False, metadata)
+        _assert(metadata["request_size_diagnostics"]["fresh_context_conversation"], metadata)
+        _assert((output / "comparison_manifest.json").exists(), "comparison manifest missing")
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -1153,6 +1261,7 @@ def main() -> int:
         ("usage cache diagnostics", test_usage_cache_diagnostics),
         ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),
         ("file download timeout auto-retry decisions", test_file_download_timeout_auto_retry_decisions),
+        ("context mode comparison script", test_prepare_context_mode_comparison_script),
     ]
     results = [_run_case(name, func) for name, func in cases]
 
