@@ -650,6 +650,7 @@ class MainWindow(QMainWindow):
 
     def _build_tabs(self) -> QTabWidget:
         tabs = QTabWidget()
+        self.tabs = tabs
 
         reports_tab = QWidget()
         reports_tab_layout = QVBoxLayout(reports_tab)
@@ -921,6 +922,15 @@ class MainWindow(QMainWindow):
 
         return tabs
 
+    def _show_logs_tab(self) -> None:
+        tabs = getattr(self, "tabs", None)
+        if tabs is None:
+            return
+        for index in range(tabs.count()):
+            if tabs.tabText(index) == "Logs":
+                tabs.setCurrentIndex(index)
+                return
+
     def _set_failed_verification_rerun_compact(self, failed_count: int) -> None:
         if not hasattr(self, "failed_verification_rerun_box"):
             return
@@ -1095,11 +1105,15 @@ class MainWindow(QMainWindow):
                 self.controller.log_message.emit("Start Fresh Audit cancelled before replacing audit context mode.")
                 return
         self.controller.start_fresh_audit()
+        if self.controller.active_task_name() == "Start Fresh Audit":
+            self._show_logs_tab()
 
     def _resume_audit(self) -> None:
         self._apply_api_key()
         self._apply_pdf_path()
         self.controller.resume_audit()
+        if self.controller.active_task_name() == "Resume Audit":
+            self._show_logs_tab()
 
     def _submit_question(self) -> None:
         self._apply_api_key()

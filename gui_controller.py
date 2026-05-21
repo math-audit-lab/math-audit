@@ -47,7 +47,7 @@ from audit_runtime import (
     start_new_qa_thread,
     supported_reasoning_efforts_for_model,
 )
-from audit_state import load_session_from_pdf, workdir_from_pdf
+from audit_state import load_session_from_pdf, load_usage, workdir_from_pdf
 
 
 DEFAULT_MODEL = RUNTIME_DEFAULT_MODEL
@@ -63,6 +63,57 @@ AUDIT_CONTEXT_MODE_LABELS = {
     "Experimental fresh-context per chunk": "fresh_context_experimental",
 }
 AUDIT_CONTEXT_MODE_CHOICES = list(AUDIT_CONTEXT_MODE_LABELS)
+
+
+def _format_duration_for_log(seconds: float) -> str:
+    seconds = max(0.0, float(seconds or 0.0))
+    minutes, sec = divmod(int(round(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {sec}s"
+    if minutes:
+        return f"{minutes}m {sec}s"
+    return f"{sec}s"
+
+
+def format_chunk_completion_log_line(payload: dict[str, Any], usage_entry: dict[str, Any]) -> str:
+    status = payload.get("status") or {}
+    usage = payload.get("usage") or {}
+    totals = usage.get("totals") or {}
+    chunk_id = str(usage_entry.get("chunk_id") or status.get("current_chunk_id") or "chunk")
+    parts = [f"[{chunk_id}] completed"]
+
+    chunks_completed = status.get("chunks_completed")
+    chunks_total = status.get("chunks_total")
+    if chunks_completed is not None and chunks_total is not None:
+        parts.append(f"Progress: {int(chunks_completed or 0)}/{int(chunks_total or 0)}")
+
+    pages_completed = status.get("estimated_pages_completed")
+    pages_total = status.get("estimated_pages_total")
+    if pages_completed is not None and pages_total:
+        parts.append(f"Pages: {int(pages_completed or 0)}/{int(pages_total or 0)}")
+
+    if usage_entry.get("elapsed_seconds") is not None:
+        parts.append(f"Chunk time: {_format_duration_for_log(float(usage_entry.get('elapsed_seconds') or 0.0))}")
+
+    cost = usage_entry.get("cost") or {}
+    chunk_cost = cost.get("total_cost", usage_entry.get("cost_usd"))
+    if chunk_cost is not None:
+        parts.append(f"Chunk cost: ${float(chunk_cost or 0.0):.4f}")
+
+    cumulative_cost = totals.get("cost_usd", status.get("cost_usd"))
+    if cumulative_cost is not None:
+        parts.append(f"Cumulative cost: ${float(cumulative_cost or 0.0):.4f}")
+
+    total_seconds = totals.get("audit_seconds", status.get("total_audit_seconds"))
+    if total_seconds is not None:
+        parts.append(f"Total audit time: {_format_duration_for_log(float(total_seconds or 0.0))}")
+
+    total_tokens = totals.get("total_tokens")
+    if total_tokens is not None:
+        parts.append(f"Total tokens: {int(total_tokens or 0)}")
+
+    return " | ".join(parts)
 
 
 def audit_context_mode_display_label(mode: str) -> str:
@@ -151,6 +202,8 @@ class GuiController(QObject):
         self._saved_session_model: Optional[str] = None
         self._saved_session_reasoning_effort: Optional[str] = None
         self._model_effort_override_active = False
+        self._logged_chunk_completion_signatures: set[tuple[str, str]] = set()
+        self._chunk_completion_log_pdf_path = ""
 
         configure_runtime(
             prompt_builder=build_user_message_for_chunk,
@@ -202,6 +255,7 @@ class GuiController(QObject):
             self._load_saved_audit_settings()
             self._load_saved_discussion_history()
             self._load_saved_discussion_threads()
+            self._prime_chunk_completion_log_state()
         self.poll_status()
 
     def set_model(self, model: str) -> None:
@@ -469,6 +523,7 @@ class GuiController(QObject):
             return
         if not self._require_api_key_for_live_calls():
             return
+        self._reset_chunk_completion_log_state_for_new_audit()
         audit_prompt, audit_prompt_source = effective_audit_system_prompt_with_source(self.model)
         self._run_backend_task(
             "Start Fresh Audit",
@@ -489,6 +544,7 @@ class GuiController(QObject):
         if not self._require_session():
             return
         self._restore_saved_context_mode_for_resume()
+        self._prime_chunk_completion_log_state()
         if not self._require_api_key_for_live_calls():
             return
         model = self.model if self._model_effort_override_active else None
@@ -1050,14 +1106,7 @@ class GuiController(QObject):
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
-        seconds = max(0.0, float(seconds or 0.0))
-        minutes, sec = divmod(int(round(seconds)), 60)
-        hours, minutes = divmod(minutes, 60)
-        if hours:
-            return f"{hours}h {minutes}m {sec}s"
-        if minutes:
-            return f"{minutes}m {sec}s"
-        return f"{sec}s"
+        return _format_duration_for_log(seconds)
 
     def _require_pdf_file(self) -> bool:
         if not self.pdf_path:
@@ -1171,7 +1220,52 @@ class GuiController(QObject):
         payload.setdefault("message", "")
         return payload
 
+    @staticmethod
+    def _chunk_completion_signature(entry: dict[str, Any]) -> tuple[str, str]:
+        return (
+            str(entry.get("time") or ""),
+            str(entry.get("chunk_id") or ""),
+        )
+
+    def _reset_chunk_completion_log_state_for_new_audit(self) -> None:
+        self._logged_chunk_completion_signatures = set()
+        self._chunk_completion_log_pdf_path = self.pdf_path
+
+    def _prime_chunk_completion_log_state(self) -> None:
+        self._logged_chunk_completion_signatures = set()
+        self._chunk_completion_log_pdf_path = self.pdf_path
+        if not self.pdf_path:
+            return
+        try:
+            session = load_session_from_pdf(self.pdf_path)
+            if not session:
+                return
+            usage = load_usage(session)
+        except Exception:
+            return
+        for entry in usage.get("per_chunk", []) or []:
+            if isinstance(entry, dict):
+                self._logged_chunk_completion_signatures.add(self._chunk_completion_signature(entry))
+
+    def _log_new_chunk_completions(self, payload: dict[str, Any]) -> None:
+        if not payload.get("session_available"):
+            return
+        if self._chunk_completion_log_pdf_path != self.pdf_path:
+            self._prime_chunk_completion_log_state()
+            return
+        usage = payload.get("usage") or {}
+        entries = usage.get("per_chunk", []) or []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            signature = self._chunk_completion_signature(entry)
+            if signature in self._logged_chunk_completion_signatures:
+                continue
+            self._logged_chunk_completion_signatures.add(signature)
+            self.log_message.emit(format_chunk_completion_log_line(payload, entry))
+
     def _log_status_change(self, payload: dict[str, Any]) -> None:
+        self._log_new_chunk_completions(payload)
         status = payload.get("status") or {}
         pause = payload.get("pause") or {}
         auto_retry = status.get("last_file_download_timeout_auto_retry") or {}

@@ -47,7 +47,7 @@ from audit_runtime import (
     report_latex_paragraph,
 )
 from audit_state import save_json, session_paths, usage_cache_diagnostics
-from gui_controller import fresh_start_context_mode_mismatch_info
+from gui_controller import format_chunk_completion_log_line, fresh_start_context_mode_mismatch_info
 from scripts.prepare_context_mode_comparison import prepare_context_mode_comparison
 from scripts.run_context_mode_ab_test import run_context_mode_ab_test
 
@@ -957,6 +957,42 @@ def test_context_mode_mixing_guardrails() -> None:
         )
 
 
+def test_chunk_completion_log_line_formatting() -> None:
+    payload = {
+        "status": {
+            "current_chunk_id": "chunk_012",
+            "chunks_completed": 12,
+            "chunks_total": 81,
+            "estimated_pages_completed": 7,
+            "estimated_pages_total": 46,
+            "cost_usd": 12.3456,
+            "total_audit_seconds": 1450.0,
+        },
+        "usage": {
+            "totals": {
+                "cost_usd": 12.3456,
+                "audit_seconds": 1450.0,
+                "total_tokens": 1234567,
+            }
+        },
+    }
+    usage_entry = {
+        "time": NEW,
+        "chunk_id": "chunk_012",
+        "elapsed_seconds": 102.0,
+        "cost": {"total_cost": 0.8421},
+    }
+    line = format_chunk_completion_log_line(payload, usage_entry)
+    _assert(line.startswith("[chunk_012] completed"), line)
+    _assert("Progress: 12/81" in line, line)
+    _assert("Pages: 7/46" in line, line)
+    _assert("Chunk time: 1m 42s" in line, line)
+    _assert("Chunk cost: $0.8421" in line, line)
+    _assert("Cumulative cost: $12.3456" in line, line)
+    _assert("Total audit time: 24m 10s" in line, line)
+    _assert("Total tokens: 1234567" in line, line)
+
+
 def test_resume_preserves_saved_audit_context_mode() -> None:
     with tempfile.TemporaryDirectory(prefix="math_audit_resume_context_") as tmp:
         root = Path(tmp)
@@ -1511,6 +1547,7 @@ def main() -> int:
         ("fresh context mode scaffolding", test_fresh_context_mode_scaffolding),
         ("fresh context issue generic-term downweighting", test_fresh_context_issue_retrieval_downweights_generic_terms),
         ("context mode mixing guardrails", test_context_mode_mixing_guardrails),
+        ("chunk completion log line formatting", test_chunk_completion_log_line_formatting),
         ("resume preserves saved audit context mode", test_resume_preserves_saved_audit_context_mode),
         ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
         ("issue severity summary in audit summary", test_issue_severity_summary_in_audit_summary),
