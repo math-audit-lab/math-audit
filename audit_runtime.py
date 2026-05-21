@@ -816,6 +816,83 @@ def get_report_freshness(session_or_pdf: dict[str, Any] | str | Path) -> dict[st
     }
 
 
+def _reconcile_completed_status_from_chunk_records(
+    session: dict[str, Any],
+    status: dict[str, Any],
+    usage: dict[str, Any],
+) -> dict[str, Any]:
+    if session.get("pending"):
+        return status
+    try:
+        manifest = load_manifest(session)
+        manifest_chunks = manifest.get("chunks") or []
+    except Exception:
+        return status
+    if not manifest_chunks:
+        return status
+    manifest_ids = [
+        str(chunk.get("chunk_id") or "").strip()
+        for chunk in manifest_chunks
+        if isinstance(chunk, dict) and str(chunk.get("chunk_id") or "").strip()
+    ]
+    if not manifest_ids:
+        return status
+    try:
+        records = _read_chunk_records(session)
+    except Exception:
+        return status
+    active_ids = {
+        str(record.get("chunk_id") or "").strip()
+        for record in records
+        if isinstance(record, dict) and str(record.get("chunk_id") or "").strip()
+    }
+    if not all(chunk_id in active_ids for chunk_id in manifest_ids):
+        return status
+
+    status_name = str(status.get("status") or "").strip().lower()
+    current_completed = int(status.get("chunks_completed", 0) or 0)
+    chunks_total = len(manifest_ids)
+    if status_name == "completed" and current_completed >= chunks_total:
+        return status
+
+    previous = {
+        "status": status.get("status"),
+        "pause_reason": status.get("pause_reason"),
+        "chunks_completed": status.get("chunks_completed"),
+        "chunks_total": status.get("chunks_total"),
+        "estimated_pages_completed": status.get("estimated_pages_completed"),
+        "estimated_pages_total": status.get("estimated_pages_total"),
+        "progress_pct": status.get("progress_pct"),
+        "updated_at": status.get("updated_at"),
+    }
+    totals = usage.get("totals") or {}
+    pdf_page_count = int(manifest.get("pdf_page_count", 0) or 0)
+    reconciled = dict(status)
+    reconciled.update(
+        {
+            "status": "completed",
+            "pause_reason": None,
+            "current_chunk_id": None,
+            "chunks_completed": chunks_total,
+            "chunks_total": chunks_total,
+            "estimated_pages_completed": pdf_page_count or status.get("estimated_pages_total", 0),
+            "estimated_pages_total": pdf_page_count or status.get("estimated_pages_total", 0),
+            "progress_pct": 100.0,
+            "cost_usd": float(totals.get("cost_usd", status.get("cost_usd", 0.0)) or 0.0),
+            "total_audit_seconds": float(totals.get("audit_seconds", status.get("total_audit_seconds", 0.0)) or 0.0),
+            "current_chunk_elapsed_seconds": 0.0,
+            "audit_finished_at": session.get("audit_finished_at") or status.get("audit_finished_at"),
+            "reconciled_from_chunk_records": True,
+            "reconciliation_note": (
+                "Displayed as completed because active chunk records cover every manifest chunk; "
+                "state/status.json appears stale."
+            ),
+            "stale_status_snapshot": previous,
+        }
+    )
+    return reconciled
+
+
 def get_audit_status(
     session_or_pdf: dict[str, Any] | str | Path,
     include_manifest: bool = False,
@@ -827,6 +904,7 @@ def get_audit_status(
     status["pause_requested"] = pause["requested"]
     status["pause_requested_at"] = pause["requested_at"]
     usage = load_usage(session)
+    status = _reconcile_completed_status_from_chunk_records(session, status, usage)
     if not status.get("last_chunk_usage_diagnostics"):
         for entry in reversed(usage.get("per_chunk", []) or []):
             if not isinstance(entry, dict) or not entry.get("usage"):

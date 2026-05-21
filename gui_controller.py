@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -114,6 +115,63 @@ def format_chunk_completion_log_line(payload: dict[str, Any], usage_entry: dict[
         parts.append(f"Total tokens: {int(total_tokens or 0)}")
 
     return " | ".join(parts)
+
+
+def persistent_audit_log_preview(pdf_path: str, max_entries: int = 8) -> list[str]:
+    if not str(pdf_path or "").strip():
+        return []
+    session = load_session_from_pdf(pdf_path)
+    if not session:
+        return []
+    logs_dir = Path(session["workdir"]) / "logs"
+    if not logs_dir.exists():
+        return []
+
+    counts: list[str] = []
+    events: list[tuple[str, str, dict[str, Any]]] = []
+    for path in sorted(logs_dir.glob("*.jsonl")):
+        try:
+            raw_lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        if not raw_lines:
+            continue
+        counts.append(f"{path.name}: {len(raw_lines)}")
+        for raw in raw_lines[-max(1, int(max_entries)):]:
+            try:
+                item = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(item, dict):
+                events.append((str(item.get("time") or ""), path.name, item))
+
+    if not counts:
+        return []
+
+    lines = [
+        "Historical audit logs found: " + "; ".join(counts),
+        f"Logs folder: {logs_dir}",
+    ]
+    events.sort(key=lambda event: event[0])
+    recent = events[-max(1, int(max_entries)):]
+    if recent:
+        lines.append(f"Recent persistent audit events (last {len(recent)}):")
+    for event_time, filename, event in recent:
+        action = str(event.get("action") or "").strip()
+        chunk_id = str(event.get("chunk_id") or "").strip()
+        chunk_ids = event.get("chunk_ids")
+        if not chunk_id and isinstance(chunk_ids, list) and chunk_ids:
+            preview = ", ".join(str(item) for item in chunk_ids[:4])
+            if len(chunk_ids) > 4:
+                preview += ", ..."
+            chunk_id = preview
+        label = f"{filename}: {action or 'event'}"
+        if chunk_id:
+            label += f" ({chunk_id})"
+        if event.get("error"):
+            label += " - error recorded"
+        lines.append(f"- {event_time or 'unknown time'} | {label}")
+    return lines
 
 
 def audit_context_mode_display_label(mode: str) -> str:
@@ -256,6 +314,8 @@ class GuiController(QObject):
             self._load_saved_discussion_history()
             self._load_saved_discussion_threads()
             self._prime_chunk_completion_log_state()
+            for line in persistent_audit_log_preview(self.pdf_path):
+                self.log_message.emit(line)
         self.poll_status()
 
     def set_model(self, model: str) -> None:

@@ -47,7 +47,11 @@ from audit_runtime import (
     report_latex_paragraph,
 )
 from audit_state import save_json, session_paths, usage_cache_diagnostics
-from gui_controller import format_chunk_completion_log_line, fresh_start_context_mode_mismatch_info
+from gui_controller import (
+    format_chunk_completion_log_line,
+    fresh_start_context_mode_mismatch_info,
+    persistent_audit_log_preview,
+)
 from scripts.prepare_context_mode_comparison import prepare_context_mode_comparison
 from scripts.run_context_mode_ab_test import run_context_mode_ab_test
 
@@ -993,6 +997,72 @@ def test_chunk_completion_log_line_formatting() -> None:
     _assert("Total tokens: 1234567" in line, line)
 
 
+def test_completed_status_reconciles_from_chunk_records() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_status_reconcile_") as tmp:
+        root = Path(tmp)
+        pdf_path = root / "paper.pdf"
+        _write_text(pdf_path, "%PDF synthetic placeholder")
+        workdir = pdf_path.with_name(pdf_path.stem + "_audit")
+        session = _seed_state(workdir)
+        session["pdf_path"] = str(pdf_path)
+        session["audit_finished_at"] = NEW
+        _write_json(session_paths(workdir)["session"], session)
+        manifest = {
+            "chunks": [
+                {"chunk_id": "chunk_001", "chunk_index": 1, "page_end": 1, "paper_progress_end": 0.5},
+                {"chunk_id": "chunk_002", "chunk_index": 2, "page_end": 2, "paper_progress_end": 1.0},
+            ],
+            "pdf_page_count": 2,
+        }
+        _write_json(session_paths(workdir)["manifest"], manifest)
+        _write_json(
+            session_paths(workdir)["status"],
+            {
+                "status": "paused",
+                "pause_reason": "chunk_failed",
+                "current_chunk_id": None,
+                "chunks_completed": 1,
+                "chunks_total": 2,
+                "estimated_pages_completed": 1,
+                "estimated_pages_total": 2,
+                "progress_pct": 50.0,
+                "cost_usd": 0.0,
+                "updated_at": OLD,
+            },
+        )
+        _append_jsonl(session_paths(workdir)["chunk_records"], {"chunk_id": "chunk_001", "chunk_index": 1})
+        _append_jsonl(session_paths(workdir)["chunk_records"], {"chunk_id": "chunk_002", "chunk_index": 2})
+        payload = get_audit_status(pdf_path)
+        status = payload["status"]
+        _assert(status["status"] == "completed", status)
+        _assert(status["chunks_completed"] == 2, status)
+        _assert(status["estimated_pages_completed"] == 2, status)
+        _assert(status.get("reconciled_from_chunk_records"), status)
+        saved_status = json.loads(session_paths(workdir)["status"].read_text(encoding="utf-8"))
+        _assert(saved_status["status"] == "paused", saved_status)
+
+
+def test_persistent_audit_log_preview() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_log_preview_") as tmp:
+        root = Path(tmp)
+        pdf_path = root / "paper.pdf"
+        _write_text(pdf_path, "%PDF synthetic placeholder")
+        workdir = pdf_path.with_name(pdf_path.stem + "_audit")
+        session = _seed_state(workdir)
+        session["pdf_path"] = str(pdf_path)
+        _write_json(session_paths(workdir)["session"], session)
+        _append_jsonl(workdir / "logs" / "selected_chunk_reruns.jsonl", {"time": OLD, "action": "started", "chunk_ids": ["chunk_001"]})
+        _append_jsonl(workdir / "logs" / "selected_chunk_reruns.jsonl", {"time": NEW, "action": "finished", "chunk_ids": ["chunk_001", "chunk_002"]})
+        _append_jsonl(workdir / "logs" / "failed_chunks.jsonl", {"time": MID, "action": "failed", "chunk_id": "chunk_002", "error": "boom"})
+        preview = persistent_audit_log_preview(str(pdf_path), max_entries=2)
+        text = "\n".join(preview)
+        _assert("Historical audit logs found:" in text, text)
+        _assert("Logs folder:" in text, text)
+        _assert("Recent persistent audit events" in text, text)
+        _assert("failed_chunks.jsonl: failed (chunk_002) - error recorded" in text, text)
+        _assert("selected_chunk_reruns.jsonl: finished (chunk_001, chunk_002)" in text, text)
+
+
 def test_resume_preserves_saved_audit_context_mode() -> None:
     with tempfile.TemporaryDirectory(prefix="math_audit_resume_context_") as tmp:
         root = Path(tmp)
@@ -1548,6 +1618,8 @@ def main() -> int:
         ("fresh context issue generic-term downweighting", test_fresh_context_issue_retrieval_downweights_generic_terms),
         ("context mode mixing guardrails", test_context_mode_mixing_guardrails),
         ("chunk completion log line formatting", test_chunk_completion_log_line_formatting),
+        ("completed status reconciliation", test_completed_status_reconciles_from_chunk_records),
+        ("persistent audit log preview", test_persistent_audit_log_preview),
         ("resume preserves saved audit context mode", test_resume_preserves_saved_audit_context_mode),
         ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
         ("issue severity summary in audit summary", test_issue_severity_summary_in_audit_summary),
