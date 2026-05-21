@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -1073,6 +1074,26 @@ class MainWindow(QMainWindow):
     def _start_fresh_audit(self) -> None:
         self._apply_api_key()
         self._apply_pdf_path()
+        mismatch = self.controller.fresh_start_context_mode_mismatch_info()
+        if mismatch:
+            message = (
+                "This will archive the existing "
+                f"{mismatch.get('saved_label', mismatch.get('saved_mode', 'saved'))} audit folder "
+                "and create a new "
+                f"{mismatch.get('selected_label', mismatch.get('selected_mode', 'selected'))} audit in:\n\n"
+                f"{mismatch.get('workdir', '')}\n\n"
+                "Continue?"
+            )
+            choice = QMessageBox.question(
+                self,
+                "Start Fresh Audit With Different Context Mode",
+                message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if choice != QMessageBox.StandardButton.Yes:
+                self.controller.log_message.emit("Start Fresh Audit cancelled before replacing audit context mode.")
+                return
         self.controller.start_fresh_audit()
 
     def _resume_audit(self) -> None:

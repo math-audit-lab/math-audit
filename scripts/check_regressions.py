@@ -34,6 +34,7 @@ from audit_runtime import (
     PDF_TEXT_ONLY_RETRY_NOTE,
     _append_audit_context_db_entries,
     _audit_request_size_diagnostics,
+    _existing_session_audit_context_mode,
     _file_download_timeout_auto_retry_decision,
     _file_download_timeout_retry_mode,
     _retryable_response_failure_reason,
@@ -46,6 +47,7 @@ from audit_runtime import (
     report_latex_paragraph,
 )
 from audit_state import save_json, session_paths, usage_cache_diagnostics
+from gui_controller import fresh_start_context_mode_mismatch_info
 from scripts.prepare_context_mode_comparison import prepare_context_mode_comparison
 from scripts.run_context_mode_ab_test import run_context_mode_ab_test
 
@@ -904,6 +906,57 @@ def test_fresh_context_issue_retrieval_downweights_generic_terms() -> None:
         _assert("I999" not in retrieved["block"], retrieved["block"])
 
 
+def test_context_mode_mixing_guardrails() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_context_mode_guard_") as tmp:
+        root = Path(tmp)
+        pdf_path = root / "paper.pdf"
+        _write_text(pdf_path, "%PDF synthetic placeholder")
+        workdir = pdf_path.with_name(pdf_path.stem + "_audit")
+        session = _seed_state(workdir)
+        session["pdf_path"] = str(pdf_path)
+        session["audit_context_mode"] = DEFAULT_AUDIT_CONTEXT_MODE
+        _write_json(session_paths(workdir)["session"], session)
+
+        _assert(
+            _existing_session_audit_context_mode(session, None) == DEFAULT_AUDIT_CONTEXT_MODE,
+            session,
+        )
+        _assert(
+            _existing_session_audit_context_mode(session, DEFAULT_AUDIT_CONTEXT_MODE) == DEFAULT_AUDIT_CONTEXT_MODE,
+            session,
+        )
+        try:
+            _existing_session_audit_context_mode(session, AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL)
+        except RuntimeError as exc:
+            _assert("Cannot change audit_context_mode" in str(exc), str(exc))
+        else:
+            raise RegressionFailure("Runtime helper allowed context-mode change on existing session")
+
+        try:
+            runtime.audit_the_paper(
+                pdf_path,
+                continue_existing=True,
+                audit_context_mode=AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL,
+                verbose=False,
+            )
+        except RuntimeError as exc:
+            _assert("Cannot change audit_context_mode" in str(exc), str(exc))
+        else:
+            raise RegressionFailure("audit_the_paper allowed context-mode change on existing session")
+
+        saved = json.loads(session_paths(workdir)["session"].read_text(encoding="utf-8"))
+        _assert(saved["audit_context_mode"] == DEFAULT_AUDIT_CONTEXT_MODE, saved)
+
+        mismatch = fresh_start_context_mode_mismatch_info(str(pdf_path), AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL)
+        _assert(mismatch.get("saved_mode") == DEFAULT_AUDIT_CONTEXT_MODE, mismatch)
+        _assert(mismatch.get("selected_mode") == AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL, mismatch)
+        _assert(Path(str(mismatch.get("workdir") or "")).resolve() == workdir.resolve(), mismatch)
+        _assert(
+            not fresh_start_context_mode_mismatch_info(str(pdf_path), DEFAULT_AUDIT_CONTEXT_MODE),
+            "same-mode fresh start should not need a mode-mismatch warning",
+        )
+
+
 def test_resume_preserves_saved_audit_context_mode() -> None:
     with tempfile.TemporaryDirectory(prefix="math_audit_resume_context_") as tmp:
         root = Path(tmp)
@@ -1457,6 +1510,7 @@ def main() -> int:
         ("request size diagnostics", test_request_size_diagnostics),
         ("fresh context mode scaffolding", test_fresh_context_mode_scaffolding),
         ("fresh context issue generic-term downweighting", test_fresh_context_issue_retrieval_downweights_generic_terms),
+        ("context mode mixing guardrails", test_context_mode_mixing_guardrails),
         ("resume preserves saved audit context mode", test_resume_preserves_saved_audit_context_mode),
         ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
         ("issue severity summary in audit summary", test_issue_severity_summary_in_audit_summary),

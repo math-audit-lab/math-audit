@@ -206,6 +206,24 @@ def _normalize_audit_context_mode(audit_context_mode: Optional[str] = None) -> s
     return clean
 
 
+def _existing_session_audit_context_mode(
+    session: dict[str, Any],
+    requested_mode: Optional[str] = None,
+) -> str:
+    saved_mode = _normalize_audit_context_mode(session.get("audit_context_mode"))
+    if requested_mode is None:
+        return saved_mode
+    requested = _normalize_audit_context_mode(requested_mode)
+    if requested != saved_mode:
+        raise RuntimeError(
+            "Cannot change audit_context_mode for an existing audit session: "
+            f"saved={saved_mode}, requested={requested}. "
+            "Resume uses the saved mode. To audit the same PDF with a different context mode, "
+            "start a fresh audit and confirm that the existing audit folder will be archived."
+        )
+    return saved_mode
+
+
 def _normalize_qa_context_mode(qa_context_mode: Optional[str] = None) -> str:
     clean = str(qa_context_mode or DEFAULT_QA_CONTEXT_MODE).strip()
     if clean not in QA_CONTEXT_MODES:
@@ -6482,10 +6500,7 @@ def audit_the_paper(
             session["reference_mention_style"] = _normalize_reference_mention_style(reference_mention_style)
         if report_reference_style is not None:
             session["report_reference_style"] = _normalize_report_reference_style(report_reference_style)
-        if audit_context_mode is not None:
-            session["audit_context_mode"] = _normalize_audit_context_mode(audit_context_mode)
-        else:
-            session["audit_context_mode"] = _normalize_audit_context_mode(session.get("audit_context_mode"))
+        session["audit_context_mode"] = _existing_session_audit_context_mode(session, audit_context_mode)
         if audit_system_prompt is not None:
             resolved_prompt, prompt_metadata = _resolve_audit_system_prompt(
                 session.get("model") or DEFAULT_MODEL,

@@ -47,7 +47,7 @@ from audit_runtime import (
     start_new_qa_thread,
     supported_reasoning_efforts_for_model,
 )
-from audit_state import load_session_from_pdf
+from audit_state import load_session_from_pdf, workdir_from_pdf
 
 
 DEFAULT_MODEL = RUNTIME_DEFAULT_MODEL
@@ -63,6 +63,34 @@ AUDIT_CONTEXT_MODE_LABELS = {
     "Experimental fresh-context per chunk": "fresh_context_experimental",
 }
 AUDIT_CONTEXT_MODE_CHOICES = list(AUDIT_CONTEXT_MODE_LABELS)
+
+
+def audit_context_mode_display_label(mode: str) -> str:
+    clean = str(mode or DEFAULT_AUDIT_CONTEXT_MODE).strip()
+    return next((label for label, value in AUDIT_CONTEXT_MODE_LABELS.items() if value == clean), clean)
+
+
+def fresh_start_context_mode_mismatch_info(pdf_path: str, selected_mode: str) -> dict[str, str]:
+    if not str(pdf_path or "").strip():
+        return {}
+    session = load_session_from_pdf(pdf_path)
+    if not session:
+        return {}
+    saved_mode = str(session.get("audit_context_mode") or DEFAULT_AUDIT_CONTEXT_MODE).strip()
+    if saved_mode not in AUDIT_CONTEXT_MODES:
+        saved_mode = DEFAULT_AUDIT_CONTEXT_MODE
+    requested = str(selected_mode or DEFAULT_AUDIT_CONTEXT_MODE).strip()
+    if requested not in AUDIT_CONTEXT_MODES:
+        requested = DEFAULT_AUDIT_CONTEXT_MODE
+    if saved_mode == requested:
+        return {}
+    return {
+        "saved_mode": saved_mode,
+        "selected_mode": requested,
+        "saved_label": audit_context_mode_display_label(saved_mode),
+        "selected_label": audit_context_mode_display_label(requested),
+        "workdir": str(workdir_from_pdf(pdf_path)),
+    }
 
 
 class BackendWorker(QObject):
@@ -261,8 +289,7 @@ class GuiController(QObject):
             return
         if mode != self.audit_context_mode:
             self.audit_context_mode = mode
-            display = next((label for label, value in AUDIT_CONTEXT_MODE_LABELS.items() if value == mode), mode)
-            self.log_message.emit(f"Audit context mode: {display}")
+            self.log_message.emit(f"Audit context mode: {audit_context_mode_display_label(mode)}")
 
     def _load_saved_audit_settings(self) -> None:
         self._saved_session_model = None
@@ -286,6 +313,25 @@ class GuiController(QObject):
         self.audit_settings_changed.emit(model, effort)
         self.audit_context_mode_changed.emit(self.audit_context_mode)
         self.log_message.emit(f"Loaded saved audit settings: {model} / {effort} / context={self.audit_context_mode}")
+
+    def fresh_start_context_mode_mismatch_info(self) -> dict[str, str]:
+        return fresh_start_context_mode_mismatch_info(self.pdf_path, self.audit_context_mode)
+
+    def _restore_saved_context_mode_for_resume(self) -> None:
+        session = load_session_from_pdf(self.pdf_path) if self.pdf_path else None
+        if not session:
+            return
+        saved_context_mode = str(session.get("audit_context_mode") or DEFAULT_AUDIT_CONTEXT_MODE).strip()
+        if saved_context_mode not in AUDIT_CONTEXT_MODES:
+            saved_context_mode = DEFAULT_AUDIT_CONTEXT_MODE
+        if saved_context_mode == self.audit_context_mode:
+            return
+        self.audit_context_mode = saved_context_mode
+        self.audit_context_mode_changed.emit(saved_context_mode)
+        self.log_message.emit(
+            "Resume uses the saved audit context mode: "
+            f"{audit_context_mode_display_label(saved_context_mode)}."
+        )
 
     def _load_saved_discussion_history(self) -> None:
         if not self.pdf_path:
@@ -442,6 +488,7 @@ class GuiController(QObject):
             return
         if not self._require_session():
             return
+        self._restore_saved_context_mode_for_resume()
         if not self._require_api_key_for_live_calls():
             return
         model = self.model if self._model_effort_override_active else None
