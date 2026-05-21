@@ -1231,10 +1231,17 @@ def test_prepare_context_mode_comparison_script() -> None:
         prompt = (output / "chunk_002" / "fresh_context_prompt.txt").read_text(encoding="utf-8")
         _assert("Retrieved fresh-context audit database context:" in prompt, prompt)
         _assert(prompt.index("Retrieved fresh-context audit database context:") < prompt.index("Chunk text:"), prompt)
+        summary = (output / "chunk_002" / "context_summary.md").read_text(encoding="utf-8")
+        _assert("Prior audit issues are provisional findings" in summary, summary)
+        _assert("I001 | high | status: open | source: chunk_001" in summary, summary)
+        _assert("reasons:" in summary, summary)
+        _assert("Reason Counts" in summary, summary)
         metadata = json.loads((output / "chunk_002" / "fresh_context_request_metadata.json").read_text(encoding="utf-8"))
         _assert(metadata["dry_run"] is True, metadata)
         _assert(metadata["would_call_api"] is False, metadata)
         _assert(metadata["request_size_diagnostics"]["fresh_context_conversation"], metadata)
+        _assert(metadata["priority_issues"][0]["issue_id"] == "I001", metadata)
+        _assert(metadata["priority_issue_reason_counts"]["recent"] >= 1, metadata)
         _assert((output / "comparison_manifest.json").exists(), "comparison manifest missing")
 
 

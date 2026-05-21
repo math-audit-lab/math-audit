@@ -19,9 +19,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from audit_policy_hooks import build_user_message_for_chunk
 from audit_runtime import (
     AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL,
+    FRESH_CONTEXT_PRIOR_ISSUE_CAUTION,
     FRESH_CONTEXT_TEXT_FIRST_NOTE,
     _append_audit_context_db_entries,
     _audit_request_size_diagnostics,
+    _context_entry_score,
+    _context_query_terms,
     build_fresh_audit_context_for_chunk,
 )
 from audit_state import session_paths
@@ -179,19 +182,106 @@ def _summarize_baseline_request(path: Path | None) -> dict[str, Any]:
     }
 
 
+def _chunk_index(chunk: dict[str, Any]) -> int | None:
+    try:
+        return int(chunk.get("chunk_index"))
+    except Exception:
+        pass
+    chunk_id = str(chunk.get("chunk_id") or "")
+    tail = chunk_id.rsplit("_", 1)[-1]
+    try:
+        return int(tail)
+    except Exception:
+        return None
+
+
+def _short_text(text: Any, limit: int = 180) -> str:
+    clean = " ".join(str(text or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _priority_issue_details(
+    chunk: dict[str, Any],
+    entries: list[dict[str, Any]],
+    recent_summary_limit: int = 4,
+) -> list[dict[str, Any]]:
+    current_index = _chunk_index(chunk)
+    recent_window = max(int(recent_summary_limit), 4)
+    query_terms = _context_query_terms(chunk)
+    details: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry.get("kind") != "issue":
+            continue
+        severity = str(entry.get("severity") or "").lower()
+        status = str(entry.get("status") or "open").lower()
+        if severity not in {"critical", "high"}:
+            continue
+        try:
+            source_index = int(entry.get("source_chunk_index") or 0)
+        except Exception:
+            source_index = 0
+        is_recent = bool(
+            current_index is not None
+            and source_index > 0
+            and 0 < current_index - source_index <= recent_window
+        )
+        lexical_score = _context_entry_score(entry, query_terms) if query_terms else 0
+        priority_rule_match = status != "resolved" and severity in {"critical", "high"}
+        broad_priority_only = priority_rule_match and not is_recent and lexical_score <= 0
+        reasons: list[str] = []
+        if is_recent:
+            reasons.append("recent")
+        if lexical_score > 0:
+            reasons.append(f"lexically relevant (score {lexical_score})")
+        if broad_priority_only:
+            reasons.append("broad priority rule")
+        elif priority_rule_match:
+            reasons.append("priority issue")
+        details.append(
+            {
+                "issue_id": str(entry.get("issue_id") or ""),
+                "severity": severity or "unknown",
+                "status": status or "unknown",
+                "source_chunk_id": str(entry.get("source_chunk_id") or ""),
+                "source_chunk_index": source_index or None,
+                "summary": _short_text(entry.get("text")),
+                "recent": is_recent,
+                "lexically_relevant": lexical_score > 0,
+                "lexical_score": lexical_score,
+                "priority_rule_match": priority_rule_match,
+                "broad_priority_only": broad_priority_only,
+                "reasons": reasons or ["included by retrieved context selection"],
+            }
+        )
+    return details
+
+
+def _issue_reason_counts(details: list[dict[str, Any]]) -> dict[str, int]:
+    counts = Counter()
+    for detail in details:
+        if detail.get("recent"):
+            counts["recent"] += 1
+        if detail.get("lexically_relevant"):
+            counts["lexically_relevant"] += 1
+        if detail.get("priority_rule_match"):
+            counts["priority_rule_match"] += 1
+        if detail.get("broad_priority_only"):
+            counts["broad_priority_only"] += 1
+    return dict(counts)
+
+
 def _context_summary(
-    chunk_id: str,
+    chunk: dict[str, Any],
     entries: list[dict[str, Any]],
     diagnostics: dict[str, Any],
     baseline: dict[str, Any],
 ) -> str:
+    chunk_id = str(chunk.get("chunk_id") or "chunk")
     kind_counts = Counter(str(entry.get("kind") or "unknown") for entry in entries)
-    priority_issues = [
-        str(entry.get("issue_id") or "")
-        for entry in entries
-        if entry.get("kind") == "issue"
-        and str(entry.get("severity") or "").lower() in {"critical", "high"}
-    ]
+    priority_issues = _priority_issue_details(chunk, entries)
+    issue_reason_counts = _issue_reason_counts(priority_issues)
     recent_summaries = [
         str(entry.get("source_chunk_id") or "")
         for entry in entries
@@ -221,7 +311,30 @@ def _context_summary(
         [
             "",
             "## Included Priority Issues",
-            f"- {', '.join(item for item in priority_issues if item) or 'none'}",
+            f"- Note: {FRESH_CONTEXT_PRIOR_ISSUE_CAUTION}",
+        ]
+    )
+    if priority_issues:
+        lines.append("")
+        lines.append("### Reason Counts")
+        for key in ("recent", "lexically_relevant", "priority_rule_match", "broad_priority_only"):
+            lines.append(f"- {key.replace('_', ' ').title()}: {issue_reason_counts.get(key, 0)}")
+        lines.append("")
+        lines.append("### Issue Details")
+        for issue in priority_issues:
+            lines.append(
+                "- "
+                f"{issue['issue_id'] or 'unknown issue'} | "
+                f"{issue['severity']} | "
+                f"status: {issue['status']} | "
+                f"source: {issue['source_chunk_id'] or 'unknown'} | "
+                f"reasons: {', '.join(issue['reasons'])} | "
+                f"{issue['summary'] or 'no short description available'}"
+            )
+    else:
+        lines.append("- none")
+    lines.extend(
+        [
             "",
             "## Included Recent Chunk Summaries",
             f"- {', '.join(item for item in recent_summaries if item) or 'none'}",
@@ -365,12 +478,15 @@ def prepare_context_mode_comparison(
             }
             diagnostics = _audit_request_size_diagnostics(staging_session, chunk, request_kwargs)
             baseline = _summarize_baseline_request(_latest_request_path(audit_workdir, chunk_id))
+            entries = retrieved.get("entries") or []
+            priority_issue_details = _priority_issue_details(chunk, entries)
+            issue_reason_counts = _issue_reason_counts(priority_issue_details)
 
             chunk_dir = output_dir / chunk_id
             chunk_dir.mkdir(parents=True, exist_ok=True)
             _write_json(chunk_dir / "baseline_request_metadata.json", baseline)
             (chunk_dir / "fresh_context_prompt.txt").write_text(prompt_text, encoding="utf-8")
-            _write_json(chunk_dir / "fresh_context_entries.json", retrieved.get("entries") or [])
+            _write_json(chunk_dir / "fresh_context_entries.json", entries)
             _write_json(
                 chunk_dir / "fresh_context_request_metadata.json",
                 {
@@ -385,10 +501,12 @@ def prepare_context_mode_comparison(
                     "pdf_attachment_suppressed": True,
                     "pdf_attachment_note": FRESH_CONTEXT_TEXT_FIRST_NOTE,
                     "request_size_diagnostics": diagnostics,
+                    "priority_issues": priority_issue_details,
+                    "priority_issue_reason_counts": issue_reason_counts,
                 },
             )
             (chunk_dir / "context_summary.md").write_text(
-                _context_summary(chunk_id, retrieved.get("entries") or [], diagnostics, baseline),
+                _context_summary(chunk, entries, diagnostics, baseline),
                 encoding="utf-8",
             )
 
@@ -397,13 +515,11 @@ def prepare_context_mode_comparison(
                     "chunk_id": chunk_id,
                     "entry_count": int(retrieved.get("entry_count") or 0),
                     "context_chars": int(retrieved.get("chars") or 0),
-                    "context_kinds": dict(Counter(str(entry.get("kind") or "unknown") for entry in retrieved.get("entries") or [])),
-                    "has_high_or_critical_issues": any(
-                        entry.get("kind") == "issue"
-                        and str(entry.get("severity") or "").lower() in {"critical", "high"}
-                        for entry in retrieved.get("entries") or []
-                    ),
-                    "has_recent_chunk_summaries": any(entry.get("kind") == "chunk_summary" for entry in retrieved.get("entries") or []),
+                    "context_kinds": dict(Counter(str(entry.get("kind") or "unknown") for entry in entries)),
+                    "has_high_or_critical_issues": bool(priority_issue_details),
+                    "priority_issues": priority_issue_details,
+                    "priority_issue_reason_counts": issue_reason_counts,
+                    "has_recent_chunk_summaries": any(entry.get("kind") == "chunk_summary" for entry in entries),
                     "chunk_text_chars": diagnostics.get("chunk_text_length", 0),
                     "macro_glossary_chars": diagnostics.get("tex_macro_glossary_length", 0),
                     "user_prompt_chars": diagnostics.get("user_prompt_length", 0),
