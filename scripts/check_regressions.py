@@ -29,6 +29,7 @@ from audit_runtime import (
     DEFAULT_AUDIT_CONTEXT_MODE,
     FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_REATTACH,
     FILE_DOWNLOAD_TIMEOUT_RETRY_MODE_TEXT_ONLY,
+    FRESH_CONTEXT_PRIOR_ISSUE_CAUTION,
     FRESH_CONTEXT_TEXT_FIRST_NOTE,
     PDF_TEXT_ONLY_RETRY_NOTE,
     _append_audit_context_db_entries,
@@ -808,6 +809,8 @@ def test_fresh_context_mode_scaffolding() -> None:
             if isinstance(part, dict) and part.get("type") == "input_text"
         )
         _assert("Retrieved fresh-context audit database context:" in prompt_text, prompt_text)
+        _assert(FRESH_CONTEXT_PRIOR_ISSUE_CAUTION in prompt_text, prompt_text)
+        _assert("prior audit issue (provisional)" in prompt_text, prompt_text)
         _assert(prompt_text.index("Retrieved fresh-context audit database context:") < prompt_text.index("Chunk text:"), prompt_text)
         _assert(fresh_chunk.get("_retrieved_context_entry_count", 0) > 0, fresh_chunk)
 

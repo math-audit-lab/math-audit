@@ -88,6 +88,10 @@ FRESH_CONTEXT_TEXT_FIRST_NOTE = (
     "This audit request uses explicit extracted chunk text and retrieved context instead of accumulated "
     "PDF conversation context. Do not overclaim visual PDF/reference precision."
 )
+FRESH_CONTEXT_PRIOR_ISSUE_CAUTION = (
+    "Prior audit issues are provisional findings. Recheck them when relevant; do not treat them as established facts. "
+    "If current context contradicts a prior issue, flag that."
+)
 PDF_TEXT_ONLY_RETRY_NOTE = (
     "PDF attachment disabled for this retry due to repeated API file-download timeout. "
     "Rely on extracted chunk text, reference-map/page metadata, and running audit context. "
@@ -4779,6 +4783,7 @@ def build_fresh_audit_context_for_chunk(
     summaries = [entry for entry in prior_entries if entry.get("kind") == "chunk_summary"]
     summaries.sort(key=sort_key)
     selected: list[dict[str, Any]] = summaries[-recent_summary_limit:]
+    query_terms = _context_query_terms(chunk)
 
     priority_issue_entries = [
         entry
@@ -4787,6 +4792,18 @@ def build_fresh_audit_context_for_chunk(
         and str(entry.get("status") or "open").lower() != "resolved"
         and str(entry.get("severity") or "").lower() in {"critical", "high"}
     ]
+    if current_index is not None and query_terms:
+        recent_issue_window = max(int(recent_summary_limit), 4)
+        filtered_priority_issues: list[dict[str, Any]] = []
+        for entry in priority_issue_entries:
+            try:
+                source_index = int(entry.get("source_chunk_index") or 0)
+            except Exception:
+                source_index = 0
+            is_recent = source_index > 0 and 0 < current_index - source_index <= recent_issue_window
+            if is_recent or _context_entry_score(entry, query_terms) > 0:
+                filtered_priority_issues.append(entry)
+        priority_issue_entries = filtered_priority_issues
     priority_issue_entries.sort(
         key=lambda entry: (
             0 if str(entry.get("severity") or "").lower() == "critical" else 1,
@@ -4796,7 +4813,6 @@ def build_fresh_audit_context_for_chunk(
     selected.extend(priority_issue_entries)
 
     selected_ids = {str(entry.get("entry_id") or "") for entry in selected}
-    query_terms = _context_query_terms(chunk)
     scored = []
     for entry in prior_entries:
         entry_id = str(entry.get("entry_id") or "")
@@ -4812,13 +4828,24 @@ def build_fresh_audit_context_for_chunk(
         "Retrieved fresh-context audit database context:",
         "Use this compact saved-state context conservatively; the current chunk text below is authoritative.",
         FRESH_CONTEXT_TEXT_FIRST_NOTE,
+        "Context provenance:",
+        "- Paper-derived context entries summarize saved prior chunk notation, definitions, assumptions, dependencies, verified steps, and boundary hints.",
     ]
+    if any(entry.get("kind") == "issue" for entry in selected):
+        lines.extend(
+            [
+                "- Prior audit issue entries are audit-derived warnings, not paper claims.",
+                FRESH_CONTEXT_PRIOR_ISSUE_CAUTION,
+            ]
+        )
     included: list[dict[str, Any]] = []
     for entry in selected:
+        kind = str(entry.get("kind") or "context")
+        display_kind = "prior audit issue (provisional)" if kind == "issue" else f"paper-derived {kind}"
         label = " | ".join(
             part
             for part in [
-                str(entry.get("kind") or "context"),
+                display_kind,
                 str(entry.get("source_chunk_id") or ""),
                 f"pages {entry.get('page_start')}-{entry.get('page_end')}",
                 str(entry.get("issue_id") or ""),
