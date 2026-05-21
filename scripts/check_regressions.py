@@ -47,6 +47,7 @@ from audit_runtime import (
 )
 from audit_state import save_json, session_paths, usage_cache_diagnostics
 from scripts.prepare_context_mode_comparison import prepare_context_mode_comparison
+from scripts.run_context_mode_ab_test import run_context_mode_ab_test
 
 
 OLD = "2026-01-01T00:00:00+00:00"
@@ -1245,6 +1246,133 @@ def test_prepare_context_mode_comparison_script() -> None:
         _assert((output / "comparison_manifest.json").exists(), "comparison manifest missing")
 
 
+def test_run_context_mode_ab_test_dry_run() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_ab_test_regression_") as tmp:
+        root = Path(tmp)
+        source = root / "source_audit"
+        output = root / "ab_output"
+        session = _seed_state(source)
+        session["conversation_id"] = "conv-main"
+        session["pdf_file_id"] = "file-paper"
+        session["pdf_path"] = str(root / "paper.pdf")
+        session["model"] = "gpt-5.5"
+        session["reasoning_effort"] = "xhigh"
+        _write_json(session_paths(source)["session"], session)
+        chunks = [
+            {
+                "chunk_id": "chunk_001",
+                "chunk_index": 1,
+                "label": "Synthetic definition",
+                "boundary": "pages 1-1",
+                "source_kind": "pdf",
+                "page_start": 1,
+                "page_end": 1,
+                "paper_progress_end": 0.5,
+                "chunk_text": "Definition 1. Let alpha be the main parameter.",
+            },
+            {
+                "chunk_id": "chunk_002",
+                "chunk_index": 2,
+                "label": "Synthetic theorem",
+                "boundary": "pages 2-2; Theorem 2",
+                "source_kind": "pdf",
+                "page_start": 2,
+                "page_end": 2,
+                "paper_progress_end": 1.0,
+                "chunk_text": "Theorem 2 uses alpha from Definition 1.",
+            },
+        ]
+        _write_json(session_paths(source)["manifest"], {"chunks": chunks, "pdf_page_count": 2})
+        _write_json(
+            session_paths(source)["issues"],
+            {
+                "issues": [
+                    {
+                        "issue_id": "I001",
+                        "chunk_id": "chunk_001",
+                        "severity": "high",
+                        "status": "open",
+                        "title": "Dependency needs care",
+                        "location": "chunk_001",
+                        "description": "Later chunks depend on alpha.",
+                    }
+                ]
+            },
+        )
+        structured_1 = {
+            "assumptions_and_notation": ["Definition: alpha is the main parameter."],
+            "verified_steps": ["Definition 1 is used by later theorem statements."],
+            "issues": [],
+            "python_checks": [],
+            "ledger_updates": {
+                "assumptions": ["Assume alpha > 0 where stability is discussed."],
+                "notes": ["Theorem 2 depends on Definition 1."],
+            },
+            "next_boundary_hint": "Next chunk states Theorem 2.",
+            "confidence": "high",
+        }
+        structured_1_path = source / "responses" / "chunk_001.structured.json"
+        _write_json(structured_1_path, structured_1)
+        structured_2_path = source / "responses" / "chunk_002.structured.json"
+        _write_json(
+            structured_2_path,
+            {
+                "assumptions_and_notation": [],
+                "verified_steps": [],
+                "issues": [],
+                "python_checks": [],
+                "ledger_updates": {"assumptions": [], "notes": []},
+                "next_boundary_hint": "",
+                "confidence": "medium",
+            },
+        )
+        _append_jsonl(
+            session_paths(source)["chunk_records"],
+            {"chunk_id": "chunk_001", "structured_response_path": str(structured_1_path)},
+        )
+        baseline_request = source / "requests" / "chunk_002_baseline.request.json"
+        _write_json(
+            baseline_request,
+            {
+                "chunk_id": "chunk_002",
+                "request_size_diagnostics": {
+                    "user_prompt_length": 123,
+                    "chunk_text_length": 44,
+                    "running_audit_context_length": 22,
+                    "pdf_attachment_included": False,
+                },
+            },
+        )
+
+        watched = [
+            session_paths(source)["session"],
+            session_paths(source)["manifest"],
+            session_paths(source)["issues"],
+            session_paths(source)["chunk_records"],
+            structured_1_path,
+            structured_2_path,
+            baseline_request,
+        ]
+        before_files = {path: path.read_text(encoding="utf-8") for path in watched}
+        manifest = run_context_mode_ab_test(source, ["chunk_002"], output, live=False)
+        _assert(manifest["dry_run"] is True, manifest)
+        _assert(manifest["source_mutation_guard"]["source_unmodified_by_script"], manifest)
+        _assert((output / "ab_test_manifest.json").exists(), "A/B manifest missing")
+        _assert((output / "chunk_002" / "fresh_context_prompt.txt").exists(), "fresh prompt missing")
+        _assert((output / "chunk_002" / "fresh_context_request_metadata.json").exists(), "fresh metadata missing")
+        _assert((output / "chunk_002" / "baseline_continuous_structured.json").exists(), "baseline structured missing")
+        _assert(not (output / "chunk_002" / "fresh_context_raw_response.json").exists(), "dry-run called API")
+        _assert(not session_paths(source)["audit_context_db"].exists(), "source context DB was mutated")
+        for path, text in before_files.items():
+            _assert(path.read_text(encoding="utf-8") == text, f"source file changed: {path}")
+        try:
+            run_context_mode_ab_test(source, ["chunk_002"], source / "nested_output", live=False)
+        except RuntimeError as exc:
+            _assert("inside the source audit workdir" in str(exc), str(exc))
+        else:
+            raise RegressionFailure("A/B script allowed output inside source audit workdir")
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -1272,6 +1400,7 @@ def main() -> int:
         ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),
         ("file download timeout auto-retry decisions", test_file_download_timeout_auto_retry_decisions),
         ("context mode comparison script", test_prepare_context_mode_comparison_script),
+        ("context mode A/B dry-run script", test_run_context_mode_ab_test_dry_run),
     ]
     results = [_run_case(name, func) for name, func in cases]
 
