@@ -27,6 +27,7 @@ from audit_verification import (
 )
 from audit_runtime import (
     AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL,
+    FRESH_CONTEXT_GENERIC_QUERY_TERMS,
     PDF_TEXT_ONLY_RETRY_NOTE,
     _coerce_audit_payload,
     _ensure_timing_state,
@@ -56,6 +57,11 @@ _VISIBLE_NUMBERED_OBJECT_RE = re.compile(
 )
 _EQUATION_NUMBER_ONLY_RE = re.compile(r"^\((\d+(?:\.\d+)*)\)$")
 _EQUATION_NUMBER_LINE_END_RE = re.compile(r"\((\d+(?:\.\d+)*)\)\s*$")
+CONTINUOUS_RUNNING_CONTEXT_MAX_CHARS = 3200
+CONTINUOUS_RUNNING_CONTEXT_PROFILE = "continuous_compact"
+FRESH_CONTEXT_RETRIEVAL_PROFILE = "fresh_context_retrieval"
+_CONTINUOUS_CONTEXT_RECENT_ISSUE_WINDOW = 4
+_CONTINUOUS_CONTEXT_ISSUE_MIN_SCORE = 2
 
 _TYPO_POSITIVE_TAGS = {
     "typo",
@@ -697,6 +703,25 @@ def _load_record_audit_for_running_context(rec: dict[str, Any]) -> dict[str, Any
         return {}
 
 
+def _running_context_query_terms(chunk: dict[str, Any]) -> set[str]:
+    text = " ".join(str(chunk.get(key) or "") for key in ("chunk_text", "label", "boundary"))
+    terms = {item.lower() for item in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text)}
+    terms.update(item.lower() for item in re.findall(r"\\[A-Za-z]+", text))
+    return {
+        term
+        for term in terms
+        if term.lstrip("\\").lower() not in FRESH_CONTEXT_GENERIC_QUERY_TERMS
+    }
+
+
+def _running_context_issue_score(issue: dict[str, Any], query_terms: set[str]) -> int:
+    haystack = " ".join(
+        str(issue.get(key) or "")
+        for key in ("issue_id", "severity", "title", "location", "description", "evidence", "proposed_fix", "chunk_id")
+    ).lower()
+    return sum(1 for term in query_terms if term and term in haystack)
+
+
 _LATEX_COMMAND_NAME_RE = re.compile(r"(?<!\\)\\([A-Za-z@]+)\b")
 _TEX_MACRO_GLOSSARY_UNSAFE_TOKENS = (
     r"\write18",
@@ -847,9 +872,22 @@ def _build_tex_macro_glossary_for_chunk(
 def _build_running_audit_context_for_chunk(
     session: dict[str, Any],
     chunk: dict[str, Any],
-    max_chars: int = 7000,
+    max_chars: int = CONTINUOUS_RUNNING_CONTEXT_MAX_CHARS,
+    profile: str = CONTINUOUS_RUNNING_CONTEXT_PROFILE,
 ) -> str:
     """Build a compact saved-state context block for the next chunk prompt."""
+
+    compact = profile == CONTINUOUS_RUNNING_CONTEXT_PROFILE
+    assumption_limit = 5 if compact else 8
+    assumption_item_limit = 180 if compact else 260
+    note_limit = 3 if compact else 6
+    note_item_limit = 180 if compact else 260
+    recent_record_limit = 3 if compact else 4
+    recent_assumption_limit = 1 if compact else 2
+    recent_assumption_item_limit = 140 if compact else 170
+    recent_verified_item_limit = 150 if compact else 180
+    next_hint_limit = 140 if compact else 180
+    priority_issue_limit = 3 if compact else 6
 
     lines = [
         "Running audit context from earlier chunks:",
@@ -869,8 +907,12 @@ def _build_running_audit_context_for_chunk(
     except Exception:
         ledger = {}
 
-    assumptions = _running_context_items((ledger or {}).get("assumptions"), limit=8, item_limit=260)
-    notes = _running_context_items((ledger or {}).get("notes"), limit=6, item_limit=260)
+    assumptions = _running_context_items(
+        (ledger or {}).get("assumptions"),
+        limit=assumption_limit,
+        item_limit=assumption_item_limit,
+    )
+    notes = _running_context_items((ledger or {}).get("notes"), limit=note_limit, item_limit=note_item_limit)
     if assumptions:
         has_context = True
         lines.extend(["", "Standing assumptions / regimes / notation from the saved ledger:"])
@@ -892,7 +934,7 @@ def _build_running_audit_context_for_chunk(
             continue
         prior_records.append(rec)
     prior_records.sort(key=lambda rec: (_chunk_index_value(rec.get("chunk_index")) or 0, str(rec.get("chunk_id") or "")))
-    recent_records = prior_records[-4:]
+    recent_records = prior_records[-recent_record_limit:]
     if recent_records:
         has_context = True
         lines.extend(["", "Recent chunk context:"])
@@ -908,15 +950,19 @@ def _build_running_audit_context_for_chunk(
                 if part.strip()
             )
             lines.append(f"- {heading}")
-            recent_assumptions = _running_context_items(audit.get("assumptions_and_notation"), limit=2, item_limit=170)
+            recent_assumptions = _running_context_items(
+                audit.get("assumptions_and_notation"),
+                limit=recent_assumption_limit,
+                item_limit=recent_assumption_item_limit,
+            )
             if recent_assumptions:
                 lines.append("  assumptions/notation: " + "; ".join(recent_assumptions))
-            recent_verified = _running_context_items(audit.get("verified_steps"), limit=1, item_limit=180)
+            recent_verified = _running_context_items(audit.get("verified_steps"), limit=1, item_limit=recent_verified_item_limit)
             if recent_verified:
                 lines.append("  verified/contextual step: " + recent_verified[0])
             hint = normalize_whitespace(str(audit.get("next_boundary_hint") or ""))
             if hint:
-                lines.append("  next-boundary hint: " + _truncate_text(hint, limit=180))
+                lines.append("  next-boundary hint: " + _truncate_text(hint, limit=next_hint_limit))
 
     try:
         issues_state = load_issues(session)
@@ -927,6 +973,7 @@ def _build_running_audit_context_for_chunk(
         for rec in records
         if str(rec.get("chunk_id") or "")
     }
+    query_terms = _running_context_query_terms(chunk) if compact else set()
     priority_issues = []
     for issue in (issues_state.get("issues") or []):
         if not isinstance(issue, dict):
@@ -939,6 +986,14 @@ def _build_running_audit_context_for_chunk(
         issue_index = issue_chunk_indices.get(issue_chunk_id)
         if current_index is not None and issue_index is not None and issue_index >= current_index:
             continue
+        if compact:
+            is_recent = (
+                current_index is not None
+                and issue_index is not None
+                and 0 < current_index - issue_index <= _CONTINUOUS_CONTEXT_RECENT_ISSUE_WINDOW
+            )
+            if not is_recent and _running_context_issue_score(issue, query_terms) < _CONTINUOUS_CONTEXT_ISSUE_MIN_SCORE:
+                continue
         priority_issues.append(issue)
     if priority_issues:
         has_context = True
@@ -950,8 +1005,8 @@ def _build_running_audit_context_for_chunk(
                 str(issue.get("issue_id") or ""),
             )
         )
-        lines.extend(["", "Open critical/high issues that may affect later chunks:"])
-        for issue in priority_issues[:6]:
+        lines.extend(["", "Open critical/high issues relevant to this chunk:"])
+        for issue in priority_issues[:priority_issue_limit]:
             lines.extend(
                 [
                     f"- {issue.get('issue_id', 'issue')} | {issue.get('severity', 'high')} | {issue.get('title', '')}",
@@ -1021,10 +1076,21 @@ def build_user_message_for_chunk(session: dict[str, Any], chunk: dict[str, Any])
         running_context = str(fresh_context.get("block") or "")
         chunk["_retrieved_context_entry_count"] = int(fresh_context.get("entry_count") or 0)
         chunk["_retrieved_context_chars"] = int(fresh_context.get("chars") or len(running_context))
+        chunk["_retrieved_context_cap_chars"] = int(fresh_context.get("max_chars") or 0)
+        chunk["_running_context_mode"] = FRESH_CONTEXT_RETRIEVAL_PROFILE
+        chunk["_running_context_cap_chars"] = int(fresh_context.get("max_chars") or 0)
     else:
-        running_context = _build_running_audit_context_for_chunk(session, chunk)
+        running_context = _build_running_audit_context_for_chunk(
+            session,
+            chunk,
+            max_chars=CONTINUOUS_RUNNING_CONTEXT_MAX_CHARS,
+            profile=CONTINUOUS_RUNNING_CONTEXT_PROFILE,
+        )
         chunk["_retrieved_context_entry_count"] = 0
         chunk["_retrieved_context_chars"] = 0
+        chunk["_retrieved_context_cap_chars"] = 0
+        chunk["_running_context_mode"] = CONTINUOUS_RUNNING_CONTEXT_PROFILE
+        chunk["_running_context_cap_chars"] = CONTINUOUS_RUNNING_CONTEXT_MAX_CHARS
     macro_glossary = _build_tex_macro_glossary_for_chunk(session, chunk, context_text=running_context)
     fresh_context_verification_reminder = ""
     if is_fresh_context_mode and _fresh_context_chunk_should_remind_python_checks(chunk):

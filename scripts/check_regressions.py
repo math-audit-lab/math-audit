@@ -18,6 +18,9 @@ if str(PROJECT_ROOT) not in sys.path:
 import audit_runtime as runtime
 from audit_chunking import ensure_chunk_display_labels, pdf_chunk_display_label
 from audit_policy_hooks import (
+    CONTINUOUS_RUNNING_CONTEXT_MAX_CHARS,
+    CONTINUOUS_RUNNING_CONTEXT_PROFILE,
+    FRESH_CONTEXT_RETRIEVAL_PROFILE,
     _audit_summary_markdown,
     _audit_summary_tex,
     _build_running_audit_context_for_chunk,
@@ -581,6 +584,13 @@ def test_running_audit_context_block() -> None:
         chunk_text_index = prompt_text.find("Chunk text:")
         _assert(context_index >= 0, "running context block was not inserted")
         _assert(chunk_text_index > context_index, "running context block does not appear before chunk text")
+        context_text = prompt_text[context_index:chunk_text_index].strip()
+        _assert(
+            len(context_text) <= CONTINUOUS_RUNNING_CONTEXT_MAX_CHARS + 4,
+            f"continuous running context exceeded cap: {len(context_text)}",
+        )
+        _assert(chunk.get("_running_context_mode") == CONTINUOUS_RUNNING_CONTEXT_PROFILE, chunk)
+        _assert(chunk.get("_running_context_cap_chars") == CONTINUOUS_RUNNING_CONTEXT_MAX_CHARS, chunk)
         _assert("Throughout the previous argument" in prompt_text, "ledger assumption missing from context")
         _assert("Notation: $G(z)$" in prompt_text, "recent chunk notation missing from context")
         _assert("ISSUE-001" in prompt_text and "Uniformity gap" in prompt_text, "priority issue missing from context")
@@ -822,6 +832,8 @@ def test_fresh_context_mode_scaffolding() -> None:
         _assert("include python_checks when a local symbolic or numerical sanity check can materially test" in prompt_text, prompt_text)
         _assert(prompt_text.index("Retrieved fresh-context audit database context:") < prompt_text.index("Chunk text:"), prompt_text)
         _assert(fresh_chunk.get("_retrieved_context_entry_count", 0) > 0, fresh_chunk)
+        _assert(fresh_chunk.get("_running_context_mode") == FRESH_CONTEXT_RETRIEVAL_PROFILE, fresh_chunk)
+        _assert(int(fresh_chunk.get("_retrieved_context_cap_chars") or 0) >= 10000, fresh_chunk)
 
         fresh_chunk["_fresh_context_conversation"] = True
         fresh_chunk["_fresh_context_conversation_id"] = "conv-fresh"
@@ -836,6 +848,8 @@ def test_fresh_context_mode_scaffolding() -> None:
         _assert(diagnostics["fresh_context_conversation"], diagnostics)
         _assert(diagnostics["pdf_attachment_suppressed"], diagnostics)
         _assert(diagnostics["retrieved_context_entry_count"] > 0, diagnostics)
+        _assert(diagnostics["running_context_mode"] == FRESH_CONTEXT_RETRIEVAL_PROFILE, diagnostics)
+        _assert(diagnostics["retrieved_context_cap_chars"] >= 10000, diagnostics)
         request_path = _save_request_metadata(
             fresh_session,
             fresh_chunk,

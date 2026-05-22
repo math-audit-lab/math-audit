@@ -5652,11 +5652,14 @@ def _audit_request_size_diagnostics(
             "Running audit context from earlier chunks:",
             ["Paper macro glossary for this chunk:", "Chunk text:"],
         ),
+        "running_context_mode": chunk.get("_running_context_mode"),
+        "running_context_cap_chars": chunk.get("_running_context_cap_chars"),
         "retrieved_fresh_context_length": _prompt_section_length(
             user_prompt_text,
             "Retrieved fresh-context audit database context:",
             ["Paper macro glossary for this chunk:", "Chunk text:"],
         ),
+        "retrieved_context_cap_chars": int(chunk.get("_retrieved_context_cap_chars") or 0),
         "tex_macro_glossary_length": _prompt_section_length(
             user_prompt_text,
             "Paper macro glossary for this chunk:",
