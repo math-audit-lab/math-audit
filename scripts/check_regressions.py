@@ -56,6 +56,7 @@ from gui_controller import (
     persistent_audit_log_preview,
 )
 from scripts.prepare_context_mode_comparison import prepare_context_mode_comparison
+from scripts.prepare_issue_recheck_candidates import prepare_issue_recheck_candidates
 from scripts.run_context_mode_ab_test import run_context_mode_ab_test
 
 
@@ -1610,6 +1611,132 @@ def test_run_context_mode_ab_test_dry_run() -> None:
             raise RegressionFailure("A/B script allowed output inside source audit workdir")
 
 
+def test_prepare_issue_recheck_candidates_script() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_issue_recheck_regression_") as tmp:
+        root = Path(tmp)
+        source = root / "source_audit"
+        output = root / "issue_recheck_out"
+        _seed_state(source)
+        chunks = [
+            {
+                "chunk_id": "chunk_048",
+                "chunk_index": 48,
+                "label": "Synthetic saddle point chunk",
+                "boundary": "pages 20-20; equation (50)",
+                "page_start": 20,
+                "page_end": 20,
+                "chunk_text": "The formula defines $V(R)$ near equation (50).",
+            },
+            {
+                "chunk_id": "chunk_049",
+                "chunk_index": 49,
+                "label": "Synthetic downstream theorem chunk",
+                "boundary": "pages 21-21; Theorem 4.1",
+                "page_start": 21,
+                "page_end": 21,
+                "chunk_text": "Theorem 4.1 depends on the earlier $V(R)$ curvature calculation.",
+            },
+        ]
+        _write_json(session_paths(source)["manifest"], {"chunks": chunks})
+        _write_json(
+            session_paths(source)["issues"],
+            {
+                "issues": [
+                    {
+                        "issue_id": "I122",
+                        "chunk_id": "chunk_048",
+                        "status": "open",
+                        "severity": "critical",
+                        "title": "Possible sign error in the definition of $V(R)$",
+                        "location": "equation (50)",
+                        "description": "The formula for $V(R)$ may have the wrong sign in the curvature term.",
+                        "evidence": "The later saddle-point estimate appears to require positive $V(R)$.",
+                        "proposed_fix": "Recheck the sign convention around equation (50).",
+                        "tags": ["sign", "variance", "curvature"],
+                    },
+                    {
+                        "issue_id": "I129",
+                        "chunk_id": "chunk_049",
+                        "status": "open",
+                        "severity": "high",
+                        "title": "Earlier potential issue with $V(R)$ remains unresolved",
+                        "location": "Theorem 4.1",
+                        "description": "This theorem depends on the earlier $V(R)$ sign issue from equation (50) and may propagate it downstream.",
+                        "evidence": "The proof assumes the unresolved curvature factor.",
+                        "proposed_fix": "Resolve the upstream $V(R)$ issue before relying on this theorem.",
+                        "tags": ["dependency", "propagation", "curvature"],
+                    },
+                    {
+                        "issue_id": "I130",
+                        "chunk_id": "chunk_049",
+                        "status": "open",
+                        "severity": "low",
+                        "title": "Minor wording issue",
+                        "description": "A sentence is stylistically awkward.",
+                        "tags": ["style"],
+                    },
+                ]
+            },
+        )
+        _write_json(
+            session_paths(source)["ledger"],
+            {
+                "assumptions": ["Equation (50) introduces the saddle-point variance factor $V(R)$."],
+                "notes": ["Theorem 4.1 later uses the same $V(R)$ curvature quantity."],
+                "updated_at": NEW,
+            },
+        )
+        structured_path = source / "responses" / "chunk_049.structured.json"
+        _write_json(
+            structured_path,
+            {
+                "assumptions_and_notation": ["Theorem 4.1 uses $V(R)$ from equation (50)."],
+                "verified_steps": [],
+                "ledger_updates": {"assumptions": [], "notes": ["The downstream theorem depends on $V(R)$."]},
+                "next_boundary_hint": "",
+            },
+        )
+        _append_jsonl(
+            session_paths(source)["chunk_records"],
+            {"chunk_id": "chunk_049", "structured_response_path": str(structured_path)},
+        )
+        watched = [
+            session_paths(source)["manifest"],
+            session_paths(source)["issues"],
+            session_paths(source)["ledger"],
+            session_paths(source)["chunk_records"],
+            structured_path,
+        ]
+        before_files = {path: path.read_text(encoding="utf-8") for path in watched}
+
+        manifest = prepare_issue_recheck_candidates(source, output)
+        _assert(manifest["source_unmodified_by_script"], manifest)
+        _assert((output / "issue_recheck_candidates.json").exists(), "JSON output missing")
+        _assert((output / "issue_recheck_candidates.md").exists(), "Markdown output missing")
+        candidate_ids = {candidate["issue_id"] for candidate in manifest["candidates"]}
+        _assert({"I122", "I129"} <= candidate_ids, candidate_ids)
+        _assert("I130" not in candidate_ids, candidate_ids)
+        grouped = [
+            group
+            for group in manifest["groups"]
+            if {"I122", "I129"} <= {member["issue_id"] for member in group.get("members", [])}
+        ]
+        _assert(grouped, manifest["groups"])
+        group = grouped[0]
+        _assert(group["upstream_issue_id"] == "I122", group)
+        roles = {member["issue_id"]: member["role"] for member in group["members"]}
+        _assert(roles.get("I122") == "candidate_upstream", roles)
+        _assert(roles.get("I129") == "possible_downstream", roles)
+        for path, text in before_files.items():
+            _assert(path.read_text(encoding="utf-8") == text, f"source file changed: {path}")
+        try:
+            prepare_issue_recheck_candidates(source, source / "nested_output")
+        except RuntimeError as exc:
+            _assert("inside the source audit workdir" in str(exc), str(exc))
+        else:
+            raise RegressionFailure("Issue recheck script allowed output inside source audit workdir")
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -1643,6 +1770,7 @@ def main() -> int:
         ("file download timeout auto-retry decisions", test_file_download_timeout_auto_retry_decisions),
         ("context mode comparison script", test_prepare_context_mode_comparison_script),
         ("context mode A/B dry-run script", test_run_context_mode_ab_test_dry_run),
+        ("issue recheck candidate script", test_prepare_issue_recheck_candidates_script),
     ]
     results = [_run_case(name, func) for name, func in cases]
 
