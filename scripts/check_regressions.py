@@ -25,6 +25,9 @@ from audit_policy_hooks import (
     _audit_summary_tex,
     _build_running_audit_context_for_chunk,
     _report_latex_paragraph_local,
+    build_concise_report_json,
+    build_concise_report_markdown,
+    build_concise_report_tex,
     build_user_message_for_chunk,
 )
 from audit_runtime import (
@@ -1178,6 +1181,136 @@ def test_issue_severity_summary_in_audit_summary() -> None:
         _assert(r"\item Total open issues: 4" in concise_tex, concise_tex)
 
 
+def test_concise_report_notable_proof_reference_issues() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_concise_notable_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        paths = session_paths(workdir)
+        _write_json(
+            paths["manifest"],
+            {
+                "chunking_mode": "tex-full-coverage",
+                "chunks": [
+                    {"chunk_id": "chunk_001", "chunk_index": 1, "page_start": 1, "page_end": 2},
+                    {"chunk_id": "chunk_002", "chunk_index": 2, "page_start": 3, "page_end": 4},
+                    {"chunk_id": "chunk_003", "chunk_index": 3, "page_start": 5, "page_end": 6},
+                    {"chunk_id": "chunk_004", "chunk_index": 4, "page_start": 7, "page_end": 7},
+                    {"chunk_id": "chunk_005", "chunk_index": 5, "page_start": 8, "page_end": 9},
+                ],
+            },
+        )
+        for chunk_id, index, start, end in [
+            ("chunk_001", 1, 1, 2),
+            ("chunk_002", 2, 3, 4),
+            ("chunk_003", 3, 5, 6),
+            ("chunk_004", 4, 7, 7),
+            ("chunk_005", 5, 8, 9),
+        ]:
+            _append_jsonl(
+                paths["chunk_records"],
+                {"chunk_id": chunk_id, "chunk_index": index, "page_start": start, "page_end": end},
+            )
+        _write_json(
+            paths["issues"],
+            {
+                "next_issue_id": 6,
+                "issues": [
+                    {
+                        "issue_id": "I001",
+                        "chunk_id": "chunk_001",
+                        "severity": "high",
+                        "status": "open",
+                        "title": "Main theorem bound fails",
+                        "location": "Theorem 1",
+                        "description": "A high-priority correctness issue.",
+                        "evidence": "The displayed estimate is too small.",
+                        "proposed_fix": "Repair the estimate.",
+                        "tags": ["proof-gap"],
+                    },
+                    {
+                        "issue_id": "I002",
+                        "chunk_id": "chunk_002",
+                        "severity": "medium",
+                        "status": "open",
+                        "title": "Proof cites the identity being proved",
+                        "location": "Proposition proof, opening sentence",
+                        "description": "The proof cites equation (34), the identity being proved, instead of the prior finite-difference representation.",
+                        "evidence": "The cited equation is the displayed proposition identity.",
+                        "proposed_fix": "Replace the citation with the earlier finite-difference formula and Leibniz rule.",
+                        "tags": ["reference-error", "proof-structure"],
+                    },
+                    {
+                        "issue_id": "I003",
+                        "chunk_id": "chunk_003",
+                        "severity": "medium",
+                        "status": "open",
+                        "title": "An ordinary medium issue",
+                        "location": "Middle paragraph",
+                        "description": "This is mathematically relevant but concerns only a local estimate.",
+                        "evidence": "A local estimate could be clearer.",
+                        "proposed_fix": "Clarify the estimate.",
+                        "tags": ["asymptotics"],
+                    },
+                    {
+                        "issue_id": "I004",
+                        "chunk_id": "chunk_004",
+                        "severity": "low",
+                        "status": "open",
+                        "title": "Typographical spelling issue",
+                        "location": "Caption",
+                        "description": "A typographical spelling issue.",
+                        "proposed_fix": "Fix the spelling.",
+                        "tags": ["typo"],
+                    },
+                    {
+                        "issue_id": "I005",
+                        "chunk_id": "chunk_005",
+                        "severity": "medium",
+                        "status": "open",
+                        "title": "Later theorem depends on unresolved equation reference",
+                        "location": "Theorem 2 proof",
+                        "description": "The proof depends on a wrong equation reference in an earlier lemma.",
+                        "evidence": "The later proof invokes the reference without an independent derivation.",
+                        "proposed_fix": "Correct the equation reference or restate the dependency.",
+                        "tags": ["dependency", "wrong-reference"],
+                    },
+                ],
+            },
+        )
+
+        markdown = build_concise_report_markdown(session)
+        _assert("## High-priority mathematical/correctness issues" in markdown, markdown)
+        _assert("### I001 — Main theorem bound fails [high]" in markdown, markdown)
+        _assert("## Notable proof-reference and dependency issues" in markdown, markdown)
+        _assert("### I002 — Proof cites the identity being proved [medium]" in markdown, markdown)
+        _assert("### I005 — Later theorem depends on unresolved equation reference [medium]" in markdown, markdown)
+        _assert("I003 — An ordinary medium issue" not in markdown, markdown)
+        _assert("## Typographical errors" in markdown, markdown)
+        _assert("### I004 — Typographical spelling issue [low]" in markdown, markdown)
+        notable_section = markdown.split("## Notable proof-reference and dependency issues", 1)[1].split("## Typographical errors", 1)[0]
+        _assert("I001 — Main theorem bound fails" not in notable_section, notable_section)
+        _assert("I004 — Typographical spelling issue" not in notable_section, notable_section)
+
+        tex = build_concise_report_tex(session)
+        _assert(r"\section*{Notable proof-reference and dependency issues}" in tex, tex)
+        _assert("I002 -- Proof cites the identity being proved [medium]" in tex, tex)
+        _assert("I005 -- Later theorem depends on unresolved equation reference [medium]" in tex, tex)
+
+        report_json = build_concise_report_json(session)
+        notable_ids = [
+            item.get("issue_id")
+            for item in report_json.get("notable_proof_reference_and_dependency_issues", [])
+        ]
+        _assert(set(notable_ids) == {"I002", "I005"}, notable_ids)
+        _assert(len(notable_ids) == 2, notable_ids)
+        _assert([item.get("issue_id") for item in report_json.get("main_issues", [])] == ["I001"], report_json["main_issues"])
+        _assert("notable_proof_reference_and_dependency_issues" in report_json["selection_rules"], report_json["selection_rules"])
+
+        balanced_markdown = build_concise_report_markdown(session, options={"preset": "balanced_concise"})
+        _assert("## Notable proof-reference and dependency issues" not in balanced_markdown, balanced_markdown)
+        _assert("### I002 — Proof cites the identity being proved [medium]" in balanced_markdown, balanced_markdown)
+
+
 def test_fresh_rerun_request_metadata() -> None:
     with tempfile.TemporaryDirectory(prefix="math_audit_fresh_rerun_") as tmp:
         workdir = Path(tmp) / "paper_audit"
@@ -1764,6 +1897,7 @@ def main() -> int:
         ("resume preserves saved audit context mode", test_resume_preserves_saved_audit_context_mode),
         ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
         ("issue severity summary in audit summary", test_issue_severity_summary_in_audit_summary),
+        ("concise report notable proof-reference issues", test_concise_report_notable_proof_reference_issues),
         ("fresh rerun request metadata", test_fresh_rerun_request_metadata),
         ("usage cache diagnostics", test_usage_cache_diagnostics),
         ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),

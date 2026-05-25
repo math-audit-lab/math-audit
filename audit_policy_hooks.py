@@ -115,6 +115,66 @@ _TYPO_KEYWORDS = (
 )
 _TYPO_LITERAL_FRAGMENT_RE = re.compile(r"`([^`\n]{2,120})`")
 
+_NOTABLE_PROOF_REFERENCE_SECTION_TITLE = "Notable proof-reference and dependency issues"
+_NOTABLE_PROOF_REFERENCE_MAX_ISSUES = 10
+_NOTABLE_PROOF_REFERENCE_TAGS = {
+    "circular",
+    "circular-citation",
+    "citation",
+    "dependency",
+    "downstream",
+    "equation-reference",
+    "finite-difference-identity",
+    "identity-being-proved",
+    "inherited-gap",
+    "lemma-reference",
+    "mislabeling",
+    "mislabeled",
+    "proof-gap",
+    "proof-reference",
+    "proof-structure",
+    "reference",
+    "reference-error",
+    "self-citation",
+    "theorem-reference",
+    "wrong-reference",
+}
+_NOTABLE_PROOF_REFERENCE_STRONG_KEYWORDS = (
+    "cites the identity being proved",
+    "citing the identity being proved",
+    "identity being proved",
+    "equation being proved",
+    "circular citation",
+    "circular reference",
+    "self-citation",
+    "wrong reference",
+    "wrong equation",
+    "wrong theorem",
+    "wrong lemma",
+    "proof-reference",
+    "proof reference",
+    "proof-structure",
+    "proof structure",
+)
+_NOTABLE_PROOF_REFERENCE_KEYWORDS = (
+    "citation",
+    "cite",
+    "cites",
+    "citing",
+    "dependency",
+    "depends on",
+    "downstream",
+    "equation reference",
+    "inherited gap",
+    "lemma reference",
+    "mislabeling",
+    "mislabeled",
+    "propagates",
+    "reference",
+    "theorem reference",
+    "unresolved dependency",
+)
+
 SAFE_REPORT_PACKAGES = {
     "tikz",
     "xspace",
@@ -1272,6 +1332,45 @@ def _is_concise_selected_issue(issue: dict[str, Any], options: dict[str, Any]) -
     return severity in _concise_included_severities(options)
 
 
+def _notable_proof_reference_text(issue: dict[str, Any]) -> str:
+    parts = [
+        issue.get("title", ""),
+        issue.get("location", ""),
+        issue.get("description", ""),
+        issue.get("evidence", ""),
+        issue.get("proposed_fix", ""),
+    ]
+    return normalize_whitespace(" ".join(str(part) for part in parts if part)).lower()
+
+
+def _notable_proof_reference_score(issue: dict[str, Any]) -> int:
+    if _is_pure_typographical_issue(issue):
+        return 0
+    severity = normalize_whitespace(str(issue.get("severity", "") or "")).lower()
+    if severity != "medium":
+        return 0
+    tags = _issue_tags(issue)
+    text = _notable_proof_reference_text(issue)
+    score = 0
+    tag_hits = tags & _NOTABLE_PROOF_REFERENCE_TAGS
+    score += 4 * len(tag_hits)
+    score += 5 * sum(1 for keyword in _NOTABLE_PROOF_REFERENCE_STRONG_KEYWORDS if keyword in text)
+    score += 2 * sum(1 for keyword in _NOTABLE_PROOF_REFERENCE_KEYWORDS if keyword in text)
+    if "proof" in text and "reference" in text:
+        score += 3
+    if "proof" in text and "dependency" in text:
+        score += 3
+    if ("equation" in text or "theorem" in text or "lemma" in text) and "reference" in text:
+        score += 2
+    if issue.get("proposed_fix"):
+        score += 1
+    return score
+
+
+def _is_notable_proof_reference_issue(issue: dict[str, Any]) -> bool:
+    return _notable_proof_reference_score(issue) >= 4
+
+
 def _chunk_record_map(chunk_records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     out = {}
     for rec in chunk_records or []:
@@ -1370,6 +1469,40 @@ def _collect_typographical_issue_entries(
         key=lambda item: (item["page_start_sort"], item["page_end_sort"], str(item["issue"].get("issue_id") or ""))
     )
     return entries
+
+
+def _issue_report_entry(
+    issue: dict[str, Any],
+    chunk_map: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    chunk_id = str(issue.get("chunk_id") or "").strip()
+    rec = chunk_map.get(chunk_id)
+    return {
+        "issue": issue,
+        "chunk_record": rec,
+        "location_text_md": _approx_page_location_text(rec, chunk_id, markdown=True),
+        "location_text_tex": _approx_page_location_text(rec, chunk_id, markdown=False),
+        "location_detail": normalize_whitespace(str(issue.get("location", "") or "")),
+    }
+
+
+def _collect_notable_proof_reference_issue_entries(
+    issues: list[dict[str, Any]],
+    chunk_records: list[dict[str, Any]],
+    excluded_issue_ids: Optional[set[str]] = None,
+) -> list[dict[str, Any]]:
+    excluded_issue_ids = excluded_issue_ids or set()
+    chunk_map = _chunk_record_map(chunk_records)
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for issue in issues or []:
+        issue_id = str(issue.get("issue_id") or "")
+        if issue_id in excluded_issue_ids:
+            continue
+        if not _is_notable_proof_reference_issue(issue):
+            continue
+        scored.append((_notable_proof_reference_score(issue), issue))
+    scored.sort(key=lambda item: (-item[0], _concise_issue_sort_key(item[1], chunk_map)))
+    return [_issue_report_entry(issue, chunk_map) for _score, issue in scored[:_NOTABLE_PROOF_REFERENCE_MAX_ISSUES]]
 
 
 def _typographical_errors_markdown(entries: list[dict[str, Any]]) -> str:
@@ -2800,19 +2933,14 @@ def _collect_concise_report_data(
         if _is_concise_selected_issue(issue, normalized_options) and not _is_pure_typographical_issue(issue)
     ]
     selected_issues.sort(key=lambda issue: _concise_issue_sort_key(issue, chunk_map))
-    selected_issue_entries = []
-    for issue in selected_issues:
-        chunk_id = str(issue.get("chunk_id") or "").strip()
-        rec = chunk_map.get(chunk_id)
-        selected_issue_entries.append(
-            {
-                "issue": issue,
-                "chunk_record": rec,
-                "location_text_md": _approx_page_location_text(rec, chunk_id, markdown=True),
-                "location_text_tex": _approx_page_location_text(rec, chunk_id, markdown=False),
-                "location_detail": normalize_whitespace(str(issue.get("location", "") or "")),
-            }
-        )
+    selected_issue_entries = [_issue_report_entry(issue, chunk_map) for issue in selected_issues]
+    selected_issue_ids = {str(issue.get("issue_id") or "") for issue in selected_issues}
+    notable_entries = _collect_notable_proof_reference_issue_entries(
+        candidate_issues,
+        chunk_records,
+        excluded_issue_ids=selected_issue_ids,
+    )
+    notable_issues = [entry["issue"] for entry in notable_entries]
     typographical_entries = (
         _collect_typographical_issue_entries(candidate_issues, chunk_records)
         if normalized_options.get("include_typographical_issues", True)
@@ -2832,6 +2960,8 @@ def _collect_concise_report_data(
         "main_issue_entries": selected_issue_entries,
         "high_issues": selected_issues,
         "high_issue_entries": selected_issue_entries,
+        "notable_proof_reference_issues": notable_issues,
+        "notable_proof_reference_entries": notable_entries,
         "typographical_entries": typographical_entries,
     }
 
@@ -2854,7 +2984,7 @@ def _is_strict_concise_options(options: dict[str, Any]) -> bool:
 
 def _concise_mode_description(options: dict[str, Any]) -> str:
     if _is_strict_concise_options(options):
-        return "high-priority mathematical/correctness issues plus all typographical/copyediting issues"
+        return "high-priority mathematical/correctness issues, notable proof-reference/dependency medium issues, plus all typographical/copyediting issues"
     issue_text = f"mathematical/correctness issues with severity: {_concise_option_enabled_severity_text(options)}"
     if options.get("only_open_issues", True):
         issue_text = "open " + issue_text
@@ -2953,11 +3083,61 @@ def _high_priority_issues_tex(entries: list[dict[str, Any]], options: Optional[d
     return "\n".join(parts) + "\n"
 
 
+def _notable_proof_reference_issues_markdown(entries: list[dict[str, Any]]) -> str:
+    if not entries:
+        return ""
+    lines = [f"## {_NOTABLE_PROOF_REFERENCE_SECTION_TITLE}", ""]
+    for entry in entries:
+        issue = entry["issue"]
+        lines.extend(
+            [
+                f"### {issue.get('issue_id', 'issue')} — {normalize_math_delimiters(issue.get('title', 'Untitled issue'))} [{issue.get('severity', 'medium')}]",
+                f"- {entry.get('location_text_md') or ('Chunk: ' + str(issue.get('chunk_id', '')))}",
+                f"- Location detail: {normalize_math_delimiters(entry.get('location_detail') or issue.get('location', ''))}",
+                f"- Description: {normalize_math_delimiters(issue.get('description', ''))}",
+                f"- Evidence: {normalize_math_delimiters(issue.get('evidence', ''))}",
+                f"- Proposed fix: {normalize_math_delimiters(issue.get('proposed_fix', ''))}",
+                f"- Tags: {', '.join(issue.get('tags', [])) if issue.get('tags') else 'none'}",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _notable_proof_reference_issues_tex(entries: list[dict[str, Any]]) -> str:
+    if not entries:
+        return ""
+    parts = [r"\section*{" + _report_latex_paragraph_local(_NOTABLE_PROOF_REFERENCE_SECTION_TITLE) + "}"]
+    for entry in entries:
+        issue = entry["issue"]
+        title = _report_latex_paragraph_local(
+            f"{issue.get('issue_id', 'issue')} -- {issue.get('title', 'Untitled issue')} [{issue.get('severity', 'medium')}]"
+        )
+        parts.append(r"\subsection*{" + title + "}")
+        parts.append(r"\begin{itemize}")
+        parts.append(
+            r"\item "
+            + _report_latex_paragraph_local(entry.get("location_text_tex") or ("Chunk: " + str(issue.get("chunk_id", ""))))
+        )
+        parts.append(
+            r"\item Location detail: "
+            + _report_latex_paragraph_local(entry.get("location_detail") or issue.get("location", ""))
+        )
+        parts.append(r"\item Description: " + _report_latex_paragraph_local(issue.get("description", "")))
+        parts.append(r"\item Evidence: " + _report_latex_paragraph_local(issue.get("evidence", "")))
+        parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(issue.get("proposed_fix", "")))
+        tag_text = ", ".join(issue.get("tags", [])) if issue.get("tags") else "none"
+        parts.append(r"\item Tags: " + _report_latex_paragraph_local(tag_text))
+        parts.append(r"\end{itemize}")
+    return "\n".join(parts) + "\n"
+
+
 def _concise_omitted_material_text(options: dict[str, Any]) -> str:
     if _is_strict_concise_options(options):
         return (
             "Routine verified steps, successful-check narrative, per-chunk overview material, "
-            "suggested Python-check details, and non-high mathematical/correctness issues are "
+            "suggested Python-check details, and non-high mathematical/correctness issues not selected "
+            "as notable proof-reference/dependency issues are "
             "intentionally omitted from this concise report."
         )
     omitted_parts = [
@@ -2991,6 +3171,9 @@ def _concise_selection_rules(options: dict[str, Any]) -> dict[str, str]:
         "main_issues": (
             f"{state}issues with normalized severity in {{{severities}}}, excluding pure typographical/copyediting issues"
         ),
+        "notable_proof_reference_and_dependency_issues": (
+            f"up to {_NOTABLE_PROOF_REFERENCE_MAX_ISSUES} {state}medium non-typographical issues selected by proof-reference, circular-citation, dependency, or mathematically consequential reference heuristics; issues already included in main_issues are not duplicated"
+        ),
         "typographical_errors": typo_rule,
         "audit_summary": "included" if options.get("include_audit_summary", True) else "omitted",
         "verification_summary": (
@@ -3022,6 +3205,9 @@ def build_concise_report_markdown(
             "",
         ]
     )
+    notable_markdown = _notable_proof_reference_issues_markdown(data["notable_proof_reference_entries"]).rstrip()
+    if notable_markdown:
+        lines.extend([notable_markdown, ""])
     if normalized_options.get("include_typographical_issues", True):
         lines.extend([_typographical_errors_markdown(data["typographical_entries"]).rstrip(), ""])
     if normalized_options.get("include_omitted_material_note", True):
@@ -3082,6 +3268,9 @@ def build_concise_report_tex(
         parts.append(r"\item " + _report_latex_paragraph_local(f"{label}: {value}") + "\n")
     parts.append(r"\end{itemize}" + "\n")
     parts.append(_high_priority_issues_tex(data["main_issue_entries"], normalized_options) + "\n")
+    notable_tex = _notable_proof_reference_issues_tex(data["notable_proof_reference_entries"])
+    if notable_tex:
+        parts.append(notable_tex + "\n")
     if normalized_options.get("include_typographical_issues", True):
         parts.append(_typographical_errors_tex(data["typographical_entries"]) + "\n")
     if normalized_options.get("include_omitted_material_note", True):
@@ -3138,6 +3327,8 @@ def build_concise_report_json(
         "chunk_records": data["chunk_records"],
         "main_issues": data["main_issues"],
         "high_issues": data["main_issues"],
+        "notable_proof_reference_and_dependency_issues": data["notable_proof_reference_issues"],
+        "notable_proof_reference_and_dependency_entries": data["notable_proof_reference_entries"],
         "typographical_errors": data["typographical_entries"],
         "reference_status": _reference_report_status(session),
     }
