@@ -348,16 +348,29 @@ _PERSISTED_JSON_ESCAPE_ARTIFACT_COMMAND_RE = re.compile(
     r"frac|dfrac|tfrac|binom|dbinom|tbinom|beta|blambda|bar|bmod|bigl|bigr|Bigl|Bigr"
     r")\b)"
 )
+_JSON_CONTROL_TEX_PREFIX_RE = re.compile(
+    r"[\x07\x0b](?=(?:hat|lambda|rho|frac|beta|alpha|gamma|theta|varepsilon|epsilon|sigma|omega|mu|nu|ell)\b)"
+)
+_JSON_CONTROL_ESCAPE_TEX_PREFIX_RE = re.compile(
+    r"\\u00(?:07|0b)(?=(?:hat|lambda|rho|frac|beta|alpha|gamma|theta|varepsilon|epsilon|sigma|omega|mu|nu|ell)\b)",
+    re.IGNORECASE,
+)
+_PERSISTED_HAT_BLAMBDA_ARTIFACT_RE = re.compile(r"(?<![A-Za-z])\\?hat\\blambda\b")
+_PERSISTED_HAT_BARE_LAMBDA_ARTIFACT_RE = re.compile(r"(\\hat\\lambda=)lambda\b")
 
 
 def _repair_json_escape_artifacts(text: str) -> str:
     text = "" if text is None else str(text)
     for bad, replacement in _JSON_ESCAPE_ARTIFACTS.items():
         text = text.replace(bad, replacement)
+    text = _JSON_CONTROL_TEX_PREFIX_RE.sub(lambda _m: "\\", text)
+    text = _JSON_CONTROL_ESCAPE_TEX_PREFIX_RE.sub(lambda _m: "\\", text)
     # Older runs persisted repaired JSON escapes as ``\\frac``/``\\beta``.
     # In math mode that renders as a line break plus plain letters, so restore
     # the intended single TeX command slash for the compact artifact forms.
     text = _PERSISTED_JSON_ESCAPE_ARTIFACT_COMMAND_RE.sub(lambda _m: "\\", text)
+    text = _PERSISTED_HAT_BLAMBDA_ARTIFACT_RE.sub(lambda _m: r"\hat\lambda", text)
+    text = _PERSISTED_HAT_BARE_LAMBDA_ARTIFACT_RE.sub(lambda m: m.group(1) + r"\lambda", text)
     text = _JSON_CONTROL_ESCAPE_ARTIFACT_RE.sub(" ", text)
     return text
 

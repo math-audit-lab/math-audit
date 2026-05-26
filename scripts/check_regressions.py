@@ -1157,6 +1157,24 @@ def test_report_latex_unicode_math_safety() -> None:
         _assert(r"\\frac" not in rendered_persisted, rendered_persisted)
         _assert(r"\\beta" not in rendered_persisted, rendered_persisted)
 
+        persisted_hat_artifact = r"Recovered hat artifact: $hat\\blambda=lambda+a/k$ and $\u0007hat\blambda$."
+        rendered_hat_artifact = renderer(persisted_hat_artifact)
+        _assert(r"\hat\lambda=\lambda+a/k" in rendered_hat_artifact, rendered_hat_artifact)
+        _assert(r"\hat\lambda" in rendered_hat_artifact, rendered_hat_artifact)
+        _assert(r"\blambda" not in rendered_hat_artifact, rendered_hat_artifact)
+        _assert(r"\u0007" not in rendered_hat_artifact, rendered_hat_artifact)
+
+        decoded_hat_artifact = (
+            "Recovered decoded hat: $"
+            + "\x07"
+            + "hat"
+            + "\x08"
+            + "lambda=lambda$."
+        )
+        rendered_decoded_hat = renderer(decoded_hat_artifact)
+        _assert(r"\hat\lambda=\lambda" in rendered_decoded_hat, rendered_decoded_hat)
+        _assert(r"\blambda" not in rendered_decoded_hat, rendered_decoded_hat)
+
         malformed = r"Replace $for any fixed $s\ne1$$ by $for each fixed integer $s\ne1$$."
         rendered_malformed = renderer(malformed)
         _assert("$$" not in rendered_malformed, rendered_malformed)
