@@ -415,14 +415,40 @@ def normalize_report_latex_unicode_math(text: str) -> str:
     return text
 
 
+def sanitize_latex_unsupported_unicode(text: str) -> str:
+    """Replace Unicode that pdflatex/inputenc often cannot render reliably."""
+    text = "" if text is None else str(text)
+    out = []
+    for ch in text:
+        if ord(ch) < 128:
+            out.append(ch)
+        else:
+            out.append(f"[U+{ord(ch):04X}]")
+    return "".join(out)
+
+
+def _contains_latex_unsupported_unicode(text: str) -> bool:
+    return any(ord(ch) >= 128 for ch in str(text or ""))
+
+
+def _report_math_delimiters_look_unsafe(text: str) -> bool:
+    text = "" if text is None else str(text)
+    for match in re.finditer(r"\$\$(.*?)\$\$", text, flags=re.DOTALL):
+        if "$" in match.group(1):
+            return True
+    without_display = re.sub(r"\$\$.*?\$\$", "", text, flags=re.DOTALL)
+    return without_display.count("$") % 2 == 1
+
+
 _DANGEROUS_MATH_COMMAND_RE = re.compile(
-    r"\\(?:usepackage|documentclass|begin|end|input|include|newcommand|renewcommand|providecommand|def|write18|openout|catcode|usetikzlibrary|ref|eqref|autoref|cref|Cref|cite)\b"
+    r"\\(?:usepackage|documentclass|begin|end|input|include|newcommand|renewcommand|providecommand|def|write18|openout|catcode|usetikzlibrary|ref|eqref|autoref|cref|Cref|cite|require)\b"
 )
 
 
 def _report_escape_text(s: str) -> str:
     s = sanitize_ascii_punctuation("" if s is None else str(s))
     s = normalize_report_latex_unicode_math(s)
+    s = sanitize_latex_unsupported_unicode(s)
     repl = {
         "\\": r"\textbackslash{}",
         "&": r"\&",
@@ -441,6 +467,8 @@ def _report_escape_text(s: str) -> str:
 def report_latex_paragraph(text: str) -> str:
     text = normalize_math_delimiters("" if text is None else str(text))
     text = _strip_unsafe_control_chars(_repair_json_escape_artifacts(text))
+    if _report_math_delimiters_look_unsafe(text):
+        return _report_escape_text(text)
     parts = re.split(r"(\$\$.*?\$\$|\$.*?\$)", text, flags=re.DOTALL)
     out = []
     for part in parts:
@@ -451,7 +479,7 @@ def report_latex_paragraph(text: str) -> str:
             body = part[len(delim) : -len(delim)]
             body = sanitize_ascii_punctuation(body)
             body = normalize_report_latex_unicode_math(body)
-            if _DANGEROUS_MATH_COMMAND_RE.search(body):
+            if _DANGEROUS_MATH_COMMAND_RE.search(body) or _contains_latex_unsupported_unicode(body):
                 out.append(r"\texttt{" + _report_escape_text(part) + "}")
             else:
                 out.append(delim + body + delim)
@@ -464,6 +492,9 @@ def _verbatim_block(text: str) -> str:
     text = _strip_unsafe_control_chars(_repair_json_escape_artifacts("" if text is None else str(text))).rstrip()
     if not text:
         return ""
+    text = sanitize_ascii_punctuation(text)
+    text = normalize_report_latex_unicode_math(text)
+    text = sanitize_latex_unsupported_unicode(text)
     text = text.replace(r"\end{Verbatim}", r"\string\end{Verbatim}")
     return "\\begin{Verbatim}[fontsize=\\small]\n" + text + "\n\\end{Verbatim}\n"
 

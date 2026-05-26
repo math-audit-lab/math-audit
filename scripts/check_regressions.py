@@ -1136,6 +1136,27 @@ def test_report_latex_unicode_math_safety() -> None:
         _assert("\\\\Lambda" not in rendered, rendered)
         _assert("\\\\lambda" not in rendered, rendered)
 
+        malformed = r"Replace $for any fixed $s\ne1$$ by $for each fixed integer $s\ne1$$."
+        rendered_malformed = renderer(malformed)
+        _assert("$$" not in rendered_malformed, rendered_malformed)
+        _assert(r"\$for any fixed" in rendered_malformed, rendered_malformed)
+
+        mathjax_only = r"$B_n$ uses $e^{e^z-1}=\nobreak\require{cancel}\notag\text{bad}$."
+        rendered_mathjax = renderer(mathjax_only)
+        _assert(r"\require{cancel}" not in rendered_mathjax, rendered_mathjax)
+        _assert(r"\textbackslash{}require" in rendered_mathjax, rendered_mathjax)
+
+        unsupported_unicode = "Tag: l格range-inversion."
+        rendered_unicode = renderer(unsupported_unicode)
+        _assert("格" not in rendered_unicode, rendered_unicode)
+        _assert("[U+683C]" in rendered_unicode, rendered_unicode)
+
+    verbatim = runtime._verbatim_block('print("max_E≈1")  # l格range')
+    _assert("≈" not in verbatim, verbatim)
+    _assert("格" not in verbatim, verbatim)
+    _assert(r"\approx" in verbatim, verbatim)
+    _assert("[U+683C]" in verbatim, verbatim)
+
 
 def test_issue_severity_summary_in_audit_summary() -> None:
     with tempfile.TemporaryDirectory(prefix="math_audit_issue_summary_") as tmp:

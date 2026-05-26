@@ -37,6 +37,8 @@ from audit_runtime import (
     _normalize_report_reference_style,
     _read_chunk_records,
     _repair_json_escape_artifacts,
+    _contains_latex_unsupported_unicode,
+    _report_math_delimiters_look_unsafe,
     _strip_unsafe_control_chars,
     _verification_inventory_warning,
     build_fresh_audit_context_for_chunk,
@@ -45,6 +47,7 @@ from audit_runtime import (
     normalize_math_delimiters,
     normalize_report_latex_unicode_math,
     report_latex_paragraph,
+    sanitize_latex_unsupported_unicode,
     sanitize_ascii_punctuation,
     _verbatim_block,
 )
@@ -216,7 +219,7 @@ BASE_REPORT_PACKAGES = {
 _DANGEROUS_MATH_COMMAND_RE = re.compile(
     r"\\(?:"
     r"usepackage|documentclass|begin|end|input|include|newcommand|renewcommand|providecommand|def|"
-    r"write18|openout|catcode|usetikzlibrary|ref|eqref|autoref|cref|Cref|cite|label|"
+    r"write18|openout|catcode|usetikzlibrary|ref|eqref|autoref|cref|Cref|cite|label|require|"
     r"tag|notag|nonumber|numberwithin|"
     r"section|subsection|subsubsection|paragraph|subparagraph|appendix|chapter|part|"
     r"maketitle|title|author|date|thanks|email|address|keywords|subjclass|abstract|and|with|eqand|eqwith|"
@@ -238,10 +241,13 @@ def _repair_report_escape_artifacts(text: str) -> str:
 
 def _report_math_text_looks_unsafe(text: str) -> bool:
     text = "" if text is None else str(text)
+    normalized = _normalize_report_latex_unicode_math(text)
     return bool(
         _DANGEROUS_MATH_COMMAND_RE.search(text)
         or _ARGUMENT_TAKING_REPORT_MATH_MACRO_RE.search(text)
         or text.count(r"\left") != text.count(r"\right")
+        or _report_math_delimiters_look_unsafe(text)
+        or _contains_latex_unsupported_unicode(normalized)
     )
 
 
@@ -1685,6 +1691,7 @@ def _report_escape_text(s: str) -> str:
     s = _repair_report_escape_artifacts("" if s is None else str(s))
     s = sanitize_ascii_punctuation(s)
     s = _normalize_report_latex_unicode_math(s)
+    s = sanitize_latex_unsupported_unicode(s)
     repl = {
         "\\": r"\textbackslash{}",
         "&": r"\&",
