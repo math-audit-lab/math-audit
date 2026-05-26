@@ -1121,7 +1121,7 @@ def test_resume_preserves_saved_audit_context_mode() -> None:
 def test_report_latex_unicode_math_safety() -> None:
     text = (
         "The bound is $c_2√nΛ≤1/2$ and $√(n+1)≥λ$. "
-        "Literal control-escape artifact: $\\rho k\\u000b\\lambda$."
+        "Literal control-escape artifacts: $\\rho k\\u000b\\lambda$ and $0le l\\u0007le j$."
     )
     for renderer in (_report_latex_paragraph_local, report_latex_paragraph):
         rendered = renderer(text)
@@ -1133,6 +1133,7 @@ def test_report_latex_unicode_math_safety() -> None:
         _assert(r"\le" in rendered, rendered)
         _assert(r"\ge" in rendered, rendered)
         _assert(r"\u000b" not in rendered, rendered)
+        _assert(r"\u0007" not in rendered, rendered)
         _assert("\\\\Lambda" not in rendered, rendered)
         _assert("\\\\lambda" not in rendered, rendered)
 

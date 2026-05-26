@@ -342,13 +342,14 @@ _JSON_ESCAPE_ARTIFACTS = {
     "\x08": r"\\b",
     "\x0c": r"\\f",
 }
+_JSON_CONTROL_ESCAPE_ARTIFACT_RE = re.compile(r"\\u00(?:0[0-9A-Fa-f]|1[0-9A-Fa-f])", re.IGNORECASE)
 
 
 def _repair_json_escape_artifacts(text: str) -> str:
     text = "" if text is None else str(text)
     for bad, replacement in _JSON_ESCAPE_ARTIFACTS.items():
         text = text.replace(bad, replacement)
-    text = text.replace(r"\u000b", " ").replace(r"\u000B", " ")
+    text = _JSON_CONTROL_ESCAPE_ARTIFACT_RE.sub(" ", text)
     return text
 
 
