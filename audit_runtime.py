@@ -2582,6 +2582,24 @@ def _build_paper_structure_context(session: dict[str, Any]) -> dict[str, Any]:
         "selected_chunk_reruns": summarize_rerun_log(logs_dir / "selected_chunk_reruns.jsonl"),
         "failed_verification_chunk_reruns": summarize_rerun_log(logs_dir / "failed_verification_chunk_reruns.jsonl"),
     }
+    context_db_summary = _select_audit_context_db_entries_for_discussion(
+        session,
+        "ChatGPT handoff structured context for notation dependencies regimes ambiguities verification issues",
+        max_chars=10000,
+        max_entries=60,
+    )
+    context_db_export = {
+        "source": "state/audit_context_db.jsonl",
+        "available": bool(context_db_summary.get("available")),
+        "total_entries": int(context_db_summary.get("total_entries", 0) or 0),
+        "counts_by_kind": context_db_summary.get("counts_by_kind") or {},
+        "selected_entry_count": int(context_db_summary.get("selected_entry_count", 0) or 0),
+        "selected_entries": context_db_summary.get("selected_entries") or [],
+        "selection_note": (
+            "Capped deterministic subset for handoff. Prior issue entries are provisional audit findings "
+            "and should be rechecked against the paper."
+        ),
+    }
 
     return {
         "metadata": {
@@ -2611,6 +2629,7 @@ def _build_paper_structure_context(session: dict[str, Any]) -> dict[str, Any]:
             "assumptions": ledger_assumptions,
             "notes": ledger_notes,
         },
+        "audit_context_db": context_db_export,
         "result_references": result_refs,
         "issue_impact": issue_impact,
         "verification": {
@@ -2769,6 +2788,34 @@ _QA_STOPWORDS = {
 }
 
 
+def _legacy_qa_turn_state(session: dict[str, Any]) -> tuple[bool, str]:
+    qa_root = Path(session.get("workdir", "")) / "qa"
+    if not qa_root.exists():
+        return False, ""
+    latest_key: tuple[str, str] | None = None
+    latest_conversation_id = ""
+    has_turns = False
+    for path in sorted(qa_root.glob("qa_*.json")):
+        try:
+            item = load_json(path)
+        except Exception:
+            continue
+        if not isinstance(item, dict):
+            continue
+        thread_id = str(item.get("thread_id") or LEGACY_QA_THREAD_ID).strip() or LEGACY_QA_THREAD_ID
+        if thread_id != LEGACY_QA_THREAD_ID:
+            continue
+        has_turns = True
+        conversation_id = str(item.get("conversation_id") or "").strip()
+        if not conversation_id:
+            continue
+        key = (str(item.get("time") or ""), str(item.get("turn_id") or path.name))
+        if latest_key is None or key >= latest_key:
+            latest_key = key
+            latest_conversation_id = conversation_id
+    return has_turns, latest_conversation_id
+
+
 def _resolve_qa_session(session_or_pdf_path: dict[str, Any] | str | Path) -> dict[str, Any]:
     return _resolve_session(session_or_pdf_path)
 
@@ -2799,6 +2846,7 @@ def _wait_for_response(response_id: str, poll_every: float = 3.0, max_wait_secon
 
 def _ensure_qa_thread_state(session: dict[str, Any]) -> dict[str, Any]:
     changed = False
+    legacy_has_turns, legacy_turn_conversation_id = _legacy_qa_turn_state(session)
     threads = session.get("qa_threads")
     if not isinstance(threads, dict):
         threads = {}
@@ -2813,16 +2861,28 @@ def _ensure_qa_thread_state(session: dict[str, Any]) -> dict[str, Any]:
     for key, value in {
         "thread_id": LEGACY_QA_THREAD_ID,
         "created_at": session.get("created_at") or utc_now(),
-        "conversation_id": session.get("conversation_id"),
-        "pdf_attached_in_conversation": bool(session.get("pdf_attached_in_conversation", False)),
+        "conversation_id": legacy_turn_conversation_id if legacy_has_turns else None,
+        "pdf_attached_in_conversation": bool(session.get("pdf_attached_in_conversation", False))
+        if legacy_has_turns
+        else False,
     }.items():
         if key not in legacy:
             legacy[key] = value
             changed = True
-    if session.get("conversation_id") and not legacy.get("conversation_id"):
-        legacy["conversation_id"] = session.get("conversation_id")
+    if legacy_has_turns and legacy_turn_conversation_id and not legacy.get("conversation_id"):
+        legacy["conversation_id"] = legacy_turn_conversation_id
         changed = True
-    if session.get("pdf_attached_in_conversation") and not legacy.get("pdf_attached_in_conversation"):
+    if not legacy_has_turns and legacy.get("conversation_id"):
+        legacy["conversation_id"] = None
+        changed = True
+    if not legacy_has_turns and legacy.get("pdf_attached_in_conversation"):
+        legacy["pdf_attached_in_conversation"] = False
+        changed = True
+    if (
+        legacy_has_turns
+        and session.get("pdf_attached_in_conversation")
+        and not legacy.get("pdf_attached_in_conversation")
+    ):
         legacy["pdf_attached_in_conversation"] = True
         changed = True
 
@@ -3732,6 +3792,11 @@ def _build_full_audit_qa_context(session: dict[str, Any], question: str, max_cha
     lines.extend(f"- {item}" for item in relevant_assumptions) if relevant_assumptions else lines.append("- None recorded.")
     lines.extend(["", "Ledger notes relevant to the question:"])
     lines.extend(f"- {item}" for item in relevant_notes) if relevant_notes else lines.append("- None recorded.")
+
+    context_db_summary = _select_audit_context_db_entries_for_discussion(session, question, max_chars=10000)
+    context_db_lines = _audit_context_db_summary_lines_for_qa(context_db_summary)
+    if context_db_lines:
+        lines.extend([""] + context_db_lines)
 
     lines.extend(["", "Open critical/high issues with details:"])
     if high_priority_issues:
@@ -4971,6 +5036,207 @@ def _read_audit_context_db(session: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(item, dict):
             entries.append(item)
     return entries
+
+
+def _audit_context_db_counts_by_kind(entries: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for entry in entries:
+        kind = str(entry.get("kind") or "unknown").strip() or "unknown"
+        counts[kind] = counts.get(kind, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: item[0]))
+
+
+def _audit_context_db_source_index(entry: dict[str, Any]) -> int:
+    try:
+        return int(entry.get("source_chunk_index") or 0)
+    except Exception:
+        return 0
+
+
+def _audit_context_db_relevance_score(question: str, entry: dict[str, Any]) -> int:
+    return _qa_relevance_score(
+        question,
+        entry.get("kind"),
+        entry.get("text"),
+        entry.get("source_chunk_id"),
+        entry.get("label"),
+        entry.get("boundary"),
+        entry.get("issue_id"),
+        entry.get("severity"),
+    )
+
+
+def _clean_audit_context_db_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    kind = str(entry.get("kind") or "context").strip() or "context"
+    cleaned = {
+        "entry_id": str(entry.get("entry_id") or ""),
+        "kind": kind,
+        "text": _compact_context_text(entry.get("text"), limit=700),
+        "source_chunk_id": str(entry.get("source_chunk_id") or ""),
+        "source_chunk_index": entry.get("source_chunk_index"),
+        "page_start": entry.get("page_start"),
+        "page_end": entry.get("page_end"),
+        "label": _compact_context_text(entry.get("label"), limit=160),
+        "boundary": _compact_context_text(entry.get("boundary"), limit=160),
+        "confidence": str(entry.get("confidence") or ""),
+    }
+    for key in ("issue_id", "severity", "status"):
+        if entry.get(key) not in (None, ""):
+            cleaned[key] = str(entry.get(key) or "")
+    if kind == "issue":
+        cleaned["provisional"] = True
+        cleaned["provenance_note"] = (
+            "Prior audit issue entry; recheck against the paper before treating it as established."
+        )
+    return {key: value for key, value in cleaned.items() if value not in (None, "", [])}
+
+
+def _select_audit_context_db_entries_for_discussion(
+    session: dict[str, Any],
+    question: str,
+    max_chars: int = 10000,
+    max_entries: int = 48,
+) -> dict[str, Any]:
+    entries = _read_audit_context_db(session)
+    counts = _audit_context_db_counts_by_kind(entries)
+    if not entries:
+        return {
+            "available": False,
+            "source": "state/audit_context_db.jsonl",
+            "total_entries": 0,
+            "counts_by_kind": {},
+            "selected_entries": [],
+            "selected_entry_count": 0,
+            "selected_chars": 0,
+            "max_chars": int(max_chars),
+        }
+
+    scored = [
+        (_audit_context_db_relevance_score(question, entry), _audit_context_db_source_index(entry), entry)
+        for entry in entries
+    ]
+    by_entry_id: dict[str, dict[str, Any]] = {}
+    selected_raw: list[dict[str, Any]] = []
+
+    def add_entry(entry: dict[str, Any]) -> None:
+        entry_id = str(entry.get("entry_id") or "")
+        key = entry_id or json.dumps(
+            [entry.get("kind"), entry.get("source_chunk_id"), entry.get("text")],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if key in by_entry_id:
+            return
+        by_entry_id[key] = entry
+        selected_raw.append(entry)
+
+    preferred_kinds = (
+        "definition",
+        "notation",
+        "assumption",
+        "regime",
+        "dependency",
+        "ambiguity",
+        "verified_step",
+    )
+    for kind in preferred_kinds:
+        candidates = [
+            item
+            for item in scored
+            if str(item[2].get("kind") or "") == kind
+        ]
+        candidates.sort(key=lambda item: (-item[0], -item[1], str(item[2].get("entry_id") or "")))
+        for _score, _idx, entry in candidates[:3]:
+            add_entry(entry)
+
+    severity_rank = {"critical": 0, "high": 1}
+    priority_issues = [
+        item
+        for item in scored
+        if str(item[2].get("kind") or "") == "issue"
+        and str(item[2].get("status") or "open").lower() != "resolved"
+        and str(item[2].get("severity") or "").lower() in severity_rank
+    ]
+    priority_issues.sort(
+        key=lambda item: (
+            severity_rank.get(str(item[2].get("severity") or "").lower(), 9),
+            -item[0],
+            item[1],
+            str(item[2].get("issue_id") or ""),
+        )
+    )
+    for _score, _idx, entry in priority_issues[:10]:
+        add_entry(entry)
+
+    relevant_remaining = [
+        item
+        for item in scored
+        if item[0] > 0
+    ]
+    relevant_remaining.sort(key=lambda item: (-item[0], -item[1], str(item[2].get("entry_id") or "")))
+    for _score, _idx, entry in relevant_remaining:
+        if len(selected_raw) >= max_entries:
+            break
+        add_entry(entry)
+
+    selected: list[dict[str, Any]] = []
+    used_chars = 0
+    for entry in selected_raw:
+        cleaned = _clean_audit_context_db_entry(entry)
+        text_len = len(cleaned.get("text", "")) + len(cleaned.get("label", "")) + len(cleaned.get("boundary", "")) + 180
+        if selected and used_chars + text_len > int(max_chars):
+            break
+        selected.append(cleaned)
+        used_chars += text_len
+        if len(selected) >= max_entries:
+            break
+
+    return {
+        "available": True,
+        "source": "state/audit_context_db.jsonl",
+        "total_entries": len(entries),
+        "counts_by_kind": counts,
+        "selected_entries": selected,
+        "selected_entry_count": len(selected),
+        "selected_chars": used_chars,
+        "max_chars": int(max_chars),
+    }
+
+
+def _audit_context_db_summary_lines_for_qa(summary: dict[str, Any]) -> list[str]:
+    if not summary.get("available"):
+        return []
+    counts = summary.get("counts_by_kind") or {}
+    lines = [
+        "Audit context database summary (compact):",
+        f"- source: {summary.get('source', 'state/audit_context_db.jsonl')}",
+        f"- total entries: {int(summary.get('total_entries', 0) or 0)}",
+        "- counts by kind: "
+        + (", ".join(f"{kind}={count}" for kind, count in counts.items()) if counts else "none"),
+        f"- selected entries included below: {int(summary.get('selected_entry_count', 0) or 0)} "
+        f"(cap {int(summary.get('max_chars', 0) or 0)} chars)",
+        "- Prior audit issue entries are provisional findings, not established paper facts; recheck them when relevant.",
+        "Selected context DB entries:",
+    ]
+    entries = summary.get("selected_entries") or []
+    if not entries:
+        lines.append("- None selected.")
+        return lines
+    for entry in entries:
+        kind = str(entry.get("kind") or "context")
+        display_kind = "prior audit issue (provisional)" if kind == "issue" else kind
+        parts = [
+            display_kind,
+            str(entry.get("source_chunk_id") or ""),
+            f"pages {entry.get('page_start')}-{entry.get('page_end')}"
+            if entry.get("page_start") or entry.get("page_end")
+            else "",
+            str(entry.get("issue_id") or ""),
+            str(entry.get("severity") or ""),
+        ]
+        label = " | ".join(part for part in parts if part.strip())
+        lines.append(f"- {label}: {_compact_context_text(entry.get('text'), limit=520)}")
+    return lines
 
 
 def _context_query_terms(chunk: dict[str, Any], *, include_generic: bool = False) -> set[str]:

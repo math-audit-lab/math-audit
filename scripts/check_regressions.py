@@ -1118,6 +1118,121 @@ def test_resume_preserves_saved_audit_context_mode() -> None:
         _assert(saved["audit_context_mode"] == AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL, saved)
 
 
+def test_discussion_legacy_thread_and_context_db_safety() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_discussion_safety_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        paths = session_paths(workdir)
+
+        empty_legacy = dict(session)
+        empty_legacy["conversation_id"] = "conv-audit-main"
+        empty_legacy["pdf_attached_in_conversation"] = True
+        empty_legacy.pop("qa_threads", None)
+        _write_json(paths["session"], empty_legacy)
+        ensured = runtime._ensure_qa_thread_state(empty_legacy)
+        legacy = ensured["qa_threads"]["thread_legacy"]
+        _assert(legacy.get("conversation_id") is None, legacy)
+        _assert(legacy.get("pdf_attached_in_conversation") is False, legacy)
+
+        with_history = dict(session)
+        with_history["conversation_id"] = "conv-audit-main"
+        with_history.pop("qa_threads", None)
+        _write_json(paths["session"], with_history)
+        _write_json(
+            workdir / "qa" / "qa_001.json",
+            {
+                "time": OLD,
+                "turn_id": "qa_001",
+                "thread_id": "thread_legacy",
+                "conversation_id": "conv-discussion-legacy",
+                "question": "What is the main issue?",
+                "answer": "Saved answer.",
+            },
+        )
+        ensured_history = runtime._ensure_qa_thread_state(with_history)
+        legacy_history = ensured_history["qa_threads"]["thread_legacy"]
+        _assert(legacy_history.get("conversation_id") == "conv-discussion-legacy", legacy_history)
+
+        existing_history = copy.deepcopy(ensured_history)
+        existing_history["qa_threads"]["thread_legacy"]["conversation_id"] = "conv-existing-discussion"
+        ensured_existing = runtime._ensure_qa_thread_state(existing_history)
+        _assert(
+            ensured_existing["qa_threads"]["thread_legacy"].get("conversation_id") == "conv-existing-discussion",
+            ensured_existing["qa_threads"]["thread_legacy"],
+        )
+
+        context_path = paths["audit_context_db"]
+        _append_jsonl(
+            context_path,
+            {
+                "entry_id": "chunk_001:def:001",
+                "kind": "definition",
+                "text": "Definition: alpha denotes the stability parameter used in Theorem 2.",
+                "source_chunk_id": "chunk_001",
+                "source_chunk_index": 1,
+                "page_start": 1,
+                "page_end": 2,
+                "confidence": "source-derived",
+            },
+        )
+        _append_jsonl(
+            context_path,
+            {
+                "entry_id": "chunk_002:dependency:001",
+                "kind": "dependency",
+                "text": "Theorem 2 depends on the alpha stability estimate from Lemma 1.",
+                "source_chunk_id": "chunk_002",
+                "source_chunk_index": 2,
+                "page_start": 2,
+                "page_end": 3,
+                "confidence": "source-derived",
+            },
+        )
+        _append_jsonl(
+            context_path,
+            {
+                "entry_id": "chunk_003:issue:001",
+                "kind": "issue",
+                "text": "Potential high-impact dependency gap involving Theorem 2 and alpha.",
+                "source_chunk_id": "chunk_003",
+                "source_chunk_index": 3,
+                "page_start": 3,
+                "page_end": 4,
+                "issue_id": "I001",
+                "severity": "high",
+                "status": "open",
+                "confidence": "source-derived",
+            },
+        )
+
+        full_context = runtime._build_full_audit_qa_context(session, "Does Theorem 2 depend on alpha?")
+        _assert("Audit context database summary (compact):" in full_context, full_context)
+        _assert("definition=1" in full_context, full_context)
+        _assert("dependency=1" in full_context, full_context)
+        _assert("Prior audit issue entries are provisional findings" in full_context, full_context)
+        _assert("prior audit issue (provisional)" in full_context, full_context)
+
+        paper_structure = runtime._build_paper_structure_context(session)
+        context_db = paper_structure.get("audit_context_db") or {}
+        _assert(context_db.get("available") is True, context_db)
+        _assert(context_db.get("counts_by_kind", {}).get("definition") == 1, context_db)
+        _assert(context_db.get("counts_by_kind", {}).get("dependency") == 1, context_db)
+        selected = context_db.get("selected_entries") or []
+        _assert(selected, context_db)
+        issue_entries = [entry for entry in selected if entry.get("kind") == "issue"]
+        _assert(issue_entries and issue_entries[0].get("provisional") is True, selected)
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_discussion_no_context_db_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        full_context = runtime._build_full_audit_qa_context(session, "Any context DB?")
+        _assert("Audit context database summary (compact):" not in full_context, full_context)
+        paper_structure = runtime._build_paper_structure_context(session)
+        context_db = paper_structure.get("audit_context_db") or {}
+        _assert(context_db.get("available") is False, context_db)
+        _assert(context_db.get("total_entries") == 0, context_db)
+
+
 def test_report_latex_unicode_math_safety() -> None:
     text = (
         "The bound is $c_2√nΛ≤1/2$ and $√(n+1)≥λ$. "
@@ -1955,6 +2070,7 @@ def main() -> int:
         ("completed status reconciliation", test_completed_status_reconciles_from_chunk_records),
         ("persistent audit log preview", test_persistent_audit_log_preview),
         ("resume preserves saved audit context mode", test_resume_preserves_saved_audit_context_mode),
+        ("discussion legacy thread and context DB safety", test_discussion_legacy_thread_and_context_db_safety),
         ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
         ("issue severity summary in audit summary", test_issue_severity_summary_in_audit_summary),
         ("concise report notable proof-reference issues", test_concise_report_notable_proof_reference_issues),
