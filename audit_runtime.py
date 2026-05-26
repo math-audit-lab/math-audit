@@ -339,16 +339,25 @@ def to_jsonable(obj: Any) -> Any:
 
 _UNSAFE_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _JSON_ESCAPE_ARTIFACTS = {
-    "\x08": r"\\b",
-    "\x0c": r"\\f",
+    "\x08": r"\b",
+    "\x0c": r"\f",
 }
 _JSON_CONTROL_ESCAPE_ARTIFACT_RE = re.compile(r"\\u00(?:0[0-9A-Fa-f]|1[0-9A-Fa-f])", re.IGNORECASE)
+_PERSISTED_JSON_ESCAPE_ARTIFACT_COMMAND_RE = re.compile(
+    r"\\\\(?=(?:"
+    r"frac|dfrac|tfrac|binom|dbinom|tbinom|beta|blambda|bar|bmod|bigl|bigr|Bigl|Bigr"
+    r")\b)"
+)
 
 
 def _repair_json_escape_artifacts(text: str) -> str:
     text = "" if text is None else str(text)
     for bad, replacement in _JSON_ESCAPE_ARTIFACTS.items():
         text = text.replace(bad, replacement)
+    # Older runs persisted repaired JSON escapes as ``\\frac``/``\\beta``.
+    # In math mode that renders as a line break plus plain letters, so restore
+    # the intended single TeX command slash for the compact artifact forms.
+    text = _PERSISTED_JSON_ESCAPE_ARTIFACT_COMMAND_RE.sub(lambda _m: "\\", text)
     text = _JSON_CONTROL_ESCAPE_ARTIFACT_RE.sub(" ", text)
     return text
 

@@ -1137,6 +1137,26 @@ def test_report_latex_unicode_math_safety() -> None:
         _assert("\\\\Lambda" not in rendered, rendered)
         _assert("\\\\lambda" not in rendered, rendered)
 
+        json_escaped_tex = (
+            "Recovered commands: $e^{-\\rho j}\\exp(-"
+            + "\x0c"
+            + "rac{\\rho j^2}{2k})+"
+            + "\x08"
+            + "lambda$."
+        )
+        rendered_json_escaped = renderer(json_escaped_tex)
+        _assert(r"\frac{\rho j^2}{2k}" in rendered_json_escaped, rendered_json_escaped)
+        _assert(r"\blambda" in rendered_json_escaped, rendered_json_escaped)
+        _assert(r"\\frac" not in rendered_json_escaped, rendered_json_escaped)
+        _assert(r"\\blambda" not in rendered_json_escaped, rendered_json_escaped)
+
+        persisted_json_escaped_tex = r"Persisted commands: $-\exp(-\\frac{\rho j^2}{2k})+\\beta$."
+        rendered_persisted = renderer(persisted_json_escaped_tex)
+        _assert(r"\frac{\rho j^2}{2k}" in rendered_persisted, rendered_persisted)
+        _assert(r"\beta" in rendered_persisted, rendered_persisted)
+        _assert(r"\\frac" not in rendered_persisted, rendered_persisted)
+        _assert(r"\\beta" not in rendered_persisted, rendered_persisted)
+
         malformed = r"Replace $for any fixed $s\ne1$$ by $for each fixed integer $s\ne1$$."
         rendered_malformed = renderer(malformed)
         _assert("$$" not in rendered_malformed, rendered_malformed)
