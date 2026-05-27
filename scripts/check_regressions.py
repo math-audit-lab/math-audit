@@ -61,6 +61,7 @@ from gui_controller import (
 )
 from scripts.prepare_context_mode_comparison import prepare_context_mode_comparison
 from scripts.prepare_issue_recheck_candidates import prepare_issue_recheck_candidates
+from scripts.prepare_rerun_recheck_candidates import prepare_rerun_recheck_candidates
 from scripts.run_context_mode_ab_test import run_context_mode_ab_test
 
 
@@ -2081,6 +2082,252 @@ def test_prepare_issue_recheck_candidates_script() -> None:
             raise RegressionFailure("Issue recheck script allowed output inside source audit workdir")
 
 
+def test_prepare_rerun_recheck_candidates_script() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_rerun_recheck_regression_") as tmp:
+        root = Path(tmp)
+        source = root / "source_audit"
+        output = root / "rerun_recheck_out"
+        _seed_state(source)
+        chunks = [
+            {
+                "chunk_id": "chunk_026",
+                "chunk_index": 26,
+                "label": "Proposition 4.1",
+                "boundary": "pages 12-13; equation (34)",
+                "page_start": 12,
+                "page_end": 13,
+                "chunk_text": "Proposition 4.1 proves equation (34).",
+            },
+            {
+                "chunk_id": "chunk_030",
+                "chunk_index": 30,
+                "label": "Theorem 4.1",
+                "boundary": "pages 15-16; Theorem 4.1",
+                "page_start": 15,
+                "page_end": 16,
+                "chunk_text": "Theorem 4.1 depends on equation (34).",
+            },
+            {
+                "chunk_id": "chunk_048",
+                "chunk_index": 48,
+                "label": "Saddle point chunk",
+                "boundary": "pages 20-20; equation (50)",
+                "page_start": 20,
+                "page_end": 20,
+                "chunk_text": "The formula defines $V(R)$ near equation (50).",
+            },
+            {
+                "chunk_id": "chunk_049",
+                "chunk_index": 49,
+                "label": "Downstream theorem",
+                "boundary": "pages 21-21; Theorem 5.1",
+                "page_start": 21,
+                "page_end": 21,
+                "chunk_text": "Theorem 5.1 depends on the earlier $V(R)$ curvature calculation.",
+            },
+            {
+                "chunk_id": "chunk_055",
+                "chunk_index": 55,
+                "label": "Verification chunk",
+                "boundary": "pages 24-24",
+                "page_start": 24,
+                "page_end": 24,
+            },
+            {
+                "chunk_id": "chunk_056",
+                "chunk_index": 56,
+                "label": "Technical failure chunk",
+                "boundary": "pages 24-25",
+                "page_start": 24,
+                "page_end": 25,
+            },
+        ]
+        _write_json(session_paths(source)["manifest"], {"chunks": chunks})
+        _write_json(
+            session_paths(source)["issues"],
+            {
+                "issues": [
+                    {
+                        "issue_id": "I057",
+                        "chunk_id": "chunk_026",
+                        "status": "open",
+                        "severity": "medium",
+                        "title": "Proof cites equation (34), the identity being proved",
+                        "location": "Proposition 4.1 proof",
+                        "description": "The proof cites equation (34) while proving equation (34), so this is a circular citation.",
+                        "evidence": "The intended reference is the finite-difference identity plus Leibniz rule.",
+                        "proposed_fix": "Replace the citation with the earlier identity and Leibniz rule.",
+                        "tags": ["circular-citation", "reference-error"],
+                    },
+                    {
+                        "issue_id": "I071",
+                        "chunk_id": "chunk_030",
+                        "status": "open",
+                        "severity": "high",
+                        "title": "Theorem 4.1 depends on unresolved equation (34)",
+                        "location": "Theorem 4.1",
+                        "description": "This theorem depends on equation (34); if the earlier circular citation is not repaired, this downstream theorem inherits the gap.",
+                        "evidence": "The proof invokes equation (34) without an independent derivation.",
+                        "proposed_fix": "Repair Proposition 4.1 first, then recheck this dependency.",
+                        "tags": ["dependency", "propagation"],
+                    },
+                    {
+                        "issue_id": "I122",
+                        "chunk_id": "chunk_048",
+                        "status": "open",
+                        "severity": "critical",
+                        "title": "Possible sign error in the definition of $V(R)$",
+                        "location": "equation (50)",
+                        "description": "The formula for $V(R)$ may have the wrong sign in the curvature term.",
+                        "evidence": "The later saddle-point estimate appears to require positive $V(R)$.",
+                        "proposed_fix": "Recheck the sign convention around equation (50).",
+                        "tags": ["sign", "variance", "curvature"],
+                    },
+                    {
+                        "issue_id": "I129",
+                        "chunk_id": "chunk_049",
+                        "status": "open",
+                        "severity": "high",
+                        "title": "Earlier potential issue with $V(R)$ remains unresolved",
+                        "location": "Theorem 5.1",
+                        "description": "This theorem depends on the earlier $V(R)$ sign issue from equation (50) and may propagate it downstream.",
+                        "evidence": "The proof assumes the unresolved curvature factor.",
+                        "proposed_fix": "Resolve the upstream $V(R)$ issue before relying on this theorem.",
+                        "tags": ["dependency", "propagation", "curvature"],
+                    },
+                    {
+                        "issue_id": "I140",
+                        "chunk_id": "chunk_049",
+                        "status": "open",
+                        "severity": "medium",
+                        "title": "Notation regime for $\rho$ is unclear",
+                        "location": "Theorem 5.1 setup",
+                        "description": "The range assumption for the parameter regime is ambiguous.",
+                        "evidence": "Later text appears to clarify the regime.",
+                        "proposed_fix": "Recheck against later regime notation.",
+                        "tags": ["notation", "regime"],
+                    },
+                ]
+            },
+        )
+        _write_json(
+            session_paths(source)["ledger"],
+            {
+                "assumptions": ["Equation (34) is used by Theorem 4.1.", "Equation (50) defines $V(R)$."],
+                "notes": ["Later chunks clarify the parameter regime for $\\rho$."],
+                "updated_at": NEW,
+            },
+        )
+        structured_path = source / "responses" / "chunk_049.structured.json"
+        _write_json(
+            structured_path,
+            {
+                "assumptions_and_notation": ["Theorem 5.1 uses $V(R)$ from equation (50)."],
+                "verified_steps": [],
+                "ledger_updates": {"assumptions": [], "notes": ["The downstream theorem depends on $V(R)$."]},
+                "next_boundary_hint": "",
+            },
+        )
+        _append_jsonl(
+            session_paths(source)["chunk_records"],
+            {"chunk_id": "chunk_049", "time": OLD, "structured_response_path": str(structured_path)},
+        )
+        check_path = source / "python_checks" / "chunk_055_check_01.py"
+        _write_text(check_path, "assert False, 'synthetic failure'\n")
+        result_path = source / "verification_results" / "chunk_055_check_01.result.json"
+        _write_json(
+            result_path,
+            {
+                "time": NEW,
+                "chunk_id": "chunk_055",
+                "chunk_index": 55,
+                "script_name": "chunk_055_check_01.py",
+                "script_path": str(check_path),
+                "result_path": str(result_path),
+                "status": "failed",
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "AssertionError: synthetic failure",
+                "conclusion": "Traceback (most recent call last):",
+            },
+        )
+        _write_json(
+            session_paths(source)["verification_state"],
+            {
+                "updated_at": NEW,
+                "last_run": {"scripts_total": 1, "passed": 0, "failed": 1, "timeout": 0, "skipped": 0},
+                "results": [
+                    {
+                        "chunk_id": "chunk_055",
+                        "chunk_index": 55,
+                        "script_name": "chunk_055_check_01.py",
+                        "script_path": str(check_path),
+                        "result_path": str(result_path),
+                        "status": "failed",
+                    }
+                ],
+            },
+        )
+        failed_log = {
+            "time": NEW,
+            "chunk_id": "chunk_056",
+            "chunk_index": 56,
+            "response_id": "resp_failed_context",
+            "status": "failed",
+            "error": {"code": "context_length_exceeded", "message": "too long"},
+            "request_path": str(source / "requests" / "chunk_056.request.json"),
+            "failure_summary_path": str(source / "responses" / "chunk_056_resp_failed_context.failure.json"),
+        }
+        _append_jsonl(source / "logs" / "failed_chunks.jsonl", failed_log)
+        _write_json(source / "responses" / "chunk_056_resp_failed_context.failure.json", failed_log)
+
+        watched = [
+            session_paths(source)["manifest"],
+            session_paths(source)["issues"],
+            session_paths(source)["ledger"],
+            session_paths(source)["chunk_records"],
+            session_paths(source)["verification_state"],
+            structured_path,
+            check_path,
+            result_path,
+            source / "logs" / "failed_chunks.jsonl",
+        ]
+        before_files = {path: path.read_text(encoding="utf-8") for path in watched}
+
+        manifest = prepare_rerun_recheck_candidates(source, output, include_medium=True)
+        _assert(manifest["source_unmodified_by_script"], manifest)
+        _assert((output / "rerun_recheck_candidates.json").exists(), "JSON output missing")
+        _assert((output / "rerun_recheck_candidates.md").exists(), "Markdown output missing")
+        categories = manifest["category_counts"]
+        _assert(categories.get("verification_failure", 0) >= 1, categories)
+        _assert(categories.get("technical_failure_recovery", 0) >= 1, categories)
+        _assert(categories.get("high_critical_issue_recheck", 0) >= 3, categories)
+        _assert(categories.get("dependency_propagation", 0) >= 2, categories)
+        _assert(categories.get("notation_regime_clarification", 0) >= 1, categories)
+
+        groups = manifest["groups"]
+        grouped_sets = [{member["issue_id"] for member in group.get("members", [])} for group in groups]
+        _assert(any({"I122", "I129"} <= issue_ids for issue_ids in grouped_sets), groups)
+        _assert(any({"I057", "I071"} <= issue_ids for issue_ids in grouped_sets), groups)
+        candidates = manifest["candidates"]
+        _assert(
+            any(candidate["category"] == "verification_failure" and "chunk_055_check_01.py" in candidate["source_ids"] for candidate in candidates),
+            candidates,
+        )
+        _assert(
+            any(candidate["category"] == "technical_failure_recovery" and "chunk_056" in candidate["source_ids"] for candidate in candidates),
+            candidates,
+        )
+        for path, text in before_files.items():
+            _assert(path.read_text(encoding="utf-8") == text, f"source file changed: {path}")
+        try:
+            prepare_rerun_recheck_candidates(source, source / "nested_output")
+        except RuntimeError as exc:
+            _assert("inside the source audit workdir" in str(exc), str(exc))
+        else:
+            raise RegressionFailure("Rerun/recheck script allowed output inside source audit workdir")
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -2117,6 +2364,7 @@ def main() -> int:
         ("context mode comparison script", test_prepare_context_mode_comparison_script),
         ("context mode A/B dry-run script", test_run_context_mode_ab_test_dry_run),
         ("issue recheck candidate script", test_prepare_issue_recheck_candidates_script),
+        ("rerun/recheck candidate inventory script", test_prepare_rerun_recheck_candidates_script),
     ]
     results = [_run_case(name, func) for name, func in cases]
 
