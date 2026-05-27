@@ -1369,7 +1369,7 @@ def test_issue_severity_summary_in_audit_summary() -> None:
         _assert(r"\item Total open issues: 4" in concise_tex, concise_tex)
 
 
-def test_concise_report_notable_proof_reference_issues() -> None:
+def test_concise_report_notable_incorrect_reference_issues() -> None:
     with tempfile.TemporaryDirectory(prefix="math_audit_concise_notable_") as tmp:
         workdir = Path(tmp) / "paper_audit"
         session = _seed_state(workdir)
@@ -1384,6 +1384,7 @@ def test_concise_report_notable_proof_reference_issues() -> None:
                     {"chunk_id": "chunk_003", "chunk_index": 3, "page_start": 5, "page_end": 6},
                     {"chunk_id": "chunk_004", "chunk_index": 4, "page_start": 7, "page_end": 7},
                     {"chunk_id": "chunk_005", "chunk_index": 5, "page_start": 8, "page_end": 9},
+                    {"chunk_id": "chunk_006", "chunk_index": 6, "page_start": 10, "page_end": 11},
                 ],
             },
         )
@@ -1393,6 +1394,7 @@ def test_concise_report_notable_proof_reference_issues() -> None:
             ("chunk_003", 3, 5, 6),
             ("chunk_004", 4, 7, 7),
             ("chunk_005", 5, 8, 9),
+            ("chunk_006", 6, 10, 11),
         ]:
             _append_jsonl(
                 paths["chunk_records"],
@@ -1401,7 +1403,7 @@ def test_concise_report_notable_proof_reference_issues() -> None:
         _write_json(
             paths["issues"],
             {
-                "next_issue_id": 6,
+                "next_issue_id": 7,
                 "issues": [
                     {
                         "issue_id": "I001",
@@ -1455,12 +1457,24 @@ def test_concise_report_notable_proof_reference_issues() -> None:
                         "chunk_id": "chunk_005",
                         "severity": "medium",
                         "status": "open",
-                        "title": "Later theorem depends on unresolved equation reference",
-                        "location": "Theorem 2 proof",
-                        "description": "The proof depends on a wrong equation reference in an earlier lemma.",
-                        "evidence": "The later proof invokes the reference without an independent derivation.",
-                        "proposed_fix": "Correct the equation reference or restate the dependency.",
-                        "tags": ["dependency", "wrong-reference"],
+                        "title": "Mislabeled equation reference points to the wrong formula",
+                        "location": "Lemma 2 proof",
+                        "description": "The proof cites equation (19), but the required identity is equation (18).",
+                        "evidence": "Equation (19) is a different recurrence and cannot justify this line.",
+                        "proposed_fix": "Replace the citation with equation (18).",
+                        "tags": ["wrong-reference"],
+                    },
+                    {
+                        "issue_id": "I006",
+                        "chunk_id": "chunk_006",
+                        "severity": "medium",
+                        "status": "open",
+                        "title": "Replacement of the exponential factor in equation (15) needs an explicit uniform estimate",
+                        "location": "Equation (15)",
+                        "description": "The proof should justify the uniform error term before replacing the exponential factor.",
+                        "evidence": "The estimate is plausible but not written out.",
+                        "proposed_fix": "Add the missing uniform estimate.",
+                        "tags": ["uniformity", "asymptotics", "proof-gap"],
                     },
                 ],
             },
@@ -1469,33 +1483,42 @@ def test_concise_report_notable_proof_reference_issues() -> None:
         markdown = build_concise_report_markdown(session)
         _assert("## High-priority mathematical/correctness issues" in markdown, markdown)
         _assert("### I001 — Main theorem bound fails [high]" in markdown, markdown)
-        _assert("## Notable proof-reference and dependency issues" in markdown, markdown)
+        _assert("## Notable incorrect or circular references" in markdown, markdown)
         _assert("### I002 — Proof cites the identity being proved [medium]" in markdown, markdown)
-        _assert("### I005 — Later theorem depends on unresolved equation reference [medium]" in markdown, markdown)
+        _assert("### I005 — Mislabeled equation reference points to the wrong formula [medium]" in markdown, markdown)
         _assert("I003 — An ordinary medium issue" not in markdown, markdown)
+        _assert("I006 — Replacement of the exponential factor in equation (15)" not in markdown, markdown)
         _assert("## Typographical errors" in markdown, markdown)
         _assert("### I004 — Typographical spelling issue [low]" in markdown, markdown)
-        notable_section = markdown.split("## Notable proof-reference and dependency issues", 1)[1].split("## Typographical errors", 1)[0]
+        notable_section = markdown.split("## Notable incorrect or circular references", 1)[1].split("## Typographical errors", 1)[0]
         _assert("I001 — Main theorem bound fails" not in notable_section, notable_section)
         _assert("I004 — Typographical spelling issue" not in notable_section, notable_section)
+        _assert("I006 — Replacement of the exponential factor" not in notable_section, notable_section)
 
         tex = build_concise_report_tex(session)
-        _assert(r"\section*{Notable proof-reference and dependency issues}" in tex, tex)
+        _assert(r"\section*{Notable incorrect or circular references}" in tex, tex)
         _assert("I002 -- Proof cites the identity being proved [medium]" in tex, tex)
-        _assert("I005 -- Later theorem depends on unresolved equation reference [medium]" in tex, tex)
+        _assert("I005 -- Mislabeled equation reference points to the wrong formula [medium]" in tex, tex)
+        _assert("I006 -- Replacement of the exponential factor" not in tex, tex)
 
         report_json = build_concise_report_json(session)
         notable_ids = [
             item.get("issue_id")
-            for item in report_json.get("notable_proof_reference_and_dependency_issues", [])
+            for item in report_json.get("notable_incorrect_or_circular_references", [])
         ]
         _assert(set(notable_ids) == {"I002", "I005"}, notable_ids)
         _assert(len(notable_ids) == 2, notable_ids)
+        legacy_notable_ids = [
+            item.get("issue_id")
+            for item in report_json.get("notable_proof_reference_and_dependency_issues", [])
+        ]
+        _assert(legacy_notable_ids == notable_ids, report_json)
         _assert([item.get("issue_id") for item in report_json.get("main_issues", [])] == ["I001"], report_json["main_issues"])
+        _assert("notable_incorrect_or_circular_references" in report_json["selection_rules"], report_json["selection_rules"])
         _assert("notable_proof_reference_and_dependency_issues" in report_json["selection_rules"], report_json["selection_rules"])
 
         balanced_markdown = build_concise_report_markdown(session, options={"preset": "balanced_concise"})
-        _assert("## Notable proof-reference and dependency issues" not in balanced_markdown, balanced_markdown)
+        _assert("## Notable incorrect or circular references" not in balanced_markdown, balanced_markdown)
         _assert("### I002 — Proof cites the identity being proved [medium]" in balanced_markdown, balanced_markdown)
 
 
@@ -2086,7 +2109,7 @@ def main() -> int:
         ("discussion legacy thread and context DB safety", test_discussion_legacy_thread_and_context_db_safety),
         ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
         ("issue severity summary in audit summary", test_issue_severity_summary_in_audit_summary),
-        ("concise report notable proof-reference issues", test_concise_report_notable_proof_reference_issues),
+        ("concise report notable incorrect reference issues", test_concise_report_notable_incorrect_reference_issues),
         ("fresh rerun request metadata", test_fresh_rerun_request_metadata),
         ("usage cache diagnostics", test_usage_cache_diagnostics),
         ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),

@@ -118,64 +118,84 @@ _TYPO_KEYWORDS = (
 )
 _TYPO_LITERAL_FRAGMENT_RE = re.compile(r"`([^`\n]{2,120})`")
 
-_NOTABLE_PROOF_REFERENCE_SECTION_TITLE = "Notable proof-reference and dependency issues"
+_NOTABLE_PROOF_REFERENCE_SECTION_TITLE = "Notable incorrect or circular references"
 _NOTABLE_PROOF_REFERENCE_MAX_ISSUES = 10
 _NOTABLE_PROOF_REFERENCE_TAGS = {
-    "circular",
     "circular-citation",
-    "citation",
-    "dependency",
-    "downstream",
-    "equation-reference",
-    "finite-difference-identity",
     "identity-being-proved",
-    "inherited-gap",
-    "lemma-reference",
+    "incorrect-reference",
     "mislabeling",
     "mislabeled",
-    "proof-gap",
-    "proof-reference",
-    "proof-structure",
-    "reference",
+    "mislabelled",
     "reference-error",
     "self-citation",
-    "theorem-reference",
     "wrong-reference",
 }
 _NOTABLE_PROOF_REFERENCE_STRONG_KEYWORDS = (
     "cites the identity being proved",
     "citing the identity being proved",
+    "cite the identity being proved",
     "identity being proved",
     "equation being proved",
+    "formula being proved",
+    "result being proved",
+    "currently being proved",
     "circular citation",
     "circular reference",
     "self-citation",
+    "self citation",
+    "incorrect cross-reference",
+    "incorrect cross reference",
+    "missing cross-reference",
+    "missing cross reference",
+    "wrong cross-reference",
+    "wrong cross reference",
     "wrong reference",
+    "incorrect reference",
+    "misleading reference",
+    "mislabeled reference",
+    "mislabelled reference",
+    "reference number mismatch",
+    "reference label mismatch",
+    "label mismatch",
     "wrong equation",
+    "wrong formula",
     "wrong theorem",
     "wrong lemma",
-    "proof-reference",
-    "proof reference",
-    "proof-structure",
-    "proof structure",
+    "wrong proposition",
+    "wrong definition",
+    "wrong section",
 )
-_NOTABLE_PROOF_REFERENCE_KEYWORDS = (
+_NOTABLE_PROOF_REFERENCE_TARGET_KEYWORDS = (
     "citation",
     "cite",
     "cites",
     "citing",
-    "dependency",
-    "depends on",
-    "downstream",
+    "cross-reference",
+    "cross reference",
+    "definition reference",
     "equation reference",
-    "inherited gap",
+    "formula reference",
+    "identity reference",
     "lemma reference",
+    "proposition reference",
+    "reference",
+    "section reference",
+    "theorem reference",
+)
+_NOTABLE_PROOF_REFERENCE_ERROR_KEYWORDS = (
+    "being proved",
+    "circular",
+    "incorrect",
+    "misleading",
     "mislabeling",
     "mislabeled",
-    "propagates",
-    "reference",
-    "theorem reference",
-    "unresolved dependency",
+    "mislabelled",
+    "mismatch",
+    "prevents checking",
+    "self-citation",
+    "self citation",
+    "wrong",
 )
 
 SAFE_REPORT_PACKAGES = {
@@ -1357,16 +1377,21 @@ def _notable_proof_reference_score(issue: dict[str, Any]) -> int:
         return 0
     tags = _issue_tags(issue)
     text = _notable_proof_reference_text(issue)
-    score = 0
     tag_hits = tags & _NOTABLE_PROOF_REFERENCE_TAGS
-    score += 4 * len(tag_hits)
-    score += 5 * sum(1 for keyword in _NOTABLE_PROOF_REFERENCE_STRONG_KEYWORDS if keyword in text)
-    score += 2 * sum(1 for keyword in _NOTABLE_PROOF_REFERENCE_KEYWORDS if keyword in text)
-    if "proof" in text and "reference" in text:
-        score += 3
-    if "proof" in text and "dependency" in text:
-        score += 3
-    if ("equation" in text or "theorem" in text or "lemma" in text) and "reference" in text:
+    strong_hits = sum(1 for keyword in _NOTABLE_PROOF_REFERENCE_STRONG_KEYWORDS if keyword in text)
+    has_reference_target = any(keyword in text for keyword in _NOTABLE_PROOF_REFERENCE_TARGET_KEYWORDS)
+    has_reference_error = any(keyword in text for keyword in _NOTABLE_PROOF_REFERENCE_ERROR_KEYWORDS)
+    if not (tag_hits or strong_hits or (has_reference_target and has_reference_error)):
+        return 0
+
+    score = 0
+    score += 6 * len(tag_hits)
+    score += 7 * strong_hits
+    if has_reference_target and has_reference_error:
+        score += 5
+    if "proof" in text and ("cite" in text or "reference" in text) and "being proved" in text:
+        score += 4
+    if "prevents checking" in text or "cannot check" in text:
         score += 2
     if issue.get("proposed_fix"):
         score += 1
@@ -2991,7 +3016,7 @@ def _is_strict_concise_options(options: dict[str, Any]) -> bool:
 
 def _concise_mode_description(options: dict[str, Any]) -> str:
     if _is_strict_concise_options(options):
-        return "high-priority mathematical/correctness issues, notable proof-reference/dependency medium issues, plus all typographical/copyediting issues"
+        return "high-priority mathematical/correctness issues, notable incorrect/circular reference medium issues, plus all typographical/copyediting issues"
     issue_text = f"mathematical/correctness issues with severity: {_concise_option_enabled_severity_text(options)}"
     if options.get("only_open_issues", True):
         issue_text = "open " + issue_text
@@ -3144,7 +3169,7 @@ def _concise_omitted_material_text(options: dict[str, Any]) -> str:
         return (
             "Routine verified steps, successful-check narrative, per-chunk overview material, "
             "suggested Python-check details, and non-high mathematical/correctness issues not selected "
-            "as notable proof-reference/dependency issues are "
+            "as notable incorrect or circular references are "
             "intentionally omitted from this concise report."
         )
     omitted_parts = [
@@ -3178,8 +3203,11 @@ def _concise_selection_rules(options: dict[str, Any]) -> dict[str, str]:
         "main_issues": (
             f"{state}issues with normalized severity in {{{severities}}}, excluding pure typographical/copyediting issues"
         ),
+        "notable_incorrect_or_circular_references": (
+            f"up to {_NOTABLE_PROOF_REFERENCE_MAX_ISSUES} {state}medium non-typographical issues selected only when they concern wrong, misleading, mislabeled, missing, self-referential, or circular references/citations to formulas, equations, identities, lemmas, theorems, propositions, definitions, remarks, or sections; issues already included in main_issues are not duplicated"
+        ),
         "notable_proof_reference_and_dependency_issues": (
-            f"up to {_NOTABLE_PROOF_REFERENCE_MAX_ISSUES} {state}medium non-typographical issues selected by proof-reference, circular-citation, dependency, or mathematically consequential reference heuristics; issues already included in main_issues are not duplicated"
+            "backward-compatible alias for notable_incorrect_or_circular_references"
         ),
         "typographical_errors": typo_rule,
         "audit_summary": "included" if options.get("include_audit_summary", True) else "omitted",
@@ -3334,6 +3362,8 @@ def build_concise_report_json(
         "chunk_records": data["chunk_records"],
         "main_issues": data["main_issues"],
         "high_issues": data["main_issues"],
+        "notable_incorrect_or_circular_references": data["notable_proof_reference_issues"],
+        "notable_incorrect_or_circular_reference_entries": data["notable_proof_reference_entries"],
         "notable_proof_reference_and_dependency_issues": data["notable_proof_reference_issues"],
         "notable_proof_reference_and_dependency_entries": data["notable_proof_reference_entries"],
         "typographical_errors": data["typographical_entries"],
