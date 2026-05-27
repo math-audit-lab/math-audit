@@ -55,6 +55,7 @@ from audit_runtime import (
 from audit_state import save_json, session_paths, usage_cache_diagnostics
 from gui_controller import (
     format_chunk_completion_log_line,
+    format_running_chunk_started_log_line,
     fresh_start_context_mode_mismatch_info,
     persistent_audit_log_preview,
 )
@@ -1001,6 +1002,7 @@ def test_chunk_completion_log_line_formatting() -> None:
     usage_entry = {
         "time": NEW,
         "chunk_id": "chunk_012",
+        "usage": {"total_tokens": 43210},
         "elapsed_seconds": 102.0,
         "cost": {"total_cost": 0.8421},
     }
@@ -1012,7 +1014,18 @@ def test_chunk_completion_log_line_formatting() -> None:
     _assert("Chunk cost: $0.8421" in line, line)
     _assert("Cumulative cost: $12.3456" in line, line)
     _assert("Total audit time: 24m 10s" in line, line)
-    _assert("Total tokens: 1234567" in line, line)
+    _assert("Chunk tokens: 43210" in line, line)
+    _assert("Cumulative tokens: 1234567" in line, line)
+    _assert("Total tokens:" not in line, line)
+
+    started = format_running_chunk_started_log_line(
+        {
+            "current_chunk_id": "chunk_013",
+            "chunks_completed": 12,
+            "chunks_total": 81,
+        }
+    )
+    _assert(started == "[chunk_013] started | Progress: 12/81", started)
 
 
 def test_completed_status_reconciles_from_chunk_records() -> None:

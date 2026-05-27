@@ -110,10 +110,26 @@ def format_chunk_completion_log_line(payload: dict[str, Any], usage_entry: dict[
     if total_seconds is not None:
         parts.append(f"Total audit time: {_format_duration_for_log(float(total_seconds or 0.0))}")
 
-    total_tokens = totals.get("total_tokens")
-    if total_tokens is not None:
-        parts.append(f"Total tokens: {int(total_tokens or 0)}")
+    chunk_usage = usage_entry.get("usage") or {}
+    usage_diagnostics = usage_entry.get("usage_diagnostics") or {}
+    chunk_tokens = chunk_usage.get("total_tokens", usage_diagnostics.get("total_tokens"))
+    if chunk_tokens is not None:
+        parts.append(f"Chunk tokens: {int(chunk_tokens or 0)}")
 
+    cumulative_tokens = totals.get("total_tokens")
+    if cumulative_tokens is not None:
+        parts.append(f"Cumulative tokens: {int(cumulative_tokens or 0)}")
+
+    return " | ".join(parts)
+
+
+def format_running_chunk_started_log_line(status: dict[str, Any]) -> str:
+    chunk_id = str(status.get("current_chunk_id") or "chunk")
+    parts = [f"[{chunk_id}] started"]
+    chunks_completed = status.get("chunks_completed")
+    chunks_total = status.get("chunks_total")
+    if chunks_completed is not None and chunks_total is not None:
+        parts.append(f"Progress: {int(chunks_completed or 0)}/{int(chunks_total or 0)}")
     return " | ".join(parts)
 
 
@@ -1307,14 +1323,15 @@ class GuiController(QObject):
             if isinstance(entry, dict):
                 self._logged_chunk_completion_signatures.add(self._chunk_completion_signature(entry))
 
-    def _log_new_chunk_completions(self, payload: dict[str, Any]) -> None:
+    def _log_new_chunk_completions(self, payload: dict[str, Any]) -> set[str]:
         if not payload.get("session_available"):
-            return
+            return set()
         if self._chunk_completion_log_pdf_path != self.pdf_path:
             self._prime_chunk_completion_log_state()
-            return
+            return set()
         usage = payload.get("usage") or {}
         entries = usage.get("per_chunk", []) or []
+        logged_chunk_ids: set[str] = set()
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -1322,10 +1339,25 @@ class GuiController(QObject):
             if signature in self._logged_chunk_completion_signatures:
                 continue
             self._logged_chunk_completion_signatures.add(signature)
+            logged_chunk_ids.add(str(entry.get("chunk_id") or ""))
             self.log_message.emit(format_chunk_completion_log_line(payload, entry))
+        return logged_chunk_ids
+
+    @staticmethod
+    def _is_redundant_post_completion_running_status(
+        status: dict[str, Any],
+        pause: dict[str, Any],
+        logged_chunk_ids: set[str],
+    ) -> bool:
+        if status.get("status") != "running":
+            return False
+        if pause.get("requested"):
+            return False
+        current_chunk_id = str(status.get("current_chunk_id") or "")
+        return bool(current_chunk_id and current_chunk_id in logged_chunk_ids)
 
     def _log_status_change(self, payload: dict[str, Any]) -> None:
-        self._log_new_chunk_completions(payload)
+        logged_chunk_ids = self._log_new_chunk_completions(payload)
         status = payload.get("status") or {}
         pause = payload.get("pause") or {}
         auto_retry = status.get("last_file_download_timeout_auto_retry") or {}
@@ -1353,11 +1385,17 @@ class GuiController(QObject):
             return
         self._last_status_signature = signature
 
+        if self._is_redundant_post_completion_running_status(status, pause, logged_chunk_ids):
+            return
+
         if payload.get("session_available"):
-            self.log_message.emit(
-                f"Status: {status.get('status', 'unknown')} | "
-                f"Chunk: {status.get('current_chunk_id') or '-'} | "
-                f"Progress: {status.get('chunks_completed', 0)}/{status.get('chunks_total', 0)}"
-            )
+            if status.get("status") == "running" and status.get("current_chunk_id") and not pause.get("requested"):
+                self.log_message.emit(format_running_chunk_started_log_line(status))
+            else:
+                self.log_message.emit(
+                    f"Status: {status.get('status', 'unknown')} | "
+                    f"Chunk: {status.get('current_chunk_id') or '-'} | "
+                    f"Progress: {status.get('chunks_completed', 0)}/{status.get('chunks_total', 0)}"
+                )
         elif payload.get("message"):
             self.log_message.emit(payload["message"])
