@@ -63,7 +63,7 @@ from scripts.prepare_context_mode_comparison import prepare_context_mode_compari
 from scripts.prepare_issue_recheck_candidates import prepare_issue_recheck_candidates
 from scripts.prepare_issue_recheck_families import prepare_issue_recheck_families
 from scripts.prepare_rerun_recheck_candidates import prepare_rerun_recheck_candidates
-from scripts.run_issue_family_recheck import run_issue_family_recheck
+from scripts.run_issue_family_recheck import RESULT_SCHEMA, run_issue_family_recheck, validate_result_schema
 from scripts.run_context_mode_ab_test import run_context_mode_ab_test
 
 
@@ -2510,6 +2510,16 @@ def test_prepare_issue_recheck_families_script() -> None:
 
 
 def test_run_issue_family_recheck_dry_run() -> None:
+    validate_result_schema(RESULT_SCHEMA)
+    bad_schema = json.loads(json.dumps(RESULT_SCHEMA))
+    bad_schema["required"].append("missing_top_level_field")
+    try:
+        validate_result_schema(bad_schema)
+    except ValueError as exc:
+        _assert("extra_required" in str(exc), str(exc))
+    else:
+        raise RegressionFailure("Issue family recheck schema validation allowed an extra required key")
+
     with tempfile.TemporaryDirectory(prefix="math_audit_family_recheck_regression_") as tmp:
         root = Path(tmp)
         source = root / "source_audit"

@@ -47,12 +47,30 @@ RESULT_SCHEMA = {
         "downstream_issue_ids": {"type": "array", "items": {"type": "string"}},
         "false_positive_issue_ids": {"type": "array", "items": {"type": "string"}},
         "recommended_severity_by_issue": {
-            "type": "object",
-            "additionalProperties": {"type": "string"},
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["issue_id", "severity", "rationale"],
+                "properties": {
+                    "issue_id": {"type": "string"},
+                    "severity": {"type": "string"},
+                    "rationale": {"type": "string"},
+                },
+            },
         },
         "recommended_status_by_issue": {
-            "type": "object",
-            "additionalProperties": {"type": "string"},
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["issue_id", "status", "rationale"],
+                "properties": {
+                    "issue_id": {"type": "string"},
+                    "status": {"type": "string"},
+                    "rationale": {"type": "string"},
+                },
+            },
         },
         "grouping_recommendations": {
             "type": "array",
@@ -75,6 +93,36 @@ RESULT_SCHEMA = {
         "summary": {"type": "string"},
     },
 }
+
+
+def validate_result_schema(schema: dict[str, Any]) -> None:
+    def walk(node: Any, path: str) -> None:
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "object":
+            properties = node.get("properties")
+            if not isinstance(properties, dict):
+                raise ValueError(f"{path}: object schema must define properties")
+            required = node.get("required")
+            if not isinstance(required, list):
+                raise ValueError(f"{path}: object schema must define required")
+            property_keys = set(properties)
+            required_keys = set(str(item) for item in required)
+            missing_required = sorted(property_keys - required_keys)
+            extra_required = sorted(required_keys - property_keys)
+            if missing_required or extra_required:
+                raise ValueError(
+                    f"{path}: required/properties mismatch; missing_required={missing_required}, extra_required={extra_required}"
+                )
+            if node.get("additionalProperties") is not False:
+                raise ValueError(f"{path}: object schema must set additionalProperties=false")
+            for key, child in properties.items():
+                walk(child, f"{path}.properties.{key}")
+        items = node.get("items")
+        if items is not None:
+            walk(items, f"{path}.items")
+
+    walk(schema, "RESULT_SCHEMA")
 
 
 def _utc_now() -> str:
@@ -634,6 +682,7 @@ def run_issue_family_recheck(
     _guard_output_dir(audit_workdir, output_dir)
     if live and not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is required for --live mode.")
+    validate_result_schema(RESULT_SCHEMA)
 
     session = _load_session(audit_workdir)
     selected_model = str(model or session.get("model") or "gpt-5.5")
