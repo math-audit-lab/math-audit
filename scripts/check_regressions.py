@@ -2207,6 +2207,30 @@ def test_prepare_rerun_recheck_candidates_script() -> None:
                         "proposed_fix": "Recheck against later regime notation.",
                         "tags": ["notation", "regime"],
                     },
+                    {
+                        "issue_id": "I141",
+                        "chunk_id": "chunk_049",
+                        "status": "open",
+                        "severity": "high",
+                        "title": "Undefined notation q in the local regime",
+                        "location": "Theorem 5.1 setup",
+                        "description": "The symbol q is not defined before it is used in the regime statement.",
+                        "evidence": "The variable appears without an introduced convention.",
+                        "proposed_fix": "Define q or replace it with the intended parameter.",
+                        "tags": ["notation"],
+                    },
+                    {
+                        "issue_id": "I150",
+                        "chunk_id": "chunk_049",
+                        "status": "open",
+                        "severity": "high",
+                        "title": "Uniform asymptotic estimate needs a sharper error bound",
+                        "location": "Theorem 5.1 proof",
+                        "description": "The proof invokes a uniform asymptotic estimate with an error term that is not justified.",
+                        "evidence": "This is a substantive estimate issue, not a notation or regime ambiguity.",
+                        "proposed_fix": "Add the missing estimate or restrict the range.",
+                        "tags": ["uniformity", "asymptotics", "proof-gap"],
+                    },
                 ]
             },
         )
@@ -2301,14 +2325,27 @@ def test_prepare_rerun_recheck_candidates_script() -> None:
         categories = manifest["category_counts"]
         _assert(categories.get("verification_failure", 0) >= 1, categories)
         _assert(categories.get("technical_failure_recovery", 0) >= 1, categories)
-        _assert(categories.get("high_critical_issue_recheck", 0) >= 3, categories)
+        _assert(categories.get("high_critical_issue_recheck", 0) >= 6, categories)
         _assert(categories.get("dependency_propagation", 0) >= 2, categories)
-        _assert(categories.get("notation_regime_clarification", 0) >= 1, categories)
+        _assert(categories.get("notation_regime_clarification", 0) == 0, categories)
+        secondary_categories = manifest["secondary_category_counts"]
+        _assert(secondary_categories.get("notation_regime_clarification", 0) >= 2, secondary_categories)
+        action_counts = manifest["recommended_action_kind_counts"]
+        _assert(action_counts.get("chunk_rerun", 0) == 0, action_counts)
+        _assert(action_counts.get("script_recheck", 0) >= 1, action_counts)
+        _assert(action_counts.get("technical_retry", 0) >= 1, action_counts)
+        _assert(action_counts.get("issue_recheck", 0) >= 6, action_counts)
+        _assert(action_counts.get("dependency_group_review", 0) >= 2, action_counts)
+        type_summary = manifest["candidate_type_summary"]
+        _assert(type_summary.get("full_chunk_rerun_candidates") == 0, type_summary)
+        _assert(type_summary.get("notation_regime_clarification_candidates", 0) >= 2, type_summary)
 
         groups = manifest["groups"]
         grouped_sets = [{member["issue_id"] for member in group.get("members", [])} for group in groups]
         _assert(any({"I122", "I129"} <= issue_ids for issue_ids in grouped_sets), groups)
         _assert(any({"I057", "I071"} <= issue_ids for issue_ids in grouped_sets), groups)
+        _assert(all("I150" not in issue_ids for issue_ids in grouped_sets), groups)
+        _assert(all(len(issue_ids) <= 3 for issue_ids in grouped_sets), groups)
         candidates = manifest["candidates"]
         _assert(
             any(candidate["category"] == "verification_failure" and "chunk_055_check_01.py" in candidate["source_ids"] for candidate in candidates),
@@ -2317,6 +2354,20 @@ def test_prepare_rerun_recheck_candidates_script() -> None:
         _assert(
             any(candidate["category"] == "technical_failure_recovery" and "chunk_056" in candidate["source_ids"] for candidate in candidates),
             candidates,
+        )
+        issue_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.get("item_type") == "issue" and candidate.get("source_ids")
+        ]
+        by_issue = {candidate["source_ids"][0]: candidate for candidate in issue_candidates}
+        _assert("notation_regime_clarification" in by_issue["I141"].get("secondary_categories", []), by_issue["I141"])
+        _assert("notation_regime_clarification" not in by_issue["I150"].get("secondary_categories", []), by_issue["I150"])
+        _assert(sum(1 for candidate in candidates if "I141" in candidate.get("source_ids", [])) == 1, candidates)
+        _assert(
+            "Candidate for review/recheck does not imply full chunk rerun."
+            in (output / "rerun_recheck_candidates.md").read_text(encoding="utf-8"),
+            "Markdown safety note missing",
         )
         for path, text in before_files.items():
             _assert(path.read_text(encoding="utf-8") == text, f"source file changed: {path}")

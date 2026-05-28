@@ -18,12 +18,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.prepare_issue_recheck_candidates import (  # noqa: E402
     SEVERITY_RANK,
     _build_evidence,
-    _build_groups,
     _candidate_from_issue,
     _collect_structured_summaries,
     _extract_risk_terms,
     _flatten_ledger_items,
-    _has_downstream_language,
     _issue_text,
     _load_chunks,
     _load_issues,
@@ -38,21 +36,69 @@ from scripts.prepare_issue_recheck_candidates import (  # noqa: E402
 
 SCHEMA_VERSION = "1.0"
 FAILED_VERIFICATION_STATUSES = {"failed", "timeout", "timed_out"}
+ACTION_KIND_LABELS = {
+    "issue_recheck": "Issue-level recheck candidates",
+    "chunk_rerun": "Full chunk rerun candidates",
+    "script_recheck": "Verification script/claim recheck candidates",
+    "dependency_group_review": "Dependency grouping candidates",
+    "human_review": "Human review candidates",
+    "technical_retry": "Technical recovery candidates",
+}
 TECHNICAL_FAILURE_LOGS = (
     "failed_chunks.jsonl",
     "parse_failures.jsonl",
     "pending_response_cancellations.jsonl",
     "file_download_timeout_auto_retries.jsonl",
 )
-NOTATION_REGIME_TERMS = {
-    "ambiguity",
-    "assumption",
-    "domain",
-    "notation",
-    "parameter range",
-    "range",
-    "regime",
-    "scaling",
+NOTATION_REGIME_TAGS = {
+    "ambiguous-notation",
+    "quantifier",
+    "undefined-notation",
+    "variable-domain",
+}
+NOTATION_REGIME_PHRASES = {
+    "ambiguous notation",
+    "convention not stated",
+    "domain of variable unclear",
+    "epsilon not fixed",
+    "integer vs real",
+    "k=0 endpoint",
+    "notation not defined",
+    "parameter not fixed",
+    "quantifier missing",
+    "range not specified",
+    "symbol not introduced",
+    "undefined notation",
+    "variable ambiguity",
+    "variable is integer",
+    "variable is real",
+    "varepsilon not fixed",
+}
+GENERIC_DEPENDENCY_FEATURES = {
+    "asymptotic",
+    "chunk",
+    "context",
+    "depend",
+    "dependence",
+    "depends",
+    "earlier",
+    "equation",
+    "error",
+    "estimate",
+    "expansion",
+    "explicit",
+    "finite-difference",
+    "lambda",
+    "lemma",
+    "o(1)",
+    "proof",
+    "proposition",
+    "rho",
+    "term",
+    "theorem",
+    "uniform",
+    "\\lambda",
+    "\\rho",
 }
 DEPENDENCY_TERMS = {
     "conditional on",
@@ -132,6 +178,7 @@ def _source_fingerprint(paths: list[Path]) -> dict[str, Any]:
 def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
     priority_rank = {"high": 0, "medium": 1, "low": 2}
     return (
+        str(candidate.get("recommended_action_kind") or ""),
         str(candidate.get("category") or ""),
         priority_rank.get(str(candidate.get("priority") or ""), 9),
         ",".join(str(item) for item in candidate.get("source_ids") or []),
@@ -153,10 +200,25 @@ def _issue_severity(issue: dict[str, Any]) -> str:
     return severity if severity in SEVERITY_RANK else "unknown"
 
 
-def _issue_has_notation_regime_terms(issue: dict[str, Any]) -> bool:
+def _notation_regime_reasons(issue: dict[str, Any]) -> list[str]:
     text = _issue_text(issue).lower()
     tags = {str(tag).lower() for tag in issue.get("tags") or []}
-    return bool(tags & NOTATION_REGIME_TERMS) or any(term in text for term in NOTATION_REGIME_TERMS)
+    reasons = [f"tag:{tag}" for tag in sorted(tags & NOTATION_REGIME_TAGS)]
+    for phrase in sorted(NOTATION_REGIME_PHRASES):
+        if phrase in text:
+            reasons.append(f"phrase:{phrase}")
+    for match in re.finditer(r"\b([a-z]|[A-Z][A-Za-z0-9_*]*)\s+(?:is\s+)?not\s+defined\b", text):
+        reasons.append(f"undefined-symbol:{match.group(1)}")
+    for match in re.finditer(
+        r"\b(domain|range|regime|parameter|quantifier|convention)\b.{0,60}\b(ambiguous|unclear|not specified|not stated|not fixed|missing)\b",
+        text,
+    ):
+        reasons.append(f"explicit-{match.group(1)}-{match.group(2).replace(' ', '-')}")
+    return sorted(set(reasons))
+
+
+def _issue_has_notation_regime_terms(issue: dict[str, Any]) -> bool:
+    return bool(_notation_regime_reasons(issue))
 
 
 def _issue_has_dependency_terms(issue: dict[str, Any]) -> bool:
@@ -173,6 +235,160 @@ def _issue_has_reference_terms(issue: dict[str, Any]) -> bool:
     return bool(tags & {"circular-citation", "identity-being-proved", "reference-error", "wrong-reference"}) or any(
         term in text for term in REFERENCE_TERMS
     )
+
+
+def _candidate_text(candidate: dict[str, Any]) -> str:
+    return "\n".join(
+        str(item)
+        for item in [
+            candidate.get("issue_id"),
+            candidate.get("title"),
+            candidate.get("location"),
+            candidate.get("short_description"),
+            candidate.get("proposed_fix"),
+            " ".join(str(tag) for tag in candidate.get("tags") or []),
+        ]
+        if item
+    )
+
+
+def _candidate_has_dependency_or_reference_terms(candidate: dict[str, Any]) -> bool:
+    text = _candidate_text(candidate).lower()
+    tags = {str(tag).lower() for tag in candidate.get("tags") or []}
+    if tags & {"circular-citation", "dependency", "downstream", "identity-being-proved", "propagation", "reference-error", "wrong-reference"}:
+        return True
+    return any(term in text for term in DEPENDENCY_TERMS | REFERENCE_TERMS)
+
+
+def _explicit_issue_refs(candidate: dict[str, Any], known_issue_ids: set[str]) -> set[str]:
+    self_id = str(candidate.get("issue_id") or "")
+    refs = set(re.findall(r"\bI\d{2,5}\b", _candidate_text(candidate)))
+    return {ref for ref in refs if ref in known_issue_ids and ref != self_id}
+
+
+def _specific_feature_values(candidate: dict[str, Any]) -> dict[str, set[str]]:
+    features = candidate.get("features") or {}
+    equations = {
+        str(item).strip().lower()
+        for item in features.get("equation_refs") or []
+        if str(item).strip() and str(item).strip().lower() not in GENERIC_DEPENDENCY_FEATURES
+    }
+    theorem_refs = {
+        str(item).strip().lower()
+        for item in features.get("theorem_refs") or []
+        if str(item).strip() and str(item).strip().lower() not in GENERIC_DEPENDENCY_FEATURES
+    }
+    symbols: set[str] = set()
+    for raw in features.get("symbols") or []:
+        symbol = str(raw).strip()
+        lower = symbol.lower()
+        if not symbol or lower in GENERIC_DEPENDENCY_FEATURES:
+            continue
+        if re.fullmatch(r"[A-Z]\s*\([A-Za-z0-9_*+\-/,\s]{1,24}\)", symbol) and lower not in {"s(n,k)"}:
+            symbols.add(lower)
+        elif re.search(r"\b[A-Z]\.\d+\b", symbol):
+            symbols.add(lower)
+    return {
+        "equation_refs": equations,
+        "theorem_refs": theorem_refs,
+        "symbols": symbols,
+    }
+
+
+def _strict_dependency_groups(candidates: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    known_issue_ids = {str(candidate.get("issue_id") or "") for candidate in candidates if candidate.get("issue_id")}
+    by_id = {str(candidate.get("issue_id")): candidate for candidate in candidates if candidate.get("issue_id")}
+    group_sets: dict[tuple[str, ...], dict[str, Any]] = {}
+    links: list[dict[str, Any]] = []
+
+    def add_group(members: list[dict[str, Any]], reason: str, feature: str, link_kind: str) -> None:
+        member_ids = tuple(sorted(str(member.get("issue_id") or "") for member in members if member.get("issue_id")))
+        if len(member_ids) < 2:
+            return
+        payload = group_sets.setdefault(member_ids, {"members": [by_id[item] for item in member_ids], "reasons": set(), "features": set(), "links": []})
+        payload["reasons"].add(reason)
+        payload["features"].add(feature)
+        for left_index, left_id in enumerate(member_ids):
+            for right_id in member_ids[left_index + 1 :]:
+                payload["links"].append(
+                    {
+                        "left_issue_id": left_id,
+                        "right_issue_id": right_id,
+                        "shared_features": {link_kind: [feature]},
+                        "reasons": [reason],
+                    }
+                )
+
+    for candidate in candidates:
+        for ref in _explicit_issue_refs(candidate, known_issue_ids):
+            add_group(
+                [candidate, by_id[ref]],
+                "explicit issue-id reference",
+                ref,
+                "issue_refs",
+            )
+
+    keyed: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        features = _specific_feature_values(candidate)
+        for kind, values in features.items():
+            for value in values:
+                keyed.setdefault((kind, value), []).append(candidate)
+
+    for (kind, value), members in sorted(keyed.items()):
+        unique_members = {str(member.get("issue_id") or ""): member for member in members if member.get("issue_id")}
+        if len(unique_members) < 2:
+            continue
+        member_list = list(unique_members.values())
+        if not any(_candidate_has_dependency_or_reference_terms(member) for member in member_list):
+            continue
+        if kind == "theorem_refs" and not all(_candidate_has_dependency_or_reference_terms(member) for member in member_list):
+            continue
+        reason = {
+            "equation_refs": "shared specific equation/reference label with dependency/reference wording",
+            "theorem_refs": "shared theorem-like label with dependency/reference wording",
+            "symbols": "shared distinctive symbol with dependency/reference wording",
+        }.get(kind, "shared specific feature with dependency/reference wording")
+        add_group(member_list, reason, value, kind)
+
+    groups: list[dict[str, Any]] = []
+    for member_ids, payload in sorted(group_sets.items(), key=lambda item: (min((by_id[issue_id].get("chunk_index") or 0) for issue_id in item[0]), item[0])):
+        members = list(payload["members"])
+        members.sort(key=lambda item: (item.get("chunk_index") or 0, item.get("issue_id") or ""))
+        upstream = next((item for item in members if not _candidate_has_dependency_or_reference_terms(item)), members[0])
+        group_id = f"G{len(groups) + 1:03d}"
+        member_payload = []
+        for member in members:
+            if member["issue_id"] == upstream["issue_id"]:
+                role = "candidate_upstream"
+            elif _candidate_has_dependency_or_reference_terms(member):
+                role = "possible_downstream"
+            else:
+                role = "related_same_topic"
+            member["group_ids"].append(group_id)
+            member["group_role"] = role
+            member_payload.append(
+                {
+                    "issue_id": member["issue_id"],
+                    "chunk_id": member["chunk_id"],
+                    "severity": member["severity"],
+                    "role": role,
+                    "title": member["title"],
+                }
+            )
+        groups.append(
+            {
+                "group_id": group_id,
+                "upstream_issue_id": upstream["issue_id"],
+                "classification": "tentative_dependency_group_strict",
+                "members": member_payload,
+                "link_reasons": sorted(payload["reasons"]),
+                "shared_features": sorted(payload["features"]),
+                "links": payload["links"],
+            }
+        )
+        links.extend(payload["links"])
+    return groups, links
 
 
 def _issue_selection_reasons(issue: dict[str, Any], include_medium: bool) -> list[str]:
@@ -273,7 +489,10 @@ def _verification_failure_candidates(results: list[dict[str, Any]]) -> list[dict
             {
                 "candidate_id": "",
                 "category": "verification_failure",
+                "secondary_categories": [],
+                "secondary_reasons": [],
                 "item_type": "verification_script",
+                "recommended_action_kind": "script_recheck",
                 "source_ids": [item for item in [script_name, chunk_id, str(result.get("result_path") or "")] if item],
                 "trigger_reason": f"verification result status is {status}",
                 "recommended_action": "Recheck the verification script and the mathematical claim first; rerun the chunk only if the script or audit output needs regeneration.",
@@ -306,6 +525,7 @@ def _issue_candidate_payload(
     recommended_action: str,
     trigger_reason: str,
     priority: str,
+    recommended_action_kind: str,
     estimated_cost_band: str = "low",
 ) -> dict[str, Any]:
     issue_id = str(issue_candidate.get("issue_id") or "")
@@ -313,7 +533,10 @@ def _issue_candidate_payload(
     return {
         "candidate_id": "",
         "category": category,
+        "secondary_categories": [],
+        "secondary_reasons": [],
         "item_type": "issue",
+        "recommended_action_kind": recommended_action_kind,
         "source_ids": [item for item in [issue_id, chunk_id] if item],
         "trigger_reason": trigger_reason,
         "recommended_action": recommended_action,
@@ -361,6 +584,7 @@ def _prepare_issue_candidates(
 
     for issue in issues:
         reasons = _issue_selection_reasons(issue, include_medium=include_medium)
+        notation_reasons = _notation_regime_reasons(issue)
         if reasons:
             candidate = _candidate_from_issue(issue, chunks_by_id, verification_by_chunk, reasons)
             candidate["evidence"] = _build_evidence(
@@ -380,26 +604,41 @@ def _prepare_issue_candidates(
                     "Run an issue-level recheck with source chunk, nearby/later context, ledger notes, and verification references; do not rerun the whole chunk by default.",
                     "; ".join(reasons),
                     priority,
+                    "issue_recheck",
                     estimated_cost_band="low",
                 )
             )
-            if _issue_has_notation_regime_terms(issue):
-                notation_candidates.append(
-                    _issue_candidate_payload(
-                        "notation_regime_clarification",
-                        candidate,
-                        "Re-evaluate the issue against later notation/regime/domain context; rerun chunks only if many outputs depend on the clarification.",
-                        "issue wording/tags indicate notation, regime, domain, range, or assumption clarification",
-                        "medium",
-                        estimated_cost_band="low",
-                    )
+            if notation_reasons:
+                recheck_candidates[-1]["secondary_categories"].append("notation_regime_clarification")
+                recheck_candidates[-1]["secondary_reasons"].extend(notation_reasons)
+                recheck_candidates[-1]["evidence_summary"]["secondary_reasons"] = notation_reasons
+        elif notation_reasons:
+            candidate = _candidate_from_issue(issue, chunks_by_id, verification_by_chunk, notation_reasons)
+            candidate["evidence"] = _build_evidence(
+                candidate,
+                issues,
+                chunks_by_id,
+                structured_by_chunk,
+                ledger_items,
+                max_context_chars=max_context_chars,
+            )
+            notation_candidates.append(
+                _issue_candidate_payload(
+                    "notation_regime_clarification",
+                    candidate,
+                    "Use human/issue-level review against later notation, regime, domain, or quantifier context; do not rerun a chunk unless the review shows regenerated output is needed.",
+                    "explicit notation/regime ambiguity: " + ", ".join(notation_reasons),
+                    "medium",
+                    "issue_recheck",
+                    estimated_cost_band="low",
                 )
+            )
 
         group_reasons = _group_selection_reasons(issue)
         if group_reasons:
             group_pool.append(_candidate_from_issue(issue, chunks_by_id, verification_by_chunk, group_reasons))
 
-    groups, links = _build_groups(group_pool)
+    groups, links = _strict_dependency_groups(group_pool)
     dependency_candidates = []
     for group in groups:
         members = group.get("members") or []
@@ -410,7 +649,10 @@ def _prepare_issue_candidates(
             {
                 "candidate_id": "",
                 "category": "dependency_propagation",
+                "secondary_categories": [],
+                "secondary_reasons": [],
                 "item_type": "dependency_group",
+                "recommended_action_kind": "dependency_group_review",
                 "source_ids": source_ids,
                 "trigger_reason": "tentative dependency/downstream group from shared labels, symbols, or dependency wording",
                 "recommended_action": "Inspect whether downstream issues should be grouped under an upstream cause or rechecked issue-by-issue; do not suppress issues automatically.",
@@ -487,7 +729,10 @@ def _technical_failure_candidates(workdir: Path, chunks_by_id: dict[str, dict[st
                 {
                     "candidate_id": "",
                     "category": "technical_failure_recovery",
+                    "secondary_categories": [],
+                    "secondary_reasons": [],
                     "item_type": "technical_failure",
+                    "recommended_action_kind": "technical_retry",
                     "source_ids": [item for item in [chunk_id, response_id, name] if item],
                     "trigger_reason": f"{name}: {code}",
                     "recommended_action": "Use technical chunk retry/rerun recovery; this is regeneration of a valid chunk audit, not mathematical re-evaluation.",
@@ -535,7 +780,10 @@ def _technical_failure_candidates(workdir: Path, chunks_by_id: dict[str, dict[st
             {
                 "candidate_id": "",
                 "category": "technical_failure_recovery",
+                "secondary_categories": [],
+                "secondary_reasons": [],
                 "item_type": "technical_failure",
+                "recommended_action_kind": "technical_retry",
                 "source_ids": [item for item in [chunk_id, response_id, path.name] if item],
                 "trigger_reason": f"failure response sidecar: {code}",
                 "recommended_action": "Use technical chunk retry/rerun recovery; this is regeneration of a valid chunk audit, not mathematical re-evaluation.",
@@ -568,28 +816,66 @@ def _category_definitions() -> dict[str, dict[str, str]]:
     return {
         "verification_failure": {
             "item_type": "verification_script",
+            "recommended_action_kind": "script_recheck",
             "recommended_action": "recheck script/claim first; rerun chunk only if needed",
         },
         "high_critical_issue_recheck": {
             "item_type": "issue",
+            "recommended_action_kind": "issue_recheck",
             "recommended_action": "issue-level recheck, not full chunk rerun by default",
         },
         "dependency_propagation": {
             "item_type": "dependency_group",
+            "recommended_action_kind": "dependency_group_review",
             "recommended_action": "group downstream consequences under upstream causes or recheck issue-level links",
         },
         "notation_regime_clarification": {
             "item_type": "issue",
+            "recommended_action_kind": "issue_recheck",
             "recommended_action": "recheck against later notation/regime/domain context",
         },
         "technical_failure_recovery": {
             "item_type": "technical_failure",
+            "recommended_action_kind": "technical_retry",
             "recommended_action": "full chunk retry/rerun only to regenerate valid output",
         },
         "manual_user_selected": {
             "item_type": "chunk",
+            "recommended_action_kind": "chunk_rerun",
             "recommended_action": "placeholder for explicit user-selected low-level chunk reruns",
         },
+    }
+
+
+def _secondary_category_counts(candidates: list[dict[str, Any]]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for candidate in candidates:
+        for category in candidate.get("secondary_categories") or []:
+            counts[str(category)] += 1
+    for category in _category_definitions():
+        counts.setdefault(category, 0)
+    return dict(counts)
+
+
+def _action_kind_counts(candidates: list[dict[str, Any]]) -> dict[str, int]:
+    counts = Counter(str(candidate.get("recommended_action_kind") or "human_review") for candidate in candidates)
+    for action_kind in ACTION_KIND_LABELS:
+        counts.setdefault(action_kind, 0)
+    return dict(counts)
+
+
+def _candidate_type_summary(candidates: list[dict[str, Any]]) -> dict[str, int]:
+    action_counts = _action_kind_counts(candidates)
+    secondary_counts = _secondary_category_counts(candidates)
+    category_counts = Counter(str(candidate.get("category") or "unknown") for candidate in candidates)
+    return {
+        "full_chunk_rerun_candidates": action_counts.get("chunk_rerun", 0),
+        "issue_level_recheck_candidates": action_counts.get("issue_recheck", 0),
+        "dependency_grouping_candidates": action_counts.get("dependency_group_review", 0),
+        "verification_script_claim_recheck_candidates": action_counts.get("script_recheck", 0),
+        "technical_recovery_candidates": action_counts.get("technical_retry", 0),
+        "notation_regime_clarification_candidates": category_counts.get("notation_regime_clarification", 0)
+        + secondary_counts.get("notation_regime_clarification", 0),
     }
 
 
@@ -599,16 +885,46 @@ def _markdown_report(manifest: dict[str, Any]) -> str:
         "",
         "This deterministic preparation pass does not call the API, run verification, rerun chunks, close issues, or mutate audit state.",
         "",
+        "Candidate for review/recheck does not imply full chunk rerun.",
+        "",
         "## Summary",
         f"- Source audit: {manifest['audit_workdir']}",
         f"- Candidates: {len(manifest.get('candidates') or [])}",
         f"- Groups: {len(manifest.get('groups') or [])}",
         f"- Source unmodified by script: {manifest.get('source_unmodified_by_script')}",
         "",
-        "## Category Counts",
+        "## Candidate Type Summary",
     ]
+    type_summary = manifest.get("candidate_type_summary") or {}
+    for key, label in [
+        ("full_chunk_rerun_candidates", "Full chunk rerun candidates"),
+        ("issue_level_recheck_candidates", "Issue-level recheck candidates"),
+        ("dependency_grouping_candidates", "Dependency grouping candidates"),
+        ("verification_script_claim_recheck_candidates", "Verification script/claim recheck candidates"),
+        ("technical_recovery_candidates", "Technical recovery candidates"),
+        ("notation_regime_clarification_candidates", "Notation/regime clarification candidates"),
+    ]:
+        lines.append(f"- {label}: {type_summary.get(key, 0)}")
+
+    lines.extend([
+        "",
+        "## Recommended Action Kind Counts",
+    ])
+    action_counts = manifest.get("recommended_action_kind_counts") or {}
+    for action_kind, label in ACTION_KIND_LABELS.items():
+        lines.append(f"- {label}: {action_counts.get(action_kind, 0)}")
+
+    lines.extend([
+        "",
+        "## Category Counts",
+    ])
     for category in _category_definitions():
         lines.append(f"- {category}: {manifest.get('category_counts', {}).get(category, 0)}")
+    secondary_counts = manifest.get("secondary_category_counts") or {}
+    if any(secondary_counts.get(category, 0) for category in _category_definitions()):
+        lines.extend(["", "## Secondary Category Counts"])
+        for category in _category_definitions():
+            lines.append(f"- {category}: {secondary_counts.get(category, 0)}")
 
     lines.extend(["", "## Dependency Groups"])
     groups = manifest.get("groups") or []
@@ -632,7 +948,10 @@ def _markdown_report(manifest: dict[str, Any]) -> str:
     for candidate in candidates:
         lines.append("")
         lines.append(f"### {candidate.get('candidate_id')} — {candidate.get('category')} [{candidate.get('priority')}]")
+        lines.append(f"- Recommended action kind: {candidate.get('recommended_action_kind')}")
         lines.append(f"- Item type: {candidate.get('item_type')}")
+        if candidate.get("secondary_categories"):
+            lines.append(f"- Secondary categories: {', '.join(str(item) for item in candidate.get('secondary_categories') or [])}")
         lines.append(f"- Source ids: {', '.join(str(item) for item in candidate.get('source_ids') or []) or 'none'}")
         lines.append(f"- Trigger: {candidate.get('trigger_reason')}")
         lines.append(f"- Recommended action: {candidate.get('recommended_action')}")
@@ -714,6 +1033,9 @@ def prepare_rerun_recheck_candidates(
     category_counts = dict(Counter(str(candidate.get("category") or "unknown") for candidate in candidates))
     for category in _category_definitions():
         category_counts.setdefault(category, 0)
+    secondary_category_counts = _secondary_category_counts(candidates)
+    recommended_action_kind_counts = _action_kind_counts(candidates)
+    candidate_type_summary = _candidate_type_summary(candidates)
 
     source_paths = [
         issues_path,
@@ -748,6 +1070,9 @@ def prepare_rerun_recheck_candidates(
             "note": "Candidates are triage suggestions only; all audit/model issues remain provisional until reviewed.",
         },
         "category_counts": category_counts,
+        "secondary_category_counts": secondary_category_counts,
+        "recommended_action_kind_counts": recommended_action_kind_counts,
+        "candidate_type_summary": candidate_type_summary,
         "candidate_count": len(candidates),
         "group_count": len(groups),
         "candidates": candidates,
@@ -792,6 +1117,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Output dir: {manifest['output_dir']}")
     print(f"  Candidates: {manifest['candidate_count']}")
     print(f"  Groups: {manifest['group_count']}")
+    for key, label in [
+        ("full_chunk_rerun_candidates", "Full chunk rerun candidates"),
+        ("issue_level_recheck_candidates", "Issue-level recheck candidates"),
+        ("dependency_grouping_candidates", "Dependency grouping candidates"),
+        ("verification_script_claim_recheck_candidates", "Verification script/claim recheck candidates"),
+        ("technical_recovery_candidates", "Technical recovery candidates"),
+        ("notation_regime_clarification_candidates", "Notation/regime clarification candidates"),
+    ]:
+        print(f"  {label}: {manifest['candidate_type_summary'].get(key, 0)}")
     for category in _category_definitions():
         print(f"  {category}: {manifest['category_counts'].get(category, 0)}")
     print(f"  Source unmodified by script: {manifest['source_unmodified_by_script']}")
