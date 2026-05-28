@@ -63,6 +63,7 @@ from scripts.prepare_context_mode_comparison import prepare_context_mode_compari
 from scripts.prepare_issue_recheck_candidates import prepare_issue_recheck_candidates
 from scripts.prepare_issue_recheck_families import prepare_issue_recheck_families
 from scripts.prepare_rerun_recheck_candidates import prepare_rerun_recheck_candidates
+from scripts.run_issue_family_recheck import run_issue_family_recheck
 from scripts.run_context_mode_ab_test import run_context_mode_ab_test
 
 
@@ -2508,6 +2509,166 @@ def test_prepare_issue_recheck_families_script() -> None:
             raise RegressionFailure("Issue family script allowed output inside source audit workdir")
 
 
+def test_run_issue_family_recheck_dry_run() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_family_recheck_regression_") as tmp:
+        root = Path(tmp)
+        source = root / "source_audit"
+        output = root / "family_recheck_out"
+        family_json = root / "families.json"
+        _seed_state(source)
+        session = _synthetic_session(source)
+        session["model"] = "gpt-5.5"
+        session["reasoning_effort"] = "xhigh"
+        session["tex_path"] = str(root / "paper.tex")
+        _write_json(session_paths(source)["session"], session)
+        _write_text(
+            root / "paper.tex",
+            r"""
+\section{Finite differences}
+\begin{equation}\label{E:finite-diff-k}
+  \Delta^k f(0)=\sum_j (-1)^j \binom{k}{j} f(k-j).
+\end{equation}
+\begin{equation}\label{E:Leibniz}
+  \Delta^k(fg)(0)=\sum_j \binom{k}{j}\Delta^j f(0)\Delta^{k-j}g(j).
+\end{equation}
+\begin{equation}\label{E:fg}
+  e^{nx/k}(1-x/k)^n.
+\end{equation}
+\begin{prop}[Identity]\label{P:st2-lbnz-prop}
+\begin{align}\label{E:st2-lbnz}
+  S(n,k)=\sum_j \Lambda_j D_{n,k}(j).
+\end{align}
+By equation \eqref{E:st2-lbnz} and equation \eqref{E:Leibniz} applied to \eqref{E:fg}, we obtain the identity.
+\end{prop}
+\begin{thm}\label{T:finite-diff-exp}
+The identity \eqref{E:st2-lbnz} yields an expansion.
+\end{thm}
+""",
+        )
+        _write_text(
+            root / "paper.aux",
+            "\n".join(
+                [
+                    r"\newlabel{E:finite-diff-k}{{29}{11}{A finite difference expansion}{equation.29}{}}",
+                    r"\newlabel{E:Leibniz}{{31}{11}{Leibniz's formula}{equation.31}{}}",
+                    r"\newlabel{E:fg}{{30}{11}{A finite difference expansion}{equation.30}{}}",
+                    r"\newlabel{P:st2-lbnz-prop}{{4.1}{12}{Identity}{prop.4.1}{}}",
+                    r"\newlabel{E:st2-lbnz}{{34}{12}{Identity}{equation.34}{}}",
+                    r"\newlabel{T:finite-diff-exp}{{4.1}{12}{}{thm.4.1}{}}",
+                ]
+            ),
+        )
+        _write_json(
+            session_paths(source)["manifest"],
+            {
+                "chunks": [
+                    {"chunk_id": "chunk_026", "chunk_index": 26, "label": "Proposition 4.1", "page_start": 12, "page_end": 13},
+                    {"chunk_id": "chunk_033", "chunk_index": 33, "label": "Theorem 4.1", "page_start": 14, "page_end": 15},
+                ]
+            },
+        )
+        issues = [
+            {
+                "issue_id": "I057",
+                "severity": "high",
+                "status": "open",
+                "chunk_id": "chunk_026",
+                "title": "The proof cites equation (34), the identity being proved",
+                "location": "Proposition 4.1",
+                "description": "The proof cites equation (34) while proving equation (34).",
+                "evidence": "Use finite-difference representation and Leibniz rule instead.",
+                "proposed_fix": "Cite equations (29), (31), and the factorization.",
+                "tags": ["circular-citation"],
+            },
+            {
+                "issue_id": "I071",
+                "severity": "high",
+                "status": "open",
+                "chunk_id": "chunk_033",
+                "title": "Theorem 4.1 inherits any unresolved gap in equation (34)",
+                "location": "Theorem 4.1",
+                "description": "The theorem uses equation (34).",
+                "evidence": "Downstream dependency on the identity.",
+                "proposed_fix": "Group under the upstream issue if it is real.",
+                "tags": ["dependency"],
+            },
+        ]
+        _write_json(session_paths(source)["issues"], {"issues": issues, "updated_at": NEW})
+        _write_json(session_paths(source)["ledger"], {"assumptions": ["Equation (34) supports Theorem 4.1."], "notes": ["Leibniz rule is equation (31)."], "updated_at": NEW})
+        structured_path = source / "responses" / "chunk_026.structured.json"
+        _write_json(
+            structured_path,
+            {
+                "assumptions_and_notation": ["Proposition 4.1 states equation (34)."],
+                "verified_steps": ["The local proof invokes Leibniz's formula."],
+                "ledger_updates": {"assumptions": [], "notes": ["Equation (34) is later used by Theorem 4.1."]},
+                "issues": issues[:1],
+            },
+        )
+        _append_jsonl(session_paths(source)["chunk_records"], {"chunk_id": "chunk_026", "chunk_index": 26, "time": NEW, "structured_response_path": str(structured_path)})
+        check_path = source / "python_checks" / "chunk_026_check.py"
+        _write_text(check_path, "print('synthetic check')\n")
+        result_path = source / "verification_results" / "chunk_026_check.result.json"
+        _write_json(result_path, {"chunk_id": "chunk_026", "status": "passed", "stdout": "ok"})
+        family_payload = {
+            "schema_version": "1.0",
+            "families": [
+                {
+                    "family_id": "F004",
+                    "title": "Equation (34) / Theorem 4.1 dependency chain",
+                    "primary_upstream_issue_ids": ["I057"],
+                    "downstream_issue_ids": ["I071"],
+                    "related_issue_ids": [],
+                    "all_issue_ids": ["I057", "I071"],
+                    "main_references": ["34", "theorem 4.1"],
+                    "main_symbols": [],
+                    "chunks": [{"chunk_id": "chunk_026"}, {"chunk_id": "chunk_033"}],
+                    "recommended_action": "group_downstream_under_upstream",
+                    "priority": "high",
+                    "review_notes": "Synthetic family.",
+                    "source_group_ids": ["G001"],
+                }
+            ],
+        }
+        _write_json(family_json, family_payload)
+        watched = [
+            session_paths(source)["session"],
+            session_paths(source)["manifest"],
+            session_paths(source)["issues"],
+            session_paths(source)["ledger"],
+            session_paths(source)["chunk_records"],
+            structured_path,
+            check_path,
+            result_path,
+            family_json,
+            root / "paper.tex",
+            root / "paper.aux",
+        ]
+        before_files = {path: path.read_text(encoding="utf-8") for path in watched}
+
+        manifest = run_issue_family_recheck(source, family_json, "F004", output)
+        _assert(manifest["dry_run"], manifest)
+        _assert(not manifest["would_call_api"], manifest)
+        _assert(manifest["source_unmodified_by_script"], manifest)
+        for name in ("family_recheck_manifest.json", "family_recheck_prompt.txt", "family_recheck_evidence.json", "family_recheck_notes.md"):
+            _assert((output / name).exists(), f"missing {name}")
+        for name in ("family_recheck_raw_response.json", "family_recheck_raw_response.txt", "family_recheck_result.json", "family_recheck_result.md", "usage_cost.json"):
+            _assert(not (output / name).exists(), f"dry-run wrote live artifact {name}")
+        evidence = json.loads((output / "family_recheck_evidence.json").read_text(encoding="utf-8"))
+        prompt = (output / "family_recheck_prompt.txt").read_text(encoding="utf-8")
+        _assert({"I057", "I071"} <= {item["issue_id"] for item in evidence["issues"]["all"]}, evidence)
+        _assert(any("E:st2-lbnz" in item.get("excerpt", "") for item in evidence["tex_excerpts"]), evidence["tex_excerpts"])
+        _assert("Treat all prior audit issues as provisional findings" in prompt, prompt)
+        for path, text in before_files.items():
+            _assert(path.read_text(encoding="utf-8") == text, f"source file changed: {path}")
+        try:
+            run_issue_family_recheck(source, family_json, "F004", source / "nested_output")
+        except RuntimeError as exc:
+            _assert("inside the source audit workdir" in str(exc), str(exc))
+        else:
+            raise RegressionFailure("Issue family recheck allowed output inside source audit workdir")
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -2546,6 +2707,7 @@ def main() -> int:
         ("issue recheck candidate script", test_prepare_issue_recheck_candidates_script),
         ("rerun/recheck candidate inventory script", test_prepare_rerun_recheck_candidates_script),
         ("issue recheck family consolidation script", test_prepare_issue_recheck_families_script),
+        ("issue family recheck dry-run script", test_run_issue_family_recheck_dry_run),
     ]
     results = [_run_case(name, func) for name, func in cases]
 
