@@ -61,6 +61,7 @@ from gui_controller import (
 )
 from scripts.prepare_context_mode_comparison import prepare_context_mode_comparison
 from scripts.prepare_issue_recheck_candidates import prepare_issue_recheck_candidates
+from scripts.prepare_issue_recheck_families import prepare_issue_recheck_families
 from scripts.prepare_rerun_recheck_candidates import prepare_rerun_recheck_candidates
 from scripts.run_context_mode_ab_test import run_context_mode_ab_test
 
@@ -2379,6 +2380,134 @@ def test_prepare_rerun_recheck_candidates_script() -> None:
             raise RegressionFailure("Rerun/recheck script allowed output inside source audit workdir")
 
 
+def test_prepare_issue_recheck_families_script() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_issue_families_regression_") as tmp:
+        root = Path(tmp)
+        source = root / "source_audit"
+        output = root / "families_out"
+        candidates_path = root / "candidates.json"
+        _seed_state(source)
+
+        issue_specs = [
+            ("I057", "medium", "chunk_026", "Proof cites equation (34), the identity being proved"),
+            ("I062", "high", "chunk_028", "Asymptotic uniformity of the $O$-term is not stated"),
+            ("I071", "high", "chunk_033", "Theorem 4.1 inherits any unresolved gap in the proof of equation (34)"),
+            ("I099", "high", "chunk_047", "The proof is conditional on Theorem 4.1 and inherits equation (34)"),
+            ("I137", "high", "chunk_060", "Second displayed correction in equation (63) is missing a coefficient"),
+            ("I138", "high", "chunk_060", "The coefficient-sum $O$ estimates after equations (63) and (64) conflict"),
+            ("I166", "high", "chunk_066", "Later numerical comparison inherits unresolved equation (63) and equation (82) questions"),
+            ("I186", "high", "chunk_072", "Appendix B use inherits equation (64) coefficient uncertainty"),
+            ("I157", "high", "chunk_064", "Equation (82) mixes the approximate tree-defined parameter"),
+            ("I162", "high", "chunk_065", "Equation (83) expansion does not match the stated approximation"),
+            ("I171", "high", "chunk_067", "Figure comparison depends on equations (82) and (83)"),
+            ("I203", "high", "chunk_079", "Proposition D.2 depends on unverified Appendix D hypotheses"),
+            ("I204", "high", "chunk_079", "Proposition D.2 proof omits a dependency condition"),
+            ("I209", "high", "chunk_080", "Theorem D.1 depends on Proposition D.2"),
+            ("I210", "high", "chunk_080", "Equation D.4 consequence depends on Theorem D.1"),
+            ("I300", "high", "chunk_055", "Uniform asymptotic estimate needs a sharper error bound"),
+        ]
+        chunks = [
+            {"chunk_id": f"chunk_{idx:03d}", "chunk_index": idx, "label": f"Chunk {idx}", "page_start": idx, "page_end": idx}
+            for idx in {26, 28, 33, 47, 55, 60, 64, 65, 66, 67, 72, 79, 80}
+        ]
+        _write_json(session_paths(source)["manifest"], {"chunks": chunks})
+        _write_json(
+            session_paths(source)["issues"],
+            {
+                "issues": [
+                    {
+                        "issue_id": issue_id,
+                        "severity": severity,
+                        "status": "open",
+                        "chunk_id": chunk_id,
+                        "title": title,
+                        "description": title,
+                        "evidence": title,
+                        "proposed_fix": "Review the dependency family.",
+                        "tags": ["dependency"] if issue_id != "I300" else ["uniformity", "asymptotics"],
+                    }
+                    for issue_id, severity, chunk_id, title in issue_specs
+                ]
+            },
+        )
+
+        def issue_candidate(issue_id: str, severity: str, chunk_id: str, title: str) -> dict[str, Any]:
+            return {
+                "candidate_id": f"RR-{issue_id}",
+                "category": "high_critical_issue_recheck",
+                "item_type": "issue",
+                "recommended_action_kind": "issue_recheck",
+                "source_ids": [issue_id, chunk_id],
+                "context_refs": {"issue_id": issue_id, "chunk_id": chunk_id},
+                "evidence_summary": {"severity": severity, "title": title},
+            }
+
+        def dep_group(group_id: str, ids: list[str], shared: list[str], upstream: str) -> dict[str, Any]:
+            members = []
+            for issue_id in ids:
+                spec = next(item for item in issue_specs if item[0] == issue_id)
+                members.append(
+                    {
+                        "issue_id": issue_id,
+                        "chunk_id": spec[2],
+                        "severity": spec[1],
+                        "role": "candidate_upstream" if issue_id == upstream else "possible_downstream",
+                        "title": spec[3],
+                    }
+                )
+            return {
+                "group_id": group_id,
+                "upstream_issue_id": upstream,
+                "classification": "synthetic",
+                "members": members,
+                "shared_features": shared,
+                "link_reasons": ["synthetic dependency"],
+            }
+
+        candidates_manifest = {
+            "schema_version": "1.0",
+            "audit_workdir": str(source),
+            "candidates": [issue_candidate(*item) for item in issue_specs],
+            "groups": [
+                dep_group("G001", ["I057", "I071", "I099"], ["34"], "I057"),
+                dep_group("G002", ["I062", "I071", "I099"], ["theorem 4.1"], "I062"),
+                dep_group("G003", ["I137", "I138", "I166"], ["63"], "I137"),
+                dep_group("G004", ["I138", "I166", "I186"], ["64"], "I138"),
+                dep_group("G005", ["I157", "I166", "I171"], ["82"], "I157"),
+                dep_group("G006", ["I162", "I171"], ["83"], "I162"),
+                dep_group("G007", ["I203", "I204", "I209"], ["proposition d.2"], "I203"),
+                dep_group("G008", ["I209", "I210"], ["theorem d.1"], "I209"),
+                dep_group("G009", ["I300"], ["uniform", "asymptotic"], "I300"),
+            ],
+        }
+        _write_json(candidates_path, candidates_manifest)
+        watched = [session_paths(source)["manifest"], session_paths(source)["issues"], candidates_path]
+        before_files = {path: path.read_text(encoding="utf-8") for path in watched}
+
+        manifest = prepare_issue_recheck_families(source, output, candidates_json=candidates_path)
+        _assert(manifest["source_unmodified_by_script"], manifest)
+        _assert((output / "issue_recheck_families.json").exists(), "JSON output missing")
+        _assert((output / "issue_recheck_families.md").exists(), "Markdown output missing")
+        families = manifest["families"]
+        family_sets = [set(family["all_issue_ids"]) for family in families]
+        _assert(any({"I057", "I062", "I071", "I099"} <= issue_ids for issue_ids in family_sets), families)
+        _assert(any({"I137", "I138", "I166", "I186"} <= issue_ids for issue_ids in family_sets), families)
+        _assert(any({"I157", "I162", "I171"} <= issue_ids for issue_ids in family_sets), families)
+        _assert(any({"I203", "I204", "I209", "I210"} <= issue_ids for issue_ids in family_sets), families)
+        _assert(not any({"I137", "I157"} <= issue_ids for issue_ids in family_sets), families)
+        _assert(not any("I300" in issue_ids and len(issue_ids) > 1 for issue_ids in family_sets), families)
+        _assert("I300" in manifest["summary"]["high_critical_issue_ids_not_assigned_to_family"], manifest["summary"])
+        _assert(any(item["issue_id"] == "I166" for item in manifest["summary"]["issues_appearing_in_multiple_families"]), manifest["summary"])
+        for path, text in before_files.items():
+            _assert(path.read_text(encoding="utf-8") == text, f"source file changed: {path}")
+        try:
+            prepare_issue_recheck_families(source, source / "nested_output", candidates_json=candidates_path)
+        except RuntimeError as exc:
+            _assert("inside the source audit workdir" in str(exc), str(exc))
+        else:
+            raise RegressionFailure("Issue family script allowed output inside source audit workdir")
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -2416,6 +2545,7 @@ def main() -> int:
         ("context mode A/B dry-run script", test_run_context_mode_ab_test_dry_run),
         ("issue recheck candidate script", test_prepare_issue_recheck_candidates_script),
         ("rerun/recheck candidate inventory script", test_prepare_rerun_recheck_candidates_script),
+        ("issue recheck family consolidation script", test_prepare_issue_recheck_families_script),
     ]
     results = [_run_case(name, func) for name, func in cases]
 
