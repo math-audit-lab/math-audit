@@ -1505,22 +1505,276 @@ def _collect_typographical_issue_entries(
 def _issue_report_entry(
     issue: dict[str, Any],
     chunk_map: dict[str, dict[str, Any]],
+    issue_recheck_overlay: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     chunk_id = str(issue.get("chunk_id") or "").strip()
     rec = chunk_map.get(chunk_id)
+    issue_id = str(issue.get("issue_id") or "")
     return {
         "issue": issue,
         "chunk_record": rec,
         "location_text_md": _approx_page_location_text(rec, chunk_id, markdown=True),
         "location_text_tex": _approx_page_location_text(rec, chunk_id, markdown=False),
         "location_detail": normalize_whitespace(str(issue.get("location", "") or "")),
+        "recheck": (issue_recheck_overlay or {}).get("issue_recommendations", {}).get(issue_id, {}),
     }
+
+
+def _issue_recheck_sidecar_path(session: dict[str, Any]) -> Path:
+    return Path(session["workdir"]) / "state" / "issue_rechecks.json"
+
+
+def _issue_recheck_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item or "").strip()]
+
+
+def _issue_recheck_record_for(issue_map: dict[str, dict[str, Any]], issue_id: Any) -> dict[str, Any]:
+    issue_id = str(issue_id or "").strip()
+    if not issue_id:
+        return {}
+    return issue_map.setdefault(
+        issue_id,
+        {
+            "issue_id": issue_id,
+            "family_ids": [],
+            "upstream_family_ids": [],
+            "downstream_family_ids": [],
+            "grouped_under_issue_ids": [],
+            "grouped_downstream_issue_ids": [],
+        },
+    )
+
+
+def _append_unique(target: list[str], values: Any) -> None:
+    if isinstance(values, str):
+        values = [values]
+    for value in values or []:
+        text = str(value or "").strip()
+        if text and text not in target:
+            target.append(text)
+
+
+def _status_text_marks_downstream(value: Any) -> bool:
+    text = normalize_whitespace(str(value or "")).lower().replace("_", "-")
+    return "downstream-covered" in text or "downstream covered" in text or "low/downstream" in text
+
+
+def _status_text_marks_human_review(value: Any) -> bool:
+    text = normalize_whitespace(str(value or "")).lower().replace("_", "-")
+    return "human-review" in text or "human review" in text or "needs human" in text
+
+
+def _build_issue_recheck_overlay(session: dict[str, Any]) -> dict[str, Any]:
+    sidecar_path = _issue_recheck_sidecar_path(session)
+    overlay: dict[str, Any] = {
+        "recheck_applied": False,
+        "sidecar_path": str(sidecar_path),
+        "families": [],
+        "issue_recommendations": {},
+        "grouped_downstream_issues": {},
+        "issue_recheck_summary": {
+            "accepted_recheck_count": 0,
+            "family_count": 0,
+            "issue_count": 0,
+            "downstream_covered_issue_count": 0,
+            "human_review_issue_count": 0,
+        },
+        "warnings": [],
+    }
+    if not sidecar_path.exists():
+        return overlay
+    try:
+        payload = load_json(sidecar_path)
+    except Exception as exc:
+        overlay["warnings"].append(f"Could not load issue recheck sidecar: {exc}")
+        return overlay
+    if not isinstance(payload, dict):
+        overlay["warnings"].append("Issue recheck sidecar is not a JSON object.")
+        return overlay
+    rechecks = payload.get("rechecks")
+    if not isinstance(rechecks, list):
+        overlay["warnings"].append("Issue recheck sidecar has no rechecks list.")
+        return overlay
+
+    records = [record for record in rechecks if isinstance(record, dict)]
+    records.sort(key=lambda record: str(record.get("accepted_at") or ""))
+    issue_map: dict[str, dict[str, Any]] = {}
+    families_seen: set[str] = set()
+    for record in records:
+        family_id = str(record.get("family_id") or "").strip()
+        if not family_id:
+            overlay["warnings"].append("Accepted issue recheck record without family_id was ignored.")
+            continue
+        accepted_at = str(record.get("accepted_at") or "")
+        family = {
+            "family_id": family_id,
+            "recheck_id": record.get("recheck_id"),
+            "accepted_at": accepted_at,
+            "verdict": record.get("verdict"),
+            "summary": record.get("summary"),
+            "final_report_treatment": record.get("final_report_treatment"),
+            "needs_human_review": bool(record.get("needs_human_review")),
+            "upstream_issue_ids": _issue_recheck_string_list(record.get("upstream_issue_ids")),
+            "downstream_issue_ids": _issue_recheck_string_list(record.get("downstream_issue_ids")),
+            "false_positive_issue_ids": _issue_recheck_string_list(record.get("false_positive_issue_ids")),
+        }
+        overlay["families"].append(family)
+        families_seen.add(family_id)
+        for issue_id in family["upstream_issue_ids"]:
+            rec = _issue_recheck_record_for(issue_map, issue_id)
+            _append_unique(rec["family_ids"], family_id)
+            _append_unique(rec["upstream_family_ids"], family_id)
+        for issue_id in family["downstream_issue_ids"]:
+            rec = _issue_recheck_record_for(issue_map, issue_id)
+            _append_unique(rec["family_ids"], family_id)
+            _append_unique(rec["downstream_family_ids"], family_id)
+
+        for item in record.get("recommended_severity_by_issue") or []:
+            if not isinstance(item, dict):
+                continue
+            rec = _issue_recheck_record_for(issue_map, item.get("issue_id"))
+            if not rec:
+                continue
+            _append_unique(rec["family_ids"], family_id)
+            value = str(item.get("severity") or "")
+            rec["recommended_severity"] = {
+                "value": value,
+                "rationale": str(item.get("rationale") or ""),
+                "family_id": family_id,
+                "accepted_at": accepted_at,
+            }
+            if _status_text_marks_downstream(value):
+                rec["downstream_covered"] = True
+            if _status_text_marks_human_review(value):
+                rec["needs_human_review"] = True
+
+        for item in record.get("recommended_status_by_issue") or []:
+            if not isinstance(item, dict):
+                continue
+            rec = _issue_recheck_record_for(issue_map, item.get("issue_id"))
+            if not rec:
+                continue
+            _append_unique(rec["family_ids"], family_id)
+            value = str(item.get("status") or "")
+            rec["recommended_status"] = {
+                "value": value,
+                "rationale": str(item.get("rationale") or ""),
+                "family_id": family_id,
+                "accepted_at": accepted_at,
+            }
+            if _status_text_marks_downstream(value):
+                rec["downstream_covered"] = True
+            if _status_text_marks_human_review(value):
+                rec["needs_human_review"] = True
+
+        for item in record.get("grouping_recommendations") or []:
+            if not isinstance(item, dict):
+                continue
+            upstream = str(item.get("upstream_issue_id") or "").strip()
+            downstream = _issue_recheck_string_list(item.get("downstream_issue_ids"))
+            if not upstream or not downstream:
+                continue
+            overlay["grouped_downstream_issues"].setdefault(upstream, [])
+            _append_unique(overlay["grouped_downstream_issues"][upstream], downstream)
+            upstream_rec = _issue_recheck_record_for(issue_map, upstream)
+            _append_unique(upstream_rec["family_ids"], family_id)
+            _append_unique(upstream_rec["grouped_downstream_issue_ids"], downstream)
+            for issue_id in downstream:
+                rec = _issue_recheck_record_for(issue_map, issue_id)
+                _append_unique(rec["family_ids"], family_id)
+                _append_unique(rec["grouped_under_issue_ids"], upstream)
+                rec["downstream_covered"] = True
+                rec["grouping_rationale"] = str(item.get("rationale") or "")
+
+    for rec in issue_map.values():
+        if rec.get("downstream_covered"):
+            rec["report_treatment"] = "downstream-covered"
+        elif rec.get("needs_human_review"):
+            rec["report_treatment"] = "needs-human-review"
+        elif rec.get("upstream_family_ids"):
+            rec["report_treatment"] = "upstream"
+    overlay["issue_recommendations"] = issue_map
+    downstream_count = sum(1 for rec in issue_map.values() if rec.get("downstream_covered"))
+    human_count = sum(1 for rec in issue_map.values() if rec.get("needs_human_review"))
+    overlay["recheck_applied"] = bool(records and issue_map)
+    overlay["issue_recheck_summary"] = {
+        "accepted_recheck_count": len(records),
+        "family_count": len(families_seen),
+        "issue_count": len(issue_map),
+        "downstream_covered_issue_count": downstream_count,
+        "human_review_issue_count": human_count,
+    }
+    return overlay
+
+
+def _issue_recheck_is_downstream_covered(issue: dict[str, Any], overlay: Optional[dict[str, Any]]) -> bool:
+    issue_id = str(issue.get("issue_id") or "")
+    rec = (overlay or {}).get("issue_recommendations", {}).get(issue_id, {})
+    return bool(rec.get("downstream_covered"))
+
+
+def _issue_recheck_markdown_lines(issue: dict[str, Any], rec: Optional[dict[str, Any]]) -> list[str]:
+    if not rec:
+        return []
+    lines = ["- Recheck overlay: accepted advisory recheck present; canonical issue record unchanged."]
+    severity = rec.get("recommended_severity") if isinstance(rec.get("recommended_severity"), dict) else None
+    if severity:
+        lines.append(
+            f"- Rechecked severity: original `{issue.get('severity', '')}`; recommended `{normalize_math_delimiters(severity.get('value', ''))}`"
+            + (f" ({normalize_math_delimiters(severity.get('rationale', ''))})" if severity.get("rationale") else "")
+        )
+    status = rec.get("recommended_status") if isinstance(rec.get("recommended_status"), dict) else None
+    if status:
+        lines.append(
+            f"- Rechecked status/treatment: {normalize_math_delimiters(status.get('value', ''))}"
+            + (f" ({normalize_math_delimiters(status.get('rationale', ''))})" if status.get("rationale") else "")
+        )
+    grouped_under = rec.get("grouped_under_issue_ids") or []
+    if grouped_under:
+        lines.append(f"- Grouped downstream under: {', '.join(grouped_under)}")
+    grouped_downstream = rec.get("grouped_downstream_issue_ids") or []
+    if grouped_downstream:
+        lines.append(f"- Downstream-covered issues: {', '.join(grouped_downstream)}")
+    if rec.get("needs_human_review"):
+        lines.append("- Recheck warning: needs separate human review.")
+    return lines
+
+
+def _issue_recheck_tex_items(issue: dict[str, Any], rec: Optional[dict[str, Any]]) -> list[str]:
+    if not rec:
+        return []
+    render = _report_latex_paragraph_local
+    items = [r"\item Recheck overlay: accepted advisory recheck present; canonical issue record unchanged."]
+    severity = rec.get("recommended_severity") if isinstance(rec.get("recommended_severity"), dict) else None
+    if severity:
+        text = f"Rechecked severity: original {issue.get('severity', '')}; recommended {severity.get('value', '')}"
+        if severity.get("rationale"):
+            text += f" ({severity.get('rationale')})"
+        items.append(r"\item " + render(text))
+    status = rec.get("recommended_status") if isinstance(rec.get("recommended_status"), dict) else None
+    if status:
+        text = f"Rechecked status/treatment: {status.get('value', '')}"
+        if status.get("rationale"):
+            text += f" ({status.get('rationale')})"
+        items.append(r"\item " + render(text))
+    grouped_under = rec.get("grouped_under_issue_ids") or []
+    if grouped_under:
+        items.append(r"\item " + render("Grouped downstream under: " + ", ".join(grouped_under)))
+    grouped_downstream = rec.get("grouped_downstream_issue_ids") or []
+    if grouped_downstream:
+        items.append(r"\item " + render("Downstream-covered issues: " + ", ".join(grouped_downstream)))
+    if rec.get("needs_human_review"):
+        items.append(r"\item Recheck warning: needs separate human review.")
+    return items
 
 
 def _collect_notable_proof_reference_issue_entries(
     issues: list[dict[str, Any]],
     chunk_records: list[dict[str, Any]],
     excluded_issue_ids: Optional[set[str]] = None,
+    issue_recheck_overlay: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     excluded_issue_ids = excluded_issue_ids or set()
     chunk_map = _chunk_record_map(chunk_records)
@@ -1529,11 +1783,16 @@ def _collect_notable_proof_reference_issue_entries(
         issue_id = str(issue.get("issue_id") or "")
         if issue_id in excluded_issue_ids:
             continue
+        if _issue_recheck_is_downstream_covered(issue, issue_recheck_overlay):
+            continue
         if not _is_notable_proof_reference_issue(issue):
             continue
         scored.append((_notable_proof_reference_score(issue), issue))
     scored.sort(key=lambda item: (-item[0], _concise_issue_sort_key(item[1], chunk_map)))
-    return [_issue_report_entry(issue, chunk_map) for _score, issue in scored[:_NOTABLE_PROOF_REFERENCE_MAX_ISSUES]]
+    return [
+        _issue_report_entry(issue, chunk_map, issue_recheck_overlay)
+        for _score, issue in scored[:_NOTABLE_PROOF_REFERENCE_MAX_ISSUES]
+    ]
 
 
 def _typographical_errors_markdown(entries: list[dict[str, Any]]) -> str:
@@ -1806,6 +2065,7 @@ def _build_final_report_markdown_base(session: dict[str, Any], report_title: Opt
     status = load_status(session)
     manifest = load_manifest(session)
     chunk_records = _read_chunk_records(session)
+    issue_recheck_overlay = _build_issue_recheck_overlay(session)
 
     title = report_title or f"Audit report — {Path(session['pdf_path']).stem}"
     lines = [
@@ -1837,6 +2097,7 @@ def _build_final_report_markdown_base(session: dict[str, Any], report_title: Opt
         lines.append("- No open mathematical/correctness issues.")
     else:
         for issue in main_open_issues:
+            recheck_rec = issue_recheck_overlay.get("issue_recommendations", {}).get(str(issue.get("issue_id") or ""), {})
             lines.extend(
                 [
                     f"### {issue['issue_id']} — {normalize_math_delimiters(issue['title'])} [{issue['severity']}]",
@@ -1846,9 +2107,10 @@ def _build_final_report_markdown_base(session: dict[str, Any], report_title: Opt
                     f"- Evidence: {normalize_math_delimiters(issue['evidence'])}",
                     f"- Proposed fix: {normalize_math_delimiters(issue['proposed_fix'])}",
                     f"- Tags: {', '.join(issue.get('tags', [])) if issue.get('tags') else 'none'}",
-                    "",
                 ]
             )
+            lines.extend(_issue_recheck_markdown_lines(issue, recheck_rec))
+            lines.append("")
 
     lines.extend([_typographical_errors_markdown(typo_entries), ""])
 
@@ -1934,6 +2196,7 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
     status = load_status(session)
     manifest = load_manifest(session)
     chunk_records = _read_chunk_records(session)
+    issue_recheck_overlay = _build_issue_recheck_overlay(session)
 
     title = _report_latex_paragraph_local(report_title or f"Audit report -- {Path(session['pdf_path']).stem}")
     pdf_path_text = _report_latex_paragraph_local(session["pdf_path"])
@@ -2002,6 +2265,7 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
         parts.append("No open mathematical/correctness issues.\n")
     else:
         for issue in main_open_issues:
+            recheck_rec = issue_recheck_overlay.get("issue_recommendations", {}).get(str(issue.get("issue_id") or ""), {})
             title_line = _report_latex_paragraph_local(f"{issue['issue_id']} -- {issue['title']} [{issue['severity']}]")
             parts.append(r"\subsection*{" + title_line + "}" + "\n")
             parts.append(r"\begin{itemize}" + "\n")
@@ -2012,6 +2276,8 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
             parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(issue.get("proposed_fix", "")) + "\n")
             tag_text = ", ".join(issue.get("tags", [])) if issue.get("tags") else "none"
             parts.append(r"\item Tags: " + _report_latex_paragraph_local(tag_text) + "\n")
+            for item in _issue_recheck_tex_items(issue, recheck_rec):
+                parts.append(item + "\n")
             parts.append(r"\end{itemize}" + "\n")
 
     parts.append(_typographical_errors_tex(typo_entries) + "\n")
@@ -2350,6 +2616,21 @@ def _audit_summary_items(
         items.append(("Unknown severity", str(severity_summary["unknown"])))
     total_label = "Total open issues" if issue_summary_open_only else "Total issues"
     items.append((total_label, str(severity_summary["total"])))
+    recheck_overlay = _build_issue_recheck_overlay(session)
+    recheck_summary = recheck_overlay.get("issue_recheck_summary") or {}
+    if recheck_overlay.get("recheck_applied"):
+        downstream_count = int(recheck_summary.get("downstream_covered_issue_count", 0) or 0)
+        family_count = int(recheck_summary.get("family_count", 0) or 0)
+        items.append(
+            (
+                "Issue recheck overlay",
+                (
+                    f"{family_count} accepted issue-family recheck(s) applied; "
+                    f"{downstream_count} downstream-covered issue(s) are grouped in report treatment. "
+                    "Canonical issue records and severity counts are unchanged."
+                ),
+            )
+        )
 
     verification_counts = _verification_counts_for_summary(session) if include_verification_summary else None
     if verification_counts:
@@ -2877,6 +3158,7 @@ def build_final_report(
 
     md_text = build_final_report_markdown(session, report_title=report_title)
     tex_text = build_final_report_tex(session, report_title=report_title)
+    issue_recheck_overlay = _build_issue_recheck_overlay(session)
 
     reports_dir = root / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -2897,6 +3179,10 @@ def build_final_report(
         "usage": load_usage(session),
         "manifest": load_manifest(session),
         "chunk_records": _read_chunk_records(session),
+        "recheck_applied": bool(issue_recheck_overlay.get("recheck_applied")),
+        "issue_recheck_summary": issue_recheck_overlay.get("issue_recheck_summary", {}),
+        "issue_recheck_overlay": issue_recheck_overlay,
+        "grouped_downstream_issues": issue_recheck_overlay.get("grouped_downstream_issues", {}),
         "generated_at": utc_now(),
     }
     save_json(json_path, report_json)
@@ -2951,6 +3237,7 @@ def _collect_concise_report_data(
     manifest = load_manifest(session)
     chunk_records = _read_chunk_records(session)
     chunk_map = _chunk_record_map(chunk_records)
+    issue_recheck_overlay = _build_issue_recheck_overlay(session)
 
     candidate_issues = list(issues_state.get("issues", []) or [])
     if normalized_options.get("only_open_issues", True):
@@ -2963,14 +3250,16 @@ def _collect_concise_report_data(
         issue
         for issue in candidate_issues
         if _is_concise_selected_issue(issue, normalized_options) and not _is_pure_typographical_issue(issue)
+        and not _issue_recheck_is_downstream_covered(issue, issue_recheck_overlay)
     ]
     selected_issues.sort(key=lambda issue: _concise_issue_sort_key(issue, chunk_map))
-    selected_issue_entries = [_issue_report_entry(issue, chunk_map) for issue in selected_issues]
+    selected_issue_entries = [_issue_report_entry(issue, chunk_map, issue_recheck_overlay) for issue in selected_issues]
     selected_issue_ids = {str(issue.get("issue_id") or "") for issue in selected_issues}
     notable_entries = _collect_notable_proof_reference_issue_entries(
         candidate_issues,
         chunk_records,
         excluded_issue_ids=selected_issue_ids,
+        issue_recheck_overlay=issue_recheck_overlay,
     )
     notable_issues = [entry["issue"] for entry in notable_entries]
     typographical_entries = (
@@ -2995,6 +3284,7 @@ def _collect_concise_report_data(
         "notable_proof_reference_issues": notable_issues,
         "notable_proof_reference_entries": notable_entries,
         "typographical_entries": typographical_entries,
+        "issue_recheck_overlay": issue_recheck_overlay,
     }
 
 
@@ -3079,9 +3369,10 @@ def _high_priority_issues_markdown(entries: list[dict[str, Any]], options: Optio
                 f"- Evidence: {normalize_math_delimiters(issue.get('evidence', ''))}",
                 f"- Proposed fix: {normalize_math_delimiters(issue.get('proposed_fix', ''))}",
                 f"- Tags: {', '.join(issue.get('tags', [])) if issue.get('tags') else 'none'}",
-                "",
             ]
         )
+        lines.extend(_issue_recheck_markdown_lines(issue, entry.get("recheck")))
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -3111,6 +3402,7 @@ def _high_priority_issues_tex(entries: list[dict[str, Any]], options: Optional[d
         parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(issue.get("proposed_fix", "")))
         tag_text = ", ".join(issue.get("tags", [])) if issue.get("tags") else "none"
         parts.append(r"\item Tags: " + _report_latex_paragraph_local(tag_text))
+        parts.extend(_issue_recheck_tex_items(issue, entry.get("recheck")))
         parts.append(r"\end{itemize}")
     return "\n".join(parts) + "\n"
 
@@ -3130,9 +3422,10 @@ def _notable_proof_reference_issues_markdown(entries: list[dict[str, Any]]) -> s
                 f"- Evidence: {normalize_math_delimiters(issue.get('evidence', ''))}",
                 f"- Proposed fix: {normalize_math_delimiters(issue.get('proposed_fix', ''))}",
                 f"- Tags: {', '.join(issue.get('tags', [])) if issue.get('tags') else 'none'}",
-                "",
             ]
         )
+        lines.extend(_issue_recheck_markdown_lines(issue, entry.get("recheck")))
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -3160,6 +3453,7 @@ def _notable_proof_reference_issues_tex(entries: list[dict[str, Any]]) -> str:
         parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(issue.get("proposed_fix", "")))
         tag_text = ", ".join(issue.get("tags", [])) if issue.get("tags") else "none"
         parts.append(r"\item Tags: " + _report_latex_paragraph_local(tag_text))
+        parts.extend(_issue_recheck_tex_items(issue, entry.get("recheck")))
         parts.append(r"\end{itemize}")
     return "\n".join(parts) + "\n"
 
@@ -3368,6 +3662,10 @@ def build_concise_report_json(
         "notable_proof_reference_and_dependency_entries": data["notable_proof_reference_entries"],
         "typographical_errors": data["typographical_entries"],
         "reference_status": _reference_report_status(session),
+        "recheck_applied": bool(data["issue_recheck_overlay"].get("recheck_applied")),
+        "issue_recheck_summary": data["issue_recheck_overlay"].get("issue_recheck_summary", {}),
+        "issue_recheck_overlay": data["issue_recheck_overlay"],
+        "grouped_downstream_issues": data["issue_recheck_overlay"].get("grouped_downstream_issues", {}),
     }
 
 

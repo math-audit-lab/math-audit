@@ -766,6 +766,11 @@ def _report_freshness_sources(session: dict[str, Any], kind: str) -> list[dict[s
                 ("ledger state", _json_file_timestamp(paths["ledger"]), paths["ledger"]),
                 ("usage state", _json_file_timestamp(paths["usage"]), paths["usage"]),
                 (
+                    "issue recheck sidecar",
+                    _json_file_timestamp(root / "state" / "issue_rechecks.json"),
+                    root / "state" / "issue_rechecks.json",
+                ),
+                (
                     "verification state",
                     _verification_content_timestamp(session),
                     paths["verification_state"],

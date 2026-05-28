@@ -28,6 +28,8 @@ from audit_policy_hooks import (
     build_concise_report_json,
     build_concise_report_markdown,
     build_concise_report_tex,
+    build_final_report_markdown,
+    build_final_report_tex,
     build_user_message_for_chunk,
 )
 from audit_runtime import (
@@ -1526,6 +1528,151 @@ def test_concise_report_notable_incorrect_reference_issues() -> None:
         _assert("### I002 — Proof cites the identity being proved [medium]" in balanced_markdown, balanced_markdown)
 
 
+def test_issue_recheck_overlay_in_reports() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_recheck_overlay_report_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        session["reasoning_effort"] = "xhigh"
+        _write_json(session_paths(workdir)["session"], session)
+        paths = session_paths(workdir)
+        issues = [
+            {
+                "issue_id": "I057",
+                "chunk_id": "chunk_026",
+                "severity": "high",
+                "status": "open",
+                "title": "Proof cites the identity being proved",
+                "location": "Proposition 4.1",
+                "description": "The proof cites equation (34), the identity being proved.",
+                "evidence": "The cited line is the displayed identity itself.",
+                "proposed_fix": "Cite the finite-difference representation and Leibniz rule.",
+                "tags": ["circular-citation"],
+            },
+            {
+                "issue_id": "I062",
+                "chunk_id": "chunk_028",
+                "severity": "medium",
+                "status": "open",
+                "title": "Theorem 4.1 needs explicit uniformity assumptions",
+                "location": "Theorem 4.1",
+                "description": "The permitted range and O-constant dependence should be stated.",
+                "evidence": "Later uses vary k.",
+                "proposed_fix": "State the range and uniformity.",
+                "tags": ["uniformity"],
+            },
+            {
+                "issue_id": "I071",
+                "chunk_id": "chunk_033",
+                "severity": "high",
+                "status": "open",
+                "title": "Theorem 4.1 inherits equation (34) dependency",
+                "location": "Theorem 4.1",
+                "description": "The theorem depends on equation (34).",
+                "evidence": "Downstream dependency.",
+                "proposed_fix": "Group under the upstream issue.",
+                "tags": ["dependency"],
+            },
+            {
+                "issue_id": "I099",
+                "chunk_id": "chunk_047",
+                "severity": "high",
+                "status": "open",
+                "title": "Theorem 5.1 inherits Theorem 4.1 dependency",
+                "location": "Theorem 5.1",
+                "description": "The theorem uses Theorem 4.1.",
+                "evidence": "Downstream dependency.",
+                "proposed_fix": "Group under the upstream issue.",
+                "tags": ["dependency"],
+            },
+            {
+                "issue_id": "I186",
+                "chunk_id": "chunk_072",
+                "severity": "high",
+                "status": "open",
+                "title": "Coefficient comparison needs separate review",
+                "location": "Appendix B",
+                "description": "A coefficient-level concern may be independent.",
+                "evidence": "The provided family recheck did not settle it.",
+                "proposed_fix": "Review separately.",
+                "tags": ["human-review"],
+            },
+        ]
+        _write_json(paths["issues"], {"next_issue_id": 200, "issues": issues, "updated_at": NEW})
+        _write_json(
+            workdir / "state" / "issue_rechecks.json",
+            {
+                "schema_version": 1,
+                "updated_at": NEW,
+                "rechecks": [
+                    {
+                        "recheck_id": "F004_001",
+                        "family_id": "F004",
+                        "source_result_path": "/tmp/family_recheck_result.json",
+                        "source_output_dir": "/tmp/family_recheck",
+                        "accepted_at": NEW,
+                        "review_method": "llm_issue_family_recheck",
+                        "verdict": "Group downstream consequences.",
+                        "upstream_issue_ids": ["I057", "I062"],
+                        "downstream_issue_ids": ["I071", "I099"],
+                        "false_positive_issue_ids": [],
+                        "recommended_severity_by_issue": [
+                            {"issue_id": "I057", "severity": "medium", "rationale": "Repairable reference issue."},
+                            {"issue_id": "I071", "severity": "low/downstream", "rationale": "Covered by I057."},
+                            {"issue_id": "I099", "severity": "low/downstream", "rationale": "Covered by I057."},
+                            {"issue_id": "I186", "severity": "human-review/possibly separate", "rationale": "Separate coefficient review needed."},
+                        ],
+                        "recommended_status_by_issue": [
+                            {"issue_id": "I057", "status": "open-upstream", "rationale": "Main reportable issue."},
+                            {"issue_id": "I071", "status": "downstream-covered", "rationale": "Do not count independently."},
+                            {"issue_id": "I099", "status": "downstream-covered", "rationale": "Do not count independently."},
+                            {"issue_id": "I186", "status": "needs-human-review-separate", "rationale": "Not an F004 downstream consequence."},
+                        ],
+                        "grouping_recommendations": [
+                            {"upstream_issue_id": "I057", "downstream_issue_ids": ["I071", "I099"], "rationale": "Equation (34) dependency chain."}
+                        ],
+                        "final_report_treatment": "Report I057/I062; group I071/I099 downstream; review I186 separately.",
+                        "evidence_for": ["Equation (34) is the upstream reference issue."],
+                        "evidence_against": ["The algebra appears repairable."],
+                        "confidence": "medium",
+                        "needs_human_review": True,
+                        "summary": "Advisory family recheck.",
+                    }
+                ],
+            },
+        )
+
+        concise_markdown = build_concise_report_markdown(session)
+        _assert("### I057 — Proof cites the identity being proved [high]" in concise_markdown, concise_markdown)
+        _assert("### I071 — Theorem 4.1 inherits equation (34) dependency" not in concise_markdown, concise_markdown)
+        _assert("### I099 — Theorem 5.1 inherits Theorem 4.1 dependency" not in concise_markdown, concise_markdown)
+        _assert("- Downstream-covered issues: I071, I099" in concise_markdown, concise_markdown)
+        _assert("### I186 — Coefficient comparison needs separate review [high]" in concise_markdown, concise_markdown)
+        _assert("needs separate human review" in concise_markdown, concise_markdown)
+
+        full_markdown = build_final_report_markdown(session)
+        _assert("### I071 — Theorem 4.1 inherits equation (34) dependency [high]" in full_markdown, full_markdown)
+        _assert("Rechecked status/treatment: downstream-covered" in full_markdown, full_markdown)
+        _assert("canonical issue record unchanged" in full_markdown, full_markdown)
+
+        full_tex = build_final_report_tex(session)
+        _assert("I071 -- Theorem 4.1 inherits equation (34) dependency [high]" in full_tex, full_tex)
+        _assert("Rechecked status/treatment: downstream-covered" in full_tex, full_tex)
+
+        report_json = build_concise_report_json(session)
+        _assert(report_json["recheck_applied"], report_json)
+        main_ids = [issue.get("issue_id") for issue in report_json["main_issues"]]
+        _assert("I071" not in main_ids and "I099" not in main_ids, report_json["main_issues"])
+        _assert(report_json["issue_recheck_summary"]["downstream_covered_issue_count"] == 2, report_json["issue_recheck_summary"])
+        _assert(report_json["grouped_downstream_issues"]["I057"] == ["I071", "I099"], report_json["grouped_downstream_issues"])
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_no_recheck_overlay_report_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        report_json = build_concise_report_json(session)
+        _assert(not report_json["recheck_applied"], report_json)
+        _assert(report_json["issue_recheck_summary"]["accepted_recheck_count"] == 0, report_json["issue_recheck_summary"])
+
+
 def test_fresh_rerun_request_metadata() -> None:
     with tempfile.TemporaryDirectory(prefix="math_audit_fresh_rerun_") as tmp:
         workdir = Path(tmp) / "paper_audit"
@@ -2789,6 +2936,7 @@ def main() -> int:
         ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
         ("issue severity summary in audit summary", test_issue_severity_summary_in_audit_summary),
         ("concise report notable incorrect reference issues", test_concise_report_notable_incorrect_reference_issues),
+        ("issue recheck overlay in reports", test_issue_recheck_overlay_in_reports),
         ("fresh rerun request metadata", test_fresh_rerun_request_metadata),
         ("usage cache diagnostics", test_usage_cache_diagnostics),
         ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),
