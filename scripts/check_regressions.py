@@ -63,6 +63,7 @@ from scripts.prepare_context_mode_comparison import prepare_context_mode_compari
 from scripts.prepare_issue_recheck_candidates import prepare_issue_recheck_candidates
 from scripts.prepare_issue_recheck_families import prepare_issue_recheck_families
 from scripts.prepare_rerun_recheck_candidates import prepare_rerun_recheck_candidates
+from scripts.import_issue_family_recheck import import_issue_family_recheck
 from scripts.run_issue_family_recheck import RESULT_SCHEMA, run_issue_family_recheck, validate_result_schema
 from scripts.run_context_mode_ab_test import run_context_mode_ab_test
 
@@ -2679,6 +2680,86 @@ The identity \eqref{E:st2-lbnz} yields an expansion.
             raise RegressionFailure("Issue family recheck allowed output inside source audit workdir")
 
 
+def test_import_issue_family_recheck_script() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_import_family_recheck_regression_") as tmp:
+        root = Path(tmp)
+        source = root / "source_audit"
+        result_dir = root / "family_recheck_live_output"
+        result_path = result_dir / "family_recheck_result.json"
+        _seed_state(source)
+        issues_before = session_paths(source)["issues"].read_text(encoding="utf-8")
+        result = {
+            "family_id": "F004",
+            "verdict": "Group downstream issues under upstream repairable citation issue.",
+            "upstream_issue_ids": ["I057", "I062"],
+            "downstream_issue_ids": ["I071", "I099", "I183", "I191"],
+            "false_positive_issue_ids": [],
+            "recommended_severity_by_issue": [
+                {"issue_id": "I057", "severity": "medium", "rationale": "Repairable self-citation/reference issue."},
+                {"issue_id": "I071", "severity": "low/downstream", "rationale": "Covered by upstream issue."},
+            ],
+            "recommended_status_by_issue": [
+                {"issue_id": "I057", "status": "open-upstream", "rationale": "Keep as main issue."},
+                {"issue_id": "I071", "status": "downstream-covered", "rationale": "Do not count independently."},
+            ],
+            "grouping_recommendations": [
+                {"upstream_issue_id": "I057", "downstream_issue_ids": ["I071", "I099"], "rationale": "Same equation (34) dependency chain."}
+            ],
+            "final_report_treatment": "Report I057 and I062, group downstream consequences.",
+            "evidence_for": ["The proof cites equation (34) while proving it."],
+            "evidence_against": ["The algebra appears repairable after citation correction."],
+            "confidence": "medium",
+            "needs_human_review": True,
+            "summary": "Advisory result only; do not mutate canonical issue records.",
+        }
+        _write_json(result_path, result)
+        sidecar_path = source / "state" / "issue_rechecks.json"
+        log_path = source / "logs" / "issue_recheck_decisions.jsonl"
+
+        dry_run = import_issue_family_recheck(source, result_path, result_dir)
+        _assert(dry_run["dry_run"], dry_run)
+        _assert(dry_run["family_id"] == "F004", dry_run)
+        _assert("I071" in dry_run["affected_issue_ids"], dry_run)
+        _assert(not sidecar_path.exists(), "dry-run wrote issue_rechecks.json")
+        _assert(not log_path.exists(), "dry-run wrote issue_recheck_decisions.jsonl")
+        _assert(session_paths(source)["issues"].read_text(encoding="utf-8") == issues_before, "dry-run changed issues.json")
+
+        accepted = import_issue_family_recheck(source, result_path, result_dir, accept=True)
+        _assert(not accepted["dry_run"], accepted)
+        _assert(sidecar_path.exists(), "accept did not write sidecar")
+        _assert(log_path.exists(), "accept did not write decision log")
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        _assert(sidecar["schema_version"] == 1, sidecar)
+        _assert(len(sidecar["rechecks"]) == 1, sidecar)
+        _assert(sidecar["rechecks"][0]["family_id"] == "F004", sidecar)
+        _assert(sidecar["rechecks"][0]["review_method"] == "llm_issue_family_recheck", sidecar)
+        _assert(sidecar["rechecks"][0]["source_result_path"] == str(result_path.resolve()), sidecar)
+        log_rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        _assert(len(log_rows) == 1, log_rows)
+        _assert(log_rows[0]["action"] == "accepted_issue_family_recheck", log_rows)
+        _assert(log_rows[0]["canonical_issue_mutation"] is False, log_rows)
+        _assert(session_paths(source)["issues"].read_text(encoding="utf-8") == issues_before, "accept changed issues.json")
+
+        accepted_again = import_issue_family_recheck(source, result_path, result_dir, accept=True)
+        _assert(accepted_again["existing_recheck_count"] == 1, accepted_again)
+        sidecar_again = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        _assert(len(sidecar_again["rechecks"]) == 2, sidecar_again)
+        _assert(sidecar_again["rechecks"][0]["recheck_id"] != sidecar_again["rechecks"][1]["recheck_id"], sidecar_again)
+        log_rows_again = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        _assert(len(log_rows_again) == 2, log_rows_again)
+
+        invalid_result = dict(result)
+        invalid_result.pop("family_id")
+        invalid_path = result_dir / "invalid_family_recheck_result.json"
+        _write_json(invalid_path, invalid_result)
+        try:
+            import_issue_family_recheck(source, invalid_path, result_dir)
+        except RuntimeError as exc:
+            _assert("missing required fields" in str(exc), str(exc))
+        else:
+            raise RegressionFailure("Issue family recheck import accepted a result missing family_id")
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -2718,6 +2799,7 @@ def main() -> int:
         ("rerun/recheck candidate inventory script", test_prepare_rerun_recheck_candidates_script),
         ("issue recheck family consolidation script", test_prepare_issue_recheck_families_script),
         ("issue family recheck dry-run script", test_run_issue_family_recheck_dry_run),
+        ("issue family recheck import script", test_import_issue_family_recheck_script),
     ]
     results = [_run_case(name, func) for name, func in cases]
 
