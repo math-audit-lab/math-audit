@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -45,6 +46,7 @@ from audit_runtime import (
     rerun_failed_verification_chunks as runtime_rerun_failed_verification_chunks,
     rerun_selected_chunks as runtime_rerun_selected_chunks,
     resume_audit,
+    run_issue_family_recheck_live,
     run_verification_suite_and_build_report,
     set_openai_client,
     set_active_qa_thread,
@@ -751,6 +753,23 @@ class GuiController(QObject):
             clean,
         )
 
+    def run_live_family_recheck(self, family_id: str) -> None:
+        clean = str(family_id or "").strip()
+        if not clean:
+            self.log_message.emit("Select an issue family before running a live recheck.")
+            return
+        if not self._require_session():
+            return
+        if not self._require_api_key_for_live_calls():
+            return
+        self._run_backend_task(
+            "Run Live Family Recheck",
+            run_issue_family_recheck_live,
+            self._handle_live_family_recheck_result,
+            self.pdf_path,
+            clean,
+        )
+
     def import_accepted_recheck_result(self, recheck_result_path: str) -> None:
         clean = str(recheck_result_path or "").strip()
         if not clean:
@@ -1141,6 +1160,28 @@ class GuiController(QObject):
         self.report_output.emit(message)
         self._emit_current_status()
 
+    def _handle_live_family_recheck_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected live family recheck result.")
+            return
+        manifest = result.get("manifest") if isinstance(result.get("manifest"), dict) else {}
+        review_summary = result.get("review_summary") if isinstance(result.get("review_summary"), dict) else {}
+        if review_summary:
+            self.review_summary_updated.emit(dict(review_summary))
+        family_id = str(manifest.get("family_id") or "").strip()
+        output_dir = str(manifest.get("output_dir") or "").strip()
+        live_result = manifest.get("live_result") if isinstance(manifest.get("live_result"), dict) else {}
+        response_id = str(live_result.get("response_id") or "").strip()
+        message = f"Live family recheck completed for {family_id or 'selected family'}."
+        if response_id:
+            message += f"\nResponse: {response_id}"
+        if output_dir:
+            message += f"\nLive artifacts: {output_dir}"
+        message += "\nResult was not imported or applied; review it before using Import Accepted Recheck Result."
+        self.log_message.emit(message)
+        self.report_output.emit(message)
+        self._emit_current_status()
+
     def _handle_imported_recheck_result(self, result: Any) -> None:
         if not isinstance(result, dict):
             self.report_output.emit("Unexpected issue-family recheck import result.")
@@ -1313,10 +1354,13 @@ class GuiController(QObject):
         return True
 
     def _require_api_key_for_live_calls(self) -> bool:
-        if self.api_key:
+        if self.live_api_key_available():
             return True
         self.log_message.emit("Enter an API key before starting/resuming an audit or using discussion.")
         return False
+
+    def live_api_key_available(self) -> bool:
+        return bool(self.api_key or os.environ.get("OPENAI_API_KEY"))
 
     def _load_status_payload(self) -> dict[str, Any]:
         if not self.pdf_path:

@@ -683,7 +683,10 @@ def run_issue_family_recheck(
     if not allow_output_inside_audit:
         _guard_output_dir(audit_workdir, output_dir)
     if live and not os.environ.get("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY is required for --live mode.")
+        try:
+            _get_client()
+        except Exception as exc:
+            raise RuntimeError("OPENAI_API_KEY is required for --live mode.") from exc
     validate_result_schema(RESULT_SCHEMA)
 
     session = _load_session(audit_workdir)

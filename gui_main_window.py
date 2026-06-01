@@ -1012,6 +1012,9 @@ class MainWindow(QMainWindow):
         self.prepare_family_recheck_dry_run_button = QPushButton("Prepare Selected Family Recheck Dry Run")
         self.prepare_family_recheck_dry_run_button.clicked.connect(self._prepare_selected_family_recheck_dry_run)
         family_select_row.addWidget(self.prepare_family_recheck_dry_run_button)
+        self.run_live_family_recheck_button = QPushButton("Run Live Recheck for Selected Family")
+        self.run_live_family_recheck_button.clicked.connect(self._run_live_family_recheck)
+        family_select_row.addWidget(self.run_live_family_recheck_button)
         family_layout.addLayout(family_select_row)
         self.review_family_details_value = QPlainTextEdit()
         self.review_family_details_value.setReadOnly(True)
@@ -1025,17 +1028,20 @@ class MainWindow(QMainWindow):
         self.open_family_recheck_prompt_button.clicked.connect(self._open_family_recheck_prompt)
         self.open_family_recheck_evidence_button = QPushButton("Open Evidence")
         self.open_family_recheck_evidence_button.clicked.connect(self._open_family_recheck_evidence)
+        self.open_family_recheck_result_button = QPushButton("Open Result")
+        self.open_family_recheck_result_button.clicked.connect(self._open_family_recheck_result)
         self.import_accepted_recheck_button = QPushButton("Import Accepted Recheck Result...")
         self.import_accepted_recheck_button.clicked.connect(self._import_accepted_recheck_result)
         family_artifact_buttons.addWidget(self.open_family_recheck_folder_button)
         family_artifact_buttons.addWidget(self.open_family_recheck_prompt_button)
         family_artifact_buttons.addWidget(self.open_family_recheck_evidence_button)
+        family_artifact_buttons.addWidget(self.open_family_recheck_result_button)
         family_artifact_buttons.addWidget(self.import_accepted_recheck_button)
         family_artifact_buttons.addStretch(1)
         family_layout.addLayout(family_artifact_buttons)
         family_hint = QLabel(
-            "Live issue-family rechecks are not run from the GUI yet. "
-            "Dry runs only prepare prompt/evidence artifacts for review."
+            "Live issue-family rechecks require confirmation, recheck one selected family only, "
+            "and do not import/apply results automatically."
         )
         family_hint.setWordWrap(True)
         family_hint.setStyleSheet("color: #555;")
@@ -1564,6 +1570,12 @@ class MainWindow(QMainWindow):
         output_dir = str(family.get("dry_run_output_dir") or "").strip()
         if output_dir:
             lines.extend(["", f"Dry-run folder: {output_dir}"])
+        live_pattern = str(family.get("live_output_dir_pattern") or "").strip()
+        if live_pattern:
+            lines.append(f"Live output folder pattern: {live_pattern}")
+        latest_dir = str(family.get("latest_recheck_output_dir") or "").strip()
+        if latest_dir and latest_dir != output_dir:
+            lines.append(f"Latest recheck folder: {latest_dir}")
         return "\n".join(lines)
 
     def _format_review_rechecks(self, accepted: dict[str, Any]) -> str:
@@ -1744,6 +1756,9 @@ class MainWindow(QMainWindow):
         self.refresh_review_summary_button.setEnabled(session_available and not self._task_running)
         self.prepare_review_summary_button.setEnabled(session_ready)
         self.prepare_family_recheck_dry_run_button.setEnabled(session_ready and bool(self._selected_review_family_id()))
+        self.run_live_family_recheck_button.setEnabled(
+            session_ready and bool(self._selected_review_family_id()) and self.controller.live_api_key_available()
+        )
         self.import_accepted_recheck_button.setEnabled(session_ready)
         self.rerun_selected_button.setEnabled(session_ready and not pending_response)
         self.select_rerun_chunks_button.setEnabled(session_ready and bool(self._available_rerun_chunks()))
@@ -1847,13 +1862,16 @@ class MainWindow(QMainWindow):
             bool(paths.get("issue_rechecks_json") and paths["issue_rechecks_json"].is_file())
         )
         self.open_family_recheck_folder_button.setEnabled(
-            bool(family.get("dry_run_output_dir") and Path(str(family["dry_run_output_dir"])).is_dir())
+            bool(self._selected_family_recheck_path("latest_recheck_output_dir", "dry_run_output_dir", directory=True))
         )
         self.open_family_recheck_prompt_button.setEnabled(
-            bool(family.get("dry_run_prompt_path") and Path(str(family["dry_run_prompt_path"])).is_file())
+            bool(self._selected_family_recheck_path("latest_recheck_prompt_path", "dry_run_prompt_path", require_exists=True))
         )
         self.open_family_recheck_evidence_button.setEnabled(
-            bool(family.get("dry_run_evidence_path") and Path(str(family["dry_run_evidence_path"])).is_file())
+            bool(self._selected_family_recheck_path("latest_recheck_evidence_path", "dry_run_evidence_path", require_exists=True))
+        )
+        self.open_family_recheck_result_button.setEnabled(
+            bool(self._selected_family_recheck_path("latest_recheck_result_path", require_exists=True))
         )
 
     def _open_path_in_default_app(self, path: Path, description: str) -> None:
@@ -1903,33 +1921,115 @@ class MainWindow(QMainWindow):
             return
         self.controller.prepare_selected_family_recheck_dry_run(family_id)
 
-    def _selected_family_recheck_path(self, key: str) -> Optional[Path]:
+    def _review_family_prompt_size_text(self, family: dict[str, Any]) -> str:
+        for label, key in (
+            ("latest prompt artifact", "latest_recheck_prompt_path"),
+            ("dry-run prompt artifact", "dry_run_prompt_path"),
+        ):
+            path_text = str(family.get(key) or "").strip()
+            if not path_text:
+                continue
+            path = Path(path_text)
+            if not path.is_file():
+                continue
+            try:
+                chars = len(path.read_text(encoding="utf-8"))
+            except Exception:
+                return f"available from {label}, but could not read size"
+            return f"{chars:,} chars from {label}"
+        return "not available yet; prepare a dry run first for an exact prompt size"
+
+    def _run_live_family_recheck(self) -> None:
+        self._apply_api_key()
         family = self._selected_review_family()
-        value = family.get(key) if isinstance(family, dict) else None
-        if not value:
+        family_id = str(family.get("family_id") or "").strip()
+        if not family_id:
+            self._append_log("Select an issue family before running a live recheck.")
+            return
+        if not self.controller.live_api_key_available():
+            self._append_log("Enter an API key before running a live family recheck.")
+            return
+        session = (self._last_status_payload or {}).get("session") or {}
+        model = str(session.get("model") or self.controller.model or "unknown")
+        effort = str(session.get("reasoning_effort") or self.controller.reasoning_effort or "unknown")
+        upstream = ", ".join(family.get("primary_upstream_issue_ids") or []) or "none"
+        downstream = ", ".join(family.get("downstream_issue_ids") or []) or "none"
+        live_folder = str(family.get("live_output_dir_pattern") or "review/family_rechecks/<family>_live_<timestamp>")
+        prompt_size = self._review_family_prompt_size_text(family)
+        message = (
+            "Run a live issue-family recheck?\n\n"
+            "This will call the OpenAI API and may incur cost.\n\n"
+            f"Family: {family_id} - {family.get('title') or ''}\n"
+            f"Upstream issues: {upstream}\n"
+            f"Downstream issues: {downstream}\n"
+            f"Prompt size estimate: {prompt_size}\n"
+            f"Model: {model}\n"
+            f"Reasoning effort: {effort}\n"
+            f"Output folder: {live_folder}\n\n"
+            "Safety boundaries:\n"
+            "- Rechecks only this selected issue family.\n"
+            "- Does not modify state/issues.json.\n"
+            "- Does not rerun chunks.\n"
+            "- Does not run verification.\n"
+            "- Does not automatically import or accept the result."
+        )
+        reply = QMessageBox.question(
+            self,
+            "Run Live Family Recheck",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self._append_log("Live issue-family recheck cancelled.")
+            return
+        self.controller.run_live_family_recheck(family_id)
+
+    def _selected_family_recheck_path(
+        self,
+        *keys: str,
+        require_exists: bool = False,
+        directory: bool = False,
+    ) -> Optional[Path]:
+        family = self._selected_review_family()
+        if not isinstance(family, dict):
             return None
-        return Path(str(value))
+        for key in keys:
+            value = family.get(key)
+            if not value:
+                continue
+            path = Path(str(value))
+            if directory:
+                if path.is_dir():
+                    return path
+                continue
+            if require_exists:
+                if path.is_file():
+                    return path
+                continue
+            return path
+        return None
 
     def _open_family_recheck_folder(self) -> None:
-        path = self._selected_family_recheck_path("dry_run_output_dir")
+        path = self._selected_family_recheck_path("latest_recheck_output_dir", "dry_run_output_dir")
         if path is None:
             self._append_log("Select an issue family before opening its dry-run folder.")
             return
         if not path.is_dir():
-            message = "Family recheck dry-run folder does not exist yet. Click Prepare Selected Family Recheck Dry Run first."
+            message = "Family recheck folder does not exist yet. Prepare a dry run or run a live recheck first."
             self._append_log(message)
             self._append_report_output(message)
             self._refresh_review_open_buttons()
             return
-        self._open_path_in_default_app(path, "family recheck dry-run folder")
+        self._open_path_in_default_app(path, "family recheck folder")
 
     def _open_family_recheck_prompt(self) -> None:
-        path = self._selected_family_recheck_path("dry_run_prompt_path")
+        path = self._selected_family_recheck_path("latest_recheck_prompt_path", "dry_run_prompt_path")
         if path is None:
             self._append_log("Select an issue family before opening its dry-run prompt.")
             return
         if not path.is_file():
-            message = "Family recheck prompt does not exist yet. Click Prepare Selected Family Recheck Dry Run first."
+            message = "Family recheck prompt does not exist yet. Prepare a dry run or run a live recheck first."
             self._append_log(message)
             self._append_report_output(message)
             self._refresh_review_open_buttons()
@@ -1937,17 +2037,30 @@ class MainWindow(QMainWindow):
         self._open_path_in_default_app(path, "family recheck prompt")
 
     def _open_family_recheck_evidence(self) -> None:
-        path = self._selected_family_recheck_path("dry_run_evidence_path")
+        path = self._selected_family_recheck_path("latest_recheck_evidence_path", "dry_run_evidence_path")
         if path is None:
             self._append_log("Select an issue family before opening its dry-run evidence.")
             return
         if not path.is_file():
-            message = "Family recheck evidence does not exist yet. Click Prepare Selected Family Recheck Dry Run first."
+            message = "Family recheck evidence does not exist yet. Prepare a dry run or run a live recheck first."
             self._append_log(message)
             self._append_report_output(message)
             self._refresh_review_open_buttons()
             return
         self._open_path_in_default_app(path, "family recheck evidence")
+
+    def _open_family_recheck_result(self) -> None:
+        path = self._selected_family_recheck_path("latest_recheck_result_path")
+        if path is None:
+            self._append_log("Select an issue family before opening its live recheck result.")
+            return
+        if not path.is_file():
+            message = "No live family recheck result exists for the selected family yet."
+            self._append_log(message)
+            self._append_report_output(message)
+            self._refresh_review_open_buttons()
+            return
+        self._open_path_in_default_app(path, "family recheck result")
 
     def _import_accepted_recheck_result(self) -> None:
         path, _ = QFileDialog.getOpenFileName(

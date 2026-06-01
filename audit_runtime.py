@@ -1626,6 +1626,29 @@ def _review_safe_family_id(family_id: Any) -> str:
     return clean.strip("_") or "family"
 
 
+def _review_live_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _review_family_recheck_dir(paths: dict[str, Path], family_id: Any, suffix: str) -> Path:
+    return paths["family_rechecks_dir"] / f"{_review_safe_family_id(family_id)}_{suffix}"
+
+
+def _review_latest_family_recheck_dir(paths: dict[str, Path], family_id: Any) -> Path | None:
+    root = paths["family_rechecks_dir"]
+    safe_id = _review_safe_family_id(family_id)
+    if not root.exists():
+        return None
+    candidates = [
+        path
+        for path in root.glob(f"{safe_id}_*")
+        if path.is_dir() and (path / "family_recheck_manifest.json").exists()
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+
+
 def _review_load_json(path: Path, warnings: list[str], label: str) -> Any:
     if not path.exists():
         return None
@@ -1812,7 +1835,9 @@ def _review_family_summary(paths: dict[str, Path], warnings: list[str], accepted
         if not isinstance(family, dict):
             continue
         family_id = str(family.get("family_id") or "").strip()
-        dryrun_dir = paths["family_rechecks_dir"] / f"{_review_safe_family_id(family_id)}_dryrun"
+        dryrun_dir = _review_family_recheck_dir(paths, family_id, "dryrun")
+        latest_dir = _review_latest_family_recheck_dir(paths, family_id) or dryrun_dir
+        live_pattern = _review_family_recheck_dir(paths, family_id, "live_<timestamp>")
         compact_families.append(
             {
                 "family_id": family_id,
@@ -1832,6 +1857,13 @@ def _review_family_summary(paths: dict[str, Path], warnings: list[str], accepted
                 ],
                 "review_notes": str(family.get("review_notes") or "").strip(),
                 "accepted_recheck_exists": family_id in accepted_family_ids,
+                "live_output_dir_pattern": str(live_pattern),
+                "latest_recheck_output_dir": str(latest_dir),
+                "latest_recheck_manifest_path": str(latest_dir / "family_recheck_manifest.json"),
+                "latest_recheck_prompt_path": str(latest_dir / "family_recheck_prompt.txt"),
+                "latest_recheck_evidence_path": str(latest_dir / "family_recheck_evidence.json"),
+                "latest_recheck_notes_path": str(latest_dir / "family_recheck_notes.md"),
+                "latest_recheck_result_path": str(latest_dir / "family_recheck_result.json"),
                 "dry_run_output_dir": str(dryrun_dir),
                 "dry_run_manifest_path": str(dryrun_dir / "family_recheck_manifest.json"),
                 "dry_run_prompt_path": str(dryrun_dir / "family_recheck_prompt.txt"),
@@ -1959,6 +1991,64 @@ def prepare_issue_family_recheck_dry_run(
         max_context_chars=max_context_chars,
         allow_output_inside_audit=True,
     )
+    return {
+        "manifest": manifest,
+        "review_summary": load_post_audit_review_summary(session),
+    }
+
+
+def run_issue_family_recheck_live(
+    session_or_pdf: dict[str, Any] | str | Path,
+    family_id: str,
+    *,
+    max_context_chars: int = 30000,
+    poll_every: float = 3.0,
+    max_wait_seconds: float | None = None,
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    session = _resolve_session(session_or_pdf)
+    paths = _review_sidecar_paths(session)
+    family_id = str(family_id or "").strip()
+    if not family_id:
+        raise RuntimeError("Select an issue family before running a live recheck.")
+    if not paths["families_json"].exists():
+        raise RuntimeError("Issue-family summary is missing. Click Prepare Review Summary first.")
+    from scripts.run_issue_family_recheck import run_issue_family_recheck
+
+    suffix = f"live_{timestamp or _review_live_timestamp()}"
+    output_dir = _review_family_recheck_dir(paths, family_id, suffix)
+    try:
+        manifest = run_issue_family_recheck(
+            Path(session["workdir"]),
+            paths["families_json"],
+            family_id,
+            output_dir,
+            model=str(session.get("model") or DEFAULT_MODEL),
+            reasoning_effort=str(session.get("reasoning_effort") or DEFAULT_REASONING_EFFORT),
+            live=True,
+            max_context_chars=max_context_chars,
+            poll_every=poll_every,
+            max_wait_seconds=max_wait_seconds,
+            allow_output_inside_audit=True,
+        )
+    except Exception as exc:
+        failure_path = output_dir / "family_recheck_failure.json"
+        save_json(
+            failure_path,
+            {
+                "time": utc_now(),
+                "family_id": family_id,
+                "output_dir": str(output_dir),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "canonical_issue_mutation": False,
+                "auto_imported": False,
+            },
+        )
+        raise RuntimeError(
+            f"Live issue-family recheck failed; failure artifact written to {failure_path}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     return {
         "manifest": manifest,
         "review_summary": load_post_audit_review_summary(session),
@@ -7745,6 +7835,7 @@ __all__ = [
     "load_post_audit_review_summary",
     "prepare_issue_family_recheck_dry_run",
     "prepare_post_audit_review_summary",
+    "run_issue_family_recheck_live",
     "get_report_freshness",
     "get_verification_suite_status",
     "list_qa_threads",

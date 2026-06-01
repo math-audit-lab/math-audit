@@ -2905,6 +2905,60 @@ def test_post_audit_review_summary_helpers() -> None:
         _assert(session_paths(source)["issues"].read_text(encoding="utf-8") == before_issues, "dry run changed issues")
         _assert(issue_rechecks_path.read_text(encoding="utf-8") == before_rechecks, "dry run changed recheck sidecar")
 
+        import scripts.run_issue_family_recheck as family_recheck_runner
+
+        original_live_runner = family_recheck_runner.run_issue_family_recheck
+
+        def fake_live_runner(
+            audit_workdir: Path,
+            families_json: Path,
+            family_id: str,
+            output_dir: Path,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            _assert(kwargs.get("live") is True, kwargs)
+            _assert(kwargs.get("allow_output_inside_audit") is True, kwargs)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(output_dir / "family_recheck_evidence.json", {"family_id": family_id})
+            _write_text(output_dir / "family_recheck_prompt.txt", "synthetic live prompt")
+            _write_text(output_dir / "family_recheck_notes.md", "synthetic live notes")
+            _write_json(output_dir / "family_recheck_raw_response.json", {"id": "resp_synthetic"})
+            _write_text(output_dir / "family_recheck_raw_response.txt", "{}")
+            _write_json(output_dir / "family_recheck_result.json", {"family_id": family_id, "summary": "synthetic"})
+            _write_text(output_dir / "family_recheck_result.md", "{}")
+            _write_json(output_dir / "usage_cost.json", {"cost": {"total_cost": 0.0}})
+            manifest = {
+                "schema_version": "1.0",
+                "audit_workdir": str(audit_workdir),
+                "families_json": str(families_json),
+                "family_id": family_id,
+                "output_dir": str(output_dir),
+                "live": True,
+                "dry_run": False,
+                "would_call_api": True,
+                "live_result": {"response_id": "resp_synthetic", "status": "completed"},
+                "source_unmodified_by_script": True,
+            }
+            _write_json(output_dir / "family_recheck_manifest.json", manifest)
+            return manifest
+
+        try:
+            family_recheck_runner.run_issue_family_recheck = fake_live_runner
+            live = runtime.run_issue_family_recheck_live(session, "F004", timestamp="20260601T123456Z")
+        finally:
+            family_recheck_runner.run_issue_family_recheck = original_live_runner
+        live_manifest = live["manifest"]
+        live_dir = review_dir / "family_rechecks" / "F004_live_20260601T123456Z"
+        _assert(live_manifest["live"], live_manifest)
+        _assert(live_manifest["would_call_api"], live_manifest)
+        _assert((live_dir / "family_recheck_result.json").exists(), "live result missing")
+        _assert(session_paths(source)["issues"].read_text(encoding="utf-8") == before_issues, "live run changed issues")
+        _assert(issue_rechecks_path.read_text(encoding="utf-8") == before_rechecks, "live run auto-imported recheck sidecar")
+        live_summary = live["review_summary"]
+        live_family = live_summary["issue_families"]["families"][0]
+        _assert(live_family["latest_recheck_output_dir"] == str(live_dir), live_family)
+        _assert(live_family["latest_recheck_result_path"] == str(live_dir / "family_recheck_result.json"), live_family)
+
         accepted_result_dir = root / "accepted_family_recheck"
         accepted_result_path = accepted_result_dir / "family_recheck_result.json"
         _write_json(
