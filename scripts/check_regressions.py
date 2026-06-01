@@ -2858,6 +2858,88 @@ def test_post_audit_review_summary_helpers() -> None:
         _assert(session_paths(source)["issues"].read_text(encoding="utf-8") == before_issues, "issues state changed")
         _assert(issue_rechecks_path.read_text(encoding="utf-8") == before_rechecks, "issue recheck sidecar changed")
 
+        family_payload = {
+            "schema_version": "1.0",
+            "generated_at": NEW,
+            "audit_workdir": str(source),
+            "summary": {
+                "total_families": 1,
+                "total_issue_ids_covered_by_families": 2,
+                "high_critical_issue_ids_not_assigned_to_family": [],
+            },
+            "families": [
+                {
+                    "family_id": "F004",
+                    "title": "Equation (34) / Theorem 4.1 dependency chain",
+                    "primary_upstream_issue_ids": ["I057"],
+                    "downstream_issue_ids": ["I071"],
+                    "related_issue_ids": [],
+                    "all_issue_ids": ["I057", "I071"],
+                    "main_references": ["34", "Theorem 4.1"],
+                    "main_symbols": [],
+                    "chunks": [{"chunk_id": "chunk_026"}, {"chunk_id": "chunk_033"}],
+                    "recommended_action": "group_downstream_under_upstream",
+                    "priority": "high",
+                    "review_notes": "Synthetic review family.",
+                    "source_group_ids": ["G001"],
+                }
+            ],
+        }
+        _write_json(review_dir / "issue_recheck_families.json", family_payload)
+        family_summary = runtime.load_post_audit_review_summary(session)
+        family = family_summary["issue_families"]["families"][0]
+        _assert(family["family_id"] == "F004", family)
+        _assert(family["accepted_recheck_exists"], family)
+        _assert(family["chunks"][0]["chunk_id"] == "chunk_026", family)
+        _assert(family["review_notes"] == "Synthetic review family.", family)
+        _assert(family["dry_run_output_dir"].endswith("review/family_rechecks/F004_dryrun"), family)
+
+        dry_run = runtime.prepare_issue_family_recheck_dry_run(session, "F004", max_context_chars=6000)
+        dry_manifest = dry_run["manifest"]
+        dry_dir = review_dir / "family_rechecks" / "F004_dryrun"
+        _assert(dry_manifest["dry_run"], dry_manifest)
+        _assert(not dry_manifest["would_call_api"], dry_manifest)
+        for name in ("family_recheck_manifest.json", "family_recheck_prompt.txt", "family_recheck_evidence.json", "family_recheck_notes.md"):
+            _assert((dry_dir / name).exists(), f"missing review dry-run artifact {name}")
+        _assert(not (dry_dir / "family_recheck_result.json").exists(), "GUI dry-run wrote live result")
+        _assert(session_paths(source)["issues"].read_text(encoding="utf-8") == before_issues, "dry run changed issues")
+        _assert(issue_rechecks_path.read_text(encoding="utf-8") == before_rechecks, "dry run changed recheck sidecar")
+
+        accepted_result_dir = root / "accepted_family_recheck"
+        accepted_result_path = accepted_result_dir / "family_recheck_result.json"
+        _write_json(
+            accepted_result_path,
+            {
+                "family_id": "F004",
+                "verdict": "Keep I057 upstream and group I071 downstream.",
+                "upstream_issue_ids": ["I057"],
+                "downstream_issue_ids": ["I071"],
+                "false_positive_issue_ids": [],
+                "recommended_severity_by_issue": [
+                    {"issue_id": "I057", "severity": "medium", "rationale": "repairable citation issue"},
+                    {"issue_id": "I071", "severity": "downstream-covered", "rationale": "covered by I057"},
+                ],
+                "recommended_status_by_issue": [
+                    {"issue_id": "I071", "status": "downstream-covered", "rationale": "group under I057"}
+                ],
+                "grouping_recommendations": [
+                    {"upstream_issue_id": "I057", "downstream_issue_ids": ["I071"], "rationale": "same dependency chain"}
+                ],
+                "final_report_treatment": "Report I057; mention I071 as downstream-covered.",
+                "evidence_for": ["Synthetic evidence."],
+                "evidence_against": [],
+                "confidence": "medium",
+                "needs_human_review": False,
+                "summary": "Synthetic accepted recheck.",
+            },
+        )
+        imported = runtime.import_accepted_issue_family_recheck(session, accepted_result_path)
+        _assert(imported["manifest"]["canonical_issue_mutation"] is False, imported)
+        _assert((source / "logs" / "issue_recheck_decisions.jsonl").exists(), "import log missing")
+        imported_sidecar = json.loads(issue_rechecks_path.read_text(encoding="utf-8"))
+        _assert(len(imported_sidecar["rechecks"]) == 2, imported_sidecar)
+        _assert(session_paths(source)["issues"].read_text(encoding="utf-8") == before_issues, "import changed issues")
+
         source_without_sidecar = root / "source_without_sidecar_audit"
         session_without_sidecar = _seed_state(source_without_sidecar)
         summary_without_sidecar = runtime.load_post_audit_review_summary(session_without_sidecar)

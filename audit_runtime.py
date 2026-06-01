@@ -1612,12 +1612,18 @@ def _review_sidecar_paths(session: dict[str, Any]) -> dict[str, Path]:
     review_dir = workdir / "review"
     return {
         "review_dir": review_dir,
+        "family_rechecks_dir": review_dir / "family_rechecks",
         "candidate_json": review_dir / "rerun_recheck_candidates.json",
         "candidate_markdown": review_dir / "rerun_recheck_candidates.md",
         "families_json": review_dir / "issue_recheck_families.json",
         "families_markdown": review_dir / "issue_recheck_families.md",
         "issue_rechecks_json": workdir / "state" / "issue_rechecks.json",
     }
+
+
+def _review_safe_family_id(family_id: Any) -> str:
+    clean = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(family_id or "").strip())
+    return clean.strip("_") or "family"
 
 
 def _review_load_json(path: Path, warnings: list[str], label: str) -> Any:
@@ -1776,7 +1782,15 @@ def _review_candidate_summary(paths: dict[str, Path], warnings: list[str]) -> di
     }
 
 
-def _review_family_summary(paths: dict[str, Path], warnings: list[str]) -> dict[str, Any]:
+def _review_accepted_recheck_family_ids(accepted_summary: dict[str, Any]) -> set[str]:
+    return {
+        str(family.get("family_id") or "").strip()
+        for family in accepted_summary.get("families") or []
+        if isinstance(family, dict) and str(family.get("family_id") or "").strip()
+    }
+
+
+def _review_family_summary(paths: dict[str, Path], warnings: list[str], accepted_family_ids: set[str] | None = None) -> dict[str, Any]:
     path = paths["families_json"]
     payload = _review_load_json(path, warnings, "issue recheck families")
     if not isinstance(payload, dict):
@@ -1793,20 +1807,36 @@ def _review_family_summary(paths: dict[str, Path], warnings: list[str]) -> dict[
     summary = payload.get("summary") or {}
     families = payload.get("families") or []
     compact_families = []
+    accepted_family_ids = accepted_family_ids or set()
     for family in families[:25] if isinstance(families, list) else []:
         if not isinstance(family, dict):
             continue
+        family_id = str(family.get("family_id") or "").strip()
+        dryrun_dir = paths["family_rechecks_dir"] / f"{_review_safe_family_id(family_id)}_dryrun"
         compact_families.append(
             {
-                "family_id": family.get("family_id"),
+                "family_id": family_id,
                 "title": family.get("title"),
                 "priority": family.get("priority"),
                 "recommended_action": family.get("recommended_action"),
                 "primary_upstream_issue_ids": _review_string_list(family.get("primary_upstream_issue_ids")),
                 "downstream_issue_ids": _review_string_list(family.get("downstream_issue_ids")),
                 "related_issue_ids": _review_string_list(family.get("related_issue_ids")),
+                "all_issue_ids": _review_string_list(family.get("all_issue_ids")),
                 "main_references": _review_string_list(family.get("main_references")),
                 "main_symbols": _review_string_list(family.get("main_symbols")),
+                "chunks": [
+                    item
+                    for item in family.get("chunks") or []
+                    if isinstance(item, dict) and str(item.get("chunk_id") or "").strip()
+                ],
+                "review_notes": str(family.get("review_notes") or "").strip(),
+                "accepted_recheck_exists": family_id in accepted_family_ids,
+                "dry_run_output_dir": str(dryrun_dir),
+                "dry_run_manifest_path": str(dryrun_dir / "family_recheck_manifest.json"),
+                "dry_run_prompt_path": str(dryrun_dir / "family_recheck_prompt.txt"),
+                "dry_run_evidence_path": str(dryrun_dir / "family_recheck_evidence.json"),
+                "dry_run_notes_path": str(dryrun_dir / "family_recheck_notes.md"),
             }
         )
     return {
@@ -1852,6 +1882,7 @@ def load_post_audit_review_summary(session_or_pdf: dict[str, Any] | str | Path) 
     except Exception as exc:
         freshness = {"reports": {}}
         warnings.append(f"Could not summarize report freshness: {type(exc).__name__}: {exc}")
+    accepted_rechecks = _review_issue_recheck_summary(paths, warnings)
     return {
         "available": True,
         "generated_at": utc_now(),
@@ -1860,9 +1891,13 @@ def load_post_audit_review_summary(session_or_pdf: dict[str, Any] | str | Path) 
         "paths": {key: str(value) for key, value in paths.items()},
         "issue_inventory": _review_issue_inventory(session, warnings),
         "verification_failure_count": verification_failure_count,
-        "accepted_rechecks": _review_issue_recheck_summary(paths, warnings),
+        "accepted_rechecks": accepted_rechecks,
         "candidate_inventory": _review_candidate_summary(paths, warnings),
-        "issue_families": _review_family_summary(paths, warnings),
+        "issue_families": _review_family_summary(
+            paths,
+            warnings,
+            accepted_family_ids=_review_accepted_recheck_family_ids(accepted_rechecks),
+        ),
         "report_freshness": freshness,
         "reports_stale_due_to_issue_rechecks": _reports_stale_due_to_issue_rechecks(freshness),
         "warnings": warnings,
@@ -1895,6 +1930,59 @@ def prepare_post_audit_review_summary(
         allow_output_inside_audit=True,
     )
     return load_post_audit_review_summary(session)
+
+
+def prepare_issue_family_recheck_dry_run(
+    session_or_pdf: dict[str, Any] | str | Path,
+    family_id: str,
+    *,
+    max_context_chars: int = 30000,
+) -> dict[str, Any]:
+    session = _resolve_session(session_or_pdf)
+    paths = _review_sidecar_paths(session)
+    family_id = str(family_id or "").strip()
+    if not family_id:
+        raise RuntimeError("Select an issue family before preparing a recheck dry run.")
+    if not paths["families_json"].exists():
+        raise RuntimeError("Issue-family summary is missing. Click Prepare Review Summary first.")
+    from scripts.run_issue_family_recheck import run_issue_family_recheck
+
+    output_dir = paths["family_rechecks_dir"] / f"{_review_safe_family_id(family_id)}_dryrun"
+    manifest = run_issue_family_recheck(
+        Path(session["workdir"]),
+        paths["families_json"],
+        family_id,
+        output_dir,
+        model=str(session.get("model") or DEFAULT_MODEL),
+        reasoning_effort=str(session.get("reasoning_effort") or DEFAULT_REASONING_EFFORT),
+        live=False,
+        max_context_chars=max_context_chars,
+        allow_output_inside_audit=True,
+    )
+    return {
+        "manifest": manifest,
+        "review_summary": load_post_audit_review_summary(session),
+    }
+
+
+def import_accepted_issue_family_recheck(
+    session_or_pdf: dict[str, Any] | str | Path,
+    recheck_result_path: str | Path,
+) -> dict[str, Any]:
+    session = _resolve_session(session_or_pdf)
+    result_path = Path(recheck_result_path).expanduser().resolve()
+    from scripts.import_issue_family_recheck import import_issue_family_recheck
+
+    manifest = import_issue_family_recheck(
+        Path(session["workdir"]),
+        result_path,
+        result_path.parent,
+        accept=True,
+    )
+    return {
+        "manifest": manifest,
+        "review_summary": load_post_audit_review_summary(session),
+    }
 
 
 def _format_failed_verification_context(chunk_summary: dict[str, Any]) -> str:
@@ -7653,7 +7741,9 @@ __all__ = [
     "finalize_chunk",
     "get_failed_verification_chunks",
     "get_audit_status",
+    "import_accepted_issue_family_recheck",
     "load_post_audit_review_summary",
+    "prepare_issue_family_recheck_dry_run",
     "prepare_post_audit_review_summary",
     "get_report_freshness",
     "get_verification_suite_status",

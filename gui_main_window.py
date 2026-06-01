@@ -442,6 +442,7 @@ class MainWindow(QMainWindow):
         self._last_status_payload: dict[str, Any] = {}
         self._latest_chatgpt_context_pack: dict[str, Any] = {}
         self._discussion_transcript_parts: list[str] = []
+        self._review_family_ids: list[str] = []
 
         self.setWindowTitle("Math Audit Control Panel (V1)")
         self.resize(980, 820)
@@ -1003,6 +1004,42 @@ class MainWindow(QMainWindow):
             "Dependency families",
             "Prepared family sidecars consolidate overlapping dependency-propagation groups for human review.",
         )
+        family_select_row = QHBoxLayout()
+        family_select_row.addWidget(QLabel("Selected family"))
+        self.review_family_combo = QComboBox()
+        self.review_family_combo.currentIndexChanged.connect(self._on_review_family_selected)
+        family_select_row.addWidget(self.review_family_combo, 1)
+        self.prepare_family_recheck_dry_run_button = QPushButton("Prepare Selected Family Recheck Dry Run")
+        self.prepare_family_recheck_dry_run_button.clicked.connect(self._prepare_selected_family_recheck_dry_run)
+        family_select_row.addWidget(self.prepare_family_recheck_dry_run_button)
+        family_layout.addLayout(family_select_row)
+        self.review_family_details_value = QPlainTextEdit()
+        self.review_family_details_value.setReadOnly(True)
+        self.review_family_details_value.setMinimumHeight(140)
+        self.review_family_details_value.setPlainText("No issue family selected.")
+        family_layout.addWidget(self.review_family_details_value)
+        family_artifact_buttons = QHBoxLayout()
+        self.open_family_recheck_folder_button = QPushButton("Open Family Recheck Folder")
+        self.open_family_recheck_folder_button.clicked.connect(self._open_family_recheck_folder)
+        self.open_family_recheck_prompt_button = QPushButton("Open Prompt")
+        self.open_family_recheck_prompt_button.clicked.connect(self._open_family_recheck_prompt)
+        self.open_family_recheck_evidence_button = QPushButton("Open Evidence")
+        self.open_family_recheck_evidence_button.clicked.connect(self._open_family_recheck_evidence)
+        self.import_accepted_recheck_button = QPushButton("Import Accepted Recheck Result...")
+        self.import_accepted_recheck_button.clicked.connect(self._import_accepted_recheck_result)
+        family_artifact_buttons.addWidget(self.open_family_recheck_folder_button)
+        family_artifact_buttons.addWidget(self.open_family_recheck_prompt_button)
+        family_artifact_buttons.addWidget(self.open_family_recheck_evidence_button)
+        family_artifact_buttons.addWidget(self.import_accepted_recheck_button)
+        family_artifact_buttons.addStretch(1)
+        family_layout.addLayout(family_artifact_buttons)
+        family_hint = QLabel(
+            "Live issue-family rechecks are not run from the GUI yet. "
+            "Dry runs only prepare prompt/evidence artifacts for review."
+        )
+        family_hint.setWordWrap(True)
+        family_hint.setStyleSheet("color: #555;")
+        family_layout.addWidget(family_hint)
         self.review_family_summary_value = QPlainTextEdit()
         self.review_family_summary_value.setReadOnly(True)
         self.review_family_summary_value.setMinimumHeight(150)
@@ -1398,6 +1435,7 @@ class MainWindow(QMainWindow):
                 "No issue-family summary prepared yet.",
             )
             self._refresh_review_open_buttons()
+            self._update_review_family_selector({})
             return
 
         issues = summary.get("issue_inventory") or {}
@@ -1430,7 +1468,103 @@ class MainWindow(QMainWindow):
             self.review_family_summary_value,
             self._format_review_families(families),
         )
+        self._update_review_family_selector(summary)
         self._refresh_review_open_buttons()
+
+    def _current_review_families(self) -> list[dict[str, Any]]:
+        summary = (self._last_status_payload or {}).get("review_summary") or {}
+        issue_families = summary.get("issue_families") if isinstance(summary, dict) else {}
+        families = issue_families.get("families") if isinstance(issue_families, dict) else []
+        return [family for family in families if isinstance(family, dict)]
+
+    def _selected_review_family_id(self) -> str:
+        if not hasattr(self, "review_family_combo"):
+            return ""
+        data = self.review_family_combo.currentData()
+        return str(data or "").strip()
+
+    def _selected_review_family(self) -> dict[str, Any]:
+        family_id = self._selected_review_family_id()
+        if not family_id:
+            return {}
+        for family in self._current_review_families():
+            if str(family.get("family_id") or "").strip() == family_id:
+                return family
+        return {}
+
+    def _update_review_family_selector(self, summary: dict[str, Any]) -> None:
+        if not hasattr(self, "review_family_combo"):
+            return
+        issue_families = summary.get("issue_families") if isinstance(summary, dict) else {}
+        families = issue_families.get("families") if isinstance(issue_families, dict) else []
+        families = [family for family in families if isinstance(family, dict) and str(family.get("family_id") or "").strip()]
+        family_ids = [str(family.get("family_id") or "").strip() for family in families]
+        previous = self._selected_review_family_id()
+        if family_ids != self._review_family_ids:
+            self.review_family_combo.blockSignals(True)
+            self.review_family_combo.clear()
+            for family in families:
+                family_id = str(family.get("family_id") or "").strip()
+                title = str(family.get("title") or "").strip()
+                self.review_family_combo.addItem(f"{family_id}: {title}" if title else family_id, family_id)
+            self.review_family_combo.blockSignals(False)
+            self._review_family_ids = family_ids
+        if family_ids:
+            target = previous if previous in family_ids else family_ids[0]
+            index = self.review_family_combo.findData(target)
+            if index >= 0 and self.review_family_combo.currentIndex() != index:
+                self.review_family_combo.setCurrentIndex(index)
+            self.review_family_combo.setEnabled(True)
+        else:
+            self.review_family_combo.blockSignals(True)
+            self.review_family_combo.clear()
+            self.review_family_combo.addItem("No issue families prepared", "")
+            self.review_family_combo.blockSignals(False)
+            self._review_family_ids = []
+            self.review_family_combo.setEnabled(False)
+        self._update_review_family_details()
+
+    def _on_review_family_selected(self, _index: int) -> None:
+        self._update_review_family_details()
+        self._refresh_review_open_buttons()
+
+    def _update_review_family_details(self) -> None:
+        if not hasattr(self, "review_family_details_value"):
+            return
+        _set_plain_text_preserving_scroll(
+            self.review_family_details_value,
+            self._format_review_family_details(self._selected_review_family()),
+        )
+
+    def _format_review_family_details(self, family: dict[str, Any]) -> str:
+        if not family:
+            return "No issue family selected. Click Prepare Review Summary to generate family sidecars."
+        chunks = family.get("chunks") or []
+        chunk_ids = [
+            str(item.get("chunk_id") or "").strip()
+            for item in chunks
+            if isinstance(item, dict) and str(item.get("chunk_id") or "").strip()
+        ]
+        lines = [
+            f"Family id: {family.get('family_id') or ''}",
+            f"Title: {family.get('title') or ''}",
+            f"Priority: {family.get('priority') or 'unknown'}",
+            f"Recommended action: {family.get('recommended_action') or 'unknown'}",
+            f"Accepted recheck exists: {'yes' if family.get('accepted_recheck_exists') else 'no'}",
+            f"Upstream issues: {', '.join(family.get('primary_upstream_issue_ids') or []) or 'none'}",
+            f"Downstream issues: {', '.join(family.get('downstream_issue_ids') or []) or 'none'}",
+            f"Related issues: {', '.join(family.get('related_issue_ids') or []) or 'none'}",
+            f"Source chunks: {', '.join(chunk_ids) or 'none'}",
+            f"Main references: {', '.join(family.get('main_references') or []) or 'none'}",
+            f"Main symbols: {', '.join(family.get('main_symbols') or []) or 'none'}",
+        ]
+        note = str(family.get("review_notes") or "").strip()
+        if note:
+            lines.extend(["", "Review note:", note])
+        output_dir = str(family.get("dry_run_output_dir") or "").strip()
+        if output_dir:
+            lines.extend(["", f"Dry-run folder: {output_dir}"])
+        return "\n".join(lines)
 
     def _format_review_rechecks(self, accepted: dict[str, Any]) -> str:
         if not isinstance(accepted, dict) or not accepted.get("available"):
@@ -1609,6 +1743,8 @@ class MainWindow(QMainWindow):
         self.rebuild_verification_button.setEnabled(session_ready)
         self.refresh_review_summary_button.setEnabled(session_available and not self._task_running)
         self.prepare_review_summary_button.setEnabled(session_ready)
+        self.prepare_family_recheck_dry_run_button.setEnabled(session_ready and bool(self._selected_review_family_id()))
+        self.import_accepted_recheck_button.setEnabled(session_ready)
         self.rerun_selected_button.setEnabled(session_ready and not pending_response)
         self.select_rerun_chunks_button.setEnabled(session_ready and bool(self._available_rerun_chunks()))
         self._refresh_report_open_buttons()
@@ -1682,6 +1818,7 @@ class MainWindow(QMainWindow):
         review_dir = root / "review"
         return {
             "review_dir": review_dir,
+            "family_rechecks_dir": review_dir / "family_rechecks",
             "candidate_json": review_dir / "rerun_recheck_candidates.json",
             "candidate_markdown": review_dir / "rerun_recheck_candidates.md",
             "families_json": review_dir / "issue_recheck_families.json",
@@ -1704,9 +1841,19 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "open_review_folder_button"):
             return
         paths = self._selected_review_paths()
+        family = self._selected_review_family()
         self.open_review_folder_button.setEnabled(bool(paths.get("review_dir") and paths["review_dir"].is_dir()))
         self.open_issue_rechecks_button.setEnabled(
             bool(paths.get("issue_rechecks_json") and paths["issue_rechecks_json"].is_file())
+        )
+        self.open_family_recheck_folder_button.setEnabled(
+            bool(family.get("dry_run_output_dir") and Path(str(family["dry_run_output_dir"])).is_dir())
+        )
+        self.open_family_recheck_prompt_button.setEnabled(
+            bool(family.get("dry_run_prompt_path") and Path(str(family["dry_run_prompt_path"])).is_file())
+        )
+        self.open_family_recheck_evidence_button.setEnabled(
+            bool(family.get("dry_run_evidence_path") and Path(str(family["dry_run_evidence_path"])).is_file())
         )
 
     def _open_path_in_default_app(self, path: Path, description: str) -> None:
@@ -1748,6 +1895,83 @@ class MainWindow(QMainWindow):
             self._refresh_review_open_buttons()
             return
         self._open_path_in_default_app(path, "issue rechecks sidecar")
+
+    def _prepare_selected_family_recheck_dry_run(self) -> None:
+        family_id = self._selected_review_family_id()
+        if not family_id:
+            self._append_log("Select an issue family before preparing a recheck dry run.")
+            return
+        self.controller.prepare_selected_family_recheck_dry_run(family_id)
+
+    def _selected_family_recheck_path(self, key: str) -> Optional[Path]:
+        family = self._selected_review_family()
+        value = family.get(key) if isinstance(family, dict) else None
+        if not value:
+            return None
+        return Path(str(value))
+
+    def _open_family_recheck_folder(self) -> None:
+        path = self._selected_family_recheck_path("dry_run_output_dir")
+        if path is None:
+            self._append_log("Select an issue family before opening its dry-run folder.")
+            return
+        if not path.is_dir():
+            message = "Family recheck dry-run folder does not exist yet. Click Prepare Selected Family Recheck Dry Run first."
+            self._append_log(message)
+            self._append_report_output(message)
+            self._refresh_review_open_buttons()
+            return
+        self._open_path_in_default_app(path, "family recheck dry-run folder")
+
+    def _open_family_recheck_prompt(self) -> None:
+        path = self._selected_family_recheck_path("dry_run_prompt_path")
+        if path is None:
+            self._append_log("Select an issue family before opening its dry-run prompt.")
+            return
+        if not path.is_file():
+            message = "Family recheck prompt does not exist yet. Click Prepare Selected Family Recheck Dry Run first."
+            self._append_log(message)
+            self._append_report_output(message)
+            self._refresh_review_open_buttons()
+            return
+        self._open_path_in_default_app(path, "family recheck prompt")
+
+    def _open_family_recheck_evidence(self) -> None:
+        path = self._selected_family_recheck_path("dry_run_evidence_path")
+        if path is None:
+            self._append_log("Select an issue family before opening its dry-run evidence.")
+            return
+        if not path.is_file():
+            message = "Family recheck evidence does not exist yet. Click Prepare Selected Family Recheck Dry Run first."
+            self._append_log(message)
+            self._append_report_output(message)
+            self._refresh_review_open_buttons()
+            return
+        self._open_path_in_default_app(path, "family recheck evidence")
+
+    def _import_accepted_recheck_result(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose accepted family_recheck_result.json",
+            str(Path.home()),
+            "JSON Files (*.json)",
+        )
+        if not path:
+            return
+        result_path = Path(path)
+        reply = QMessageBox.question(
+            self,
+            "Import Accepted Recheck Result",
+            "Import this accepted issue-family recheck result?\n\n"
+            "This writes only state/issue_rechecks.json and logs/issue_recheck_decisions.jsonl. "
+            "Canonical issue records are not modified.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self._append_log("Issue-family recheck import cancelled.")
+            return
+        self.controller.import_accepted_recheck_result(str(result_path))
 
     def _open_report_tex(self, kind: str) -> None:
         paths = self._selected_report_paths()

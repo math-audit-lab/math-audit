@@ -33,11 +33,13 @@ from audit_runtime import (
     get_failed_verification_chunks,
     get_audit_status,
     get_verification_suite_status,
+    import_accepted_issue_family_recheck,
     load_post_audit_review_summary,
     list_qa_threads,
     load_qa_turns,
     model_choices,
     normalize_model_and_reasoning_effort,
+    prepare_issue_family_recheck_dry_run,
     prepare_post_audit_review_summary,
     request_pause,
     rerun_failed_verification_chunks as runtime_rerun_failed_verification_chunks,
@@ -734,6 +736,36 @@ class GuiController(QObject):
             self.pdf_path,
         )
 
+    def prepare_selected_family_recheck_dry_run(self, family_id: str) -> None:
+        clean = str(family_id or "").strip()
+        if not clean:
+            self.log_message.emit("Select an issue family before preparing a recheck dry run.")
+            return
+        if not self._require_session():
+            return
+        self._run_backend_task(
+            "Prepare Family Recheck Dry Run",
+            prepare_issue_family_recheck_dry_run,
+            self._handle_family_recheck_dry_run_result,
+            self.pdf_path,
+            clean,
+        )
+
+    def import_accepted_recheck_result(self, recheck_result_path: str) -> None:
+        clean = str(recheck_result_path or "").strip()
+        if not clean:
+            self.log_message.emit("Choose a family_recheck_result.json file to import.")
+            return
+        if not self._require_session():
+            return
+        self._run_backend_task(
+            "Import Accepted Recheck Result",
+            import_accepted_issue_family_recheck,
+            self._handle_imported_recheck_result,
+            self.pdf_path,
+            clean,
+        )
+
     def run_verification_suite(self) -> None:
         if not self._require_session():
             return
@@ -1088,6 +1120,44 @@ class GuiController(QObject):
         message = f"Review summary prepared: {candidate_count} candidate(s), {family_count} issue family/families."
         if review_dir:
             message += f"\nReview sidecars: {review_dir}"
+        self.log_message.emit(message)
+        self.report_output.emit(message)
+        self._emit_current_status()
+
+    def _handle_family_recheck_dry_run_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected family recheck dry-run result.")
+            return
+        manifest = result.get("manifest") if isinstance(result.get("manifest"), dict) else {}
+        review_summary = result.get("review_summary") if isinstance(result.get("review_summary"), dict) else {}
+        if review_summary:
+            self.review_summary_updated.emit(dict(review_summary))
+        family_id = str(manifest.get("family_id") or "").strip()
+        output_dir = str(manifest.get("output_dir") or "").strip()
+        message = f"Family recheck dry run prepared for {family_id or 'selected family'}."
+        if output_dir:
+            message += f"\nDry-run artifacts: {output_dir}"
+        self.log_message.emit(message)
+        self.report_output.emit(message)
+        self._emit_current_status()
+
+    def _handle_imported_recheck_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected issue-family recheck import result.")
+            return
+        manifest = result.get("manifest") if isinstance(result.get("manifest"), dict) else {}
+        review_summary = result.get("review_summary") if isinstance(result.get("review_summary"), dict) else {}
+        if review_summary:
+            self.review_summary_updated.emit(dict(review_summary))
+        family_id = str(manifest.get("family_id") or "").strip()
+        affected = manifest.get("affected_issue_ids") or []
+        issue_preview = ", ".join(str(item) for item in affected[:8])
+        if len(affected) > 8:
+            issue_preview += ", ..."
+        message = f"Accepted issue-family recheck imported for {family_id or 'family'}."
+        if issue_preview:
+            message += f"\nAffected issues: {issue_preview}"
+        message += "\nCanonical issue records were not modified."
         self.log_message.emit(message)
         self.report_output.emit(message)
         self._emit_current_status()

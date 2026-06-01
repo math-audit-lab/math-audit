@@ -671,6 +671,7 @@ def run_issue_family_recheck(
     max_context_chars: int = 30000,
     poll_every: float = 3.0,
     max_wait_seconds: float | None = None,
+    allow_output_inside_audit: bool = False,
 ) -> dict[str, Any]:
     audit_workdir = audit_workdir.expanduser().resolve()
     families_json = families_json.expanduser().resolve()
@@ -679,7 +680,8 @@ def run_issue_family_recheck(
         raise RuntimeError(f"Audit workdir does not exist: {audit_workdir}")
     if not families_json.exists():
         raise RuntimeError(f"Families JSON does not exist: {families_json}")
-    _guard_output_dir(audit_workdir, output_dir)
+    if not allow_output_inside_audit:
+        _guard_output_dir(audit_workdir, output_dir)
     if live and not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is required for --live mode.")
     validate_result_schema(RESULT_SCHEMA)
@@ -742,7 +744,11 @@ def run_issue_family_recheck(
             "tex_excerpt_count": len(evidence.get("tex_excerpts", [])),
             "verification_ref_count": len(evidence.get("verification_refs", [])),
         },
-        "source_mutation_policy": "read-only; source audit folder, issue state, and family JSON are never modified",
+        "source_mutation_policy": (
+            "read-only; canonical audit state, issue state, and family JSON are never modified"
+            if allow_output_inside_audit
+            else "read-only; source audit folder, issue state, and family JSON are never modified"
+        ),
         "source_unmodified_by_script": before == after,
     }
     _write_json(output_dir / "family_recheck_manifest.json", manifest)
