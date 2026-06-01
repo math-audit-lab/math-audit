@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
 import shutil
@@ -3304,6 +3305,40 @@ def _resolve_qa_artifact_path(session: dict[str, Any], raw_path: Any, subdir: st
     return None
 
 
+def _python_source_parses(source: str) -> bool:
+    try:
+        ast.parse(source or "")
+    except (SyntaxError, ValueError, TypeError):
+        return False
+    return True
+
+
+def _repair_python_check_code_escapes(source: str) -> str:
+    """Repair model-returned code that double-escaped JSON newlines."""
+    source = "" if source is None else str(source)
+    if not any(marker in source for marker in (r"\n", r"\r", r"\t")):
+        return source
+    if _python_source_parses(source):
+        return source
+
+    candidate = (
+        source.replace(r"\r\n", "\n")
+        .replace(r"\n", "\n")
+        .replace(r"\r", "\n")
+        .replace(r"\t", "\t")
+    )
+    if candidate != source and _python_source_parses(candidate):
+        return candidate
+
+    try:
+        unicode_candidate = source.encode("utf-8").decode("unicode_escape")
+    except UnicodeDecodeError:
+        unicode_candidate = source
+    if unicode_candidate != source and _python_source_parses(unicode_candidate):
+        return unicode_candidate
+    return source
+
+
 def _coerce_audit_payload(audit: Any) -> dict[str, Any]:
     if not isinstance(audit, dict):
         audit = {}
@@ -4703,7 +4738,7 @@ def _coerce_audit_payload(audit: Any) -> dict[str, Any]:
             purpose = _as_str(it.get("purpose", "")).strip() or "Python check"
             description = _as_str(it.get("description", "")).strip() or purpose
             expected_outcome = _as_str(it.get("expected_outcome", "")).strip()
-            code = _as_str(it.get("code", ""))
+            code = _repair_python_check_code_escapes(_as_str(it.get("code", "")))
             if purpose or description or expected_outcome or code:
                 out.append({
                     "purpose": purpose,
@@ -4762,7 +4797,7 @@ def _normalize_python_check_entry(
             "The script should finish without exceptions or failed assertions, and any printed output "
             "should be consistent with the claim described above."
         )
-    code = str(chk.get("code", "") or "")
+    code = _repair_python_check_code_escapes(str(chk.get("code", "") or ""))
     return {
         "purpose": purpose,
         "description": description,
@@ -4861,7 +4896,7 @@ def save_patch_and_code_files(session: dict[str, Any], chunk_id: str, audit: dic
         p.write_text(latex_patch + "\n", encoding="utf-8")
         latex_paths.append(str(p))
     for idx, chk in enumerate(audit.get("python_checks", []) or [], start=1):
-        code = (chk.get("code") or "").strip()
+        code = _repair_python_check_code_escapes(chk.get("code") or "").strip()
         if code:
             p = root / "python_checks" / f"{chunk_id}_check_{idx:02d}.py"
             p.write_text(code + "\n", encoding="utf-8")

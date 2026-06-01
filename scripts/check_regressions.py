@@ -2907,6 +2907,52 @@ def test_import_issue_family_recheck_script() -> None:
             raise RegressionFailure("Issue family recheck import accepted a result missing family_id")
 
 
+def test_python_check_literal_newline_escape_repair() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_python_check_escape_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _synthetic_session(workdir)
+        (workdir / "python_checks").mkdir(parents=True)
+        (workdir / "latex_patches").mkdir(parents=True)
+
+        malformed_code = "def value():\\n    return 3\\n\\nprint(value())"
+        valid_code_with_literal_escape = "print('literal \\\\n marker stays in string')"
+        audit = runtime._coerce_audit_payload(
+            {
+                "python_checks": [
+                    {
+                        "purpose": "Repair double-escaped code",
+                        "description": "Synthetic check",
+                        "expected_outcome": "The generated file parses.",
+                        "code": malformed_code,
+                    },
+                    {
+                        "purpose": "Preserve valid code",
+                        "description": "Synthetic check",
+                        "expected_outcome": "The literal escape remains literal.",
+                        "code": valid_code_with_literal_escape,
+                    },
+                ]
+            }
+        )
+
+        repaired = audit["python_checks"][0]["code"]
+        preserved = audit["python_checks"][1]["code"]
+        _assert(repaired.count("\n") >= 3, repr(repaired))
+        _assert(r"\n" not in repaired, repr(repaired))
+        _assert(preserved == valid_code_with_literal_escape, repr(preserved))
+        compile(repaired, "<repaired_python_check>", "exec")
+        compile(preserved, "<preserved_python_check>", "exec")
+
+        paths = runtime.save_patch_and_code_files(session, "chunk_001", audit)
+        _assert(len(paths["python_paths"]) == 2, paths)
+        repaired_file = (workdir / "python_checks" / "chunk_001_check_01.py").read_text(encoding="utf-8")
+        preserved_file = (workdir / "python_checks" / "chunk_001_check_02.py").read_text(encoding="utf-8")
+        _assert(repaired_file.count("\n") >= 4, repr(repaired_file))
+        _assert(r"\n" in preserved_file, repr(preserved_file))
+        compile(repaired_file, "chunk_001_check_01.py", "exec")
+        compile(preserved_file, "chunk_001_check_02.py", "exec")
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -2948,6 +2994,7 @@ def main() -> int:
         ("issue recheck family consolidation script", test_prepare_issue_recheck_families_script),
         ("issue family recheck dry-run script", test_run_issue_family_recheck_dry_run),
         ("issue family recheck import script", test_import_issue_family_recheck_script),
+        ("python check literal newline escape repair", test_python_check_literal_newline_escape_repair),
     ]
     results = [_run_case(name, func) for name, func in cases]
 
