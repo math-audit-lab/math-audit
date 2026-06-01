@@ -271,6 +271,17 @@ def _report_math_text_looks_unsafe(text: str) -> bool:
     )
 
 
+def _report_latex_text_looks_globally_unsafe(text: str) -> bool:
+    """Detect paragraph-level hazards before math spans are rendered individually."""
+    text = "" if text is None else str(text)
+    return bool(
+        _DANGEROUS_MATH_COMMAND_RE.search(text)
+        or _ARGUMENT_TAKING_REPORT_MATH_MACRO_RE.search(text)
+        or text.count(r"\left") != text.count(r"\right")
+        or _report_math_delimiters_look_unsafe(text)
+    )
+
+
 def _dedupe_preserve_order(seq: list[str]) -> list[str]:
     seen = set()
     out = []
@@ -1995,7 +2006,7 @@ def _report_latex_paragraph_local(text: str) -> str:
     text = _repair_report_escape_artifacts("" if text is None else str(text))
     text = normalize_math_delimiters(text)
     text = _strip_unsafe_control_chars(_repair_report_escape_artifacts(text))
-    if _report_math_text_looks_unsafe(text):
+    if _report_latex_text_looks_globally_unsafe(text):
         return _report_escape_text(text)
     parts = re.split(r"(\$\$.*?\$\$|\$.*?\$)", text, flags=re.DOTALL)
     out = []

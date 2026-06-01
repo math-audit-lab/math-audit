@@ -1271,6 +1271,22 @@ def test_report_latex_unicode_math_safety() -> None:
         _assert("\\\\Lambda" not in rendered, rendered)
         _assert("\\\\lambda" not in rendered, rendered)
 
+        lmj_unicode_math = (
+            "Lemma 11 gives an unconditional $11$-adic valuation that requires $5∣a+1$. "
+            "Take $a=13$ with $a+1=14=2·7$ and $10∤14$; "
+            "the formula $ϑ_{11}(σ(13^a))$ involves $Ω(σ(n))$."
+        )
+        rendered_lmj = renderer(lmj_unicode_math)
+        _assert(r"\$11\$" not in rendered_lmj, rendered_lmj)
+        _assert("[U+" not in rendered_lmj, rendered_lmj)
+        _assert("$11$-adic" in rendered_lmj, rendered_lmj)
+        _assert(r"$5\mid a+1$" in rendered_lmj, rendered_lmj)
+        _assert(r"$10\nmid 14$" in rendered_lmj, rendered_lmj)
+        _assert(r"\cdot 7" in rendered_lmj, rendered_lmj)
+        _assert(r"\vartheta " in rendered_lmj, rendered_lmj)
+        _assert(r"\sigma " in rendered_lmj, rendered_lmj)
+        _assert(r"\Omega " in rendered_lmj, rendered_lmj)
+
         json_escaped_tex = (
             "Recovered commands: $e^{-\\rho j}\\exp(-"
             + "\x0c"
