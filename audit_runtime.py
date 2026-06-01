@@ -1607,6 +1607,296 @@ def get_failed_verification_chunks(session_or_pdf: dict[str, Any] | str | Path) 
     }
 
 
+def _review_sidecar_paths(session: dict[str, Any]) -> dict[str, Path]:
+    workdir = Path(session["workdir"])
+    review_dir = workdir / "review"
+    return {
+        "review_dir": review_dir,
+        "candidate_json": review_dir / "rerun_recheck_candidates.json",
+        "candidate_markdown": review_dir / "rerun_recheck_candidates.md",
+        "families_json": review_dir / "issue_recheck_families.json",
+        "families_markdown": review_dir / "issue_recheck_families.md",
+        "issue_rechecks_json": workdir / "state" / "issue_rechecks.json",
+    }
+
+
+def _review_load_json(path: Path, warnings: list[str], label: str) -> Any:
+    if not path.exists():
+        return None
+    try:
+        return load_json(path)
+    except Exception as exc:
+        warnings.append(f"Could not load {label}: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _review_issue_status(issue: dict[str, Any]) -> str:
+    return str(issue.get("status") or "open").strip().lower() or "open"
+
+
+def _review_issue_inventory(session: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
+    try:
+        payload = load_issues(session)
+    except Exception as exc:
+        warnings.append(f"Could not load issues state: {type(exc).__name__}: {exc}")
+        return {"total": 0, "open": 0, "high_or_critical_open": 0, "severity_counts": {}}
+    issues = payload.get("issues") if isinstance(payload, dict) else []
+    if not isinstance(issues, list):
+        warnings.append("Issues state did not contain an issues list.")
+        return {"total": 0, "open": 0, "high_or_critical_open": 0, "severity_counts": {}}
+    open_issues = [
+        issue
+        for issue in issues
+        if isinstance(issue, dict) and _review_issue_status(issue) not in {"resolved", "closed"}
+    ]
+    severity_counts: dict[str, int] = {}
+    for issue in open_issues:
+        severity = str(issue.get("severity") or "unknown").strip().lower() or "unknown"
+        severity_counts[severity] = severity_counts.get(severity, 0) + 1
+    return {
+        "total": len([issue for issue in issues if isinstance(issue, dict)]),
+        "open": len(open_issues),
+        "high_or_critical_open": severity_counts.get("high", 0) + severity_counts.get("critical", 0),
+        "severity_counts": severity_counts,
+    }
+
+
+def _review_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _review_issue_ids_from_recheck(record: dict[str, Any]) -> set[str]:
+    ids = set(_review_string_list(record.get("upstream_issue_ids")))
+    ids.update(_review_string_list(record.get("downstream_issue_ids")))
+    ids.update(_review_string_list(record.get("false_positive_issue_ids")))
+    for key in ("recommended_severity_by_issue", "recommended_status_by_issue"):
+        for item in record.get(key) or []:
+            if isinstance(item, dict) and str(item.get("issue_id") or "").strip():
+                ids.add(str(item["issue_id"]).strip())
+    for item in record.get("grouping_recommendations") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("upstream_issue_id") or "").strip():
+            ids.add(str(item["upstream_issue_id"]).strip())
+        ids.update(_review_string_list(item.get("downstream_issue_ids")))
+    return ids
+
+
+def _review_issue_recheck_summary(paths: dict[str, Path], warnings: list[str]) -> dict[str, Any]:
+    path = paths["issue_rechecks_json"]
+    payload = _review_load_json(path, warnings, "issue rechecks sidecar")
+    if not isinstance(payload, dict):
+        return {
+            "available": False,
+            "path": str(path),
+            "accepted_recheck_count": 0,
+            "family_count": 0,
+            "downstream_covered_issue_count": 0,
+            "human_review_issue_count": 0,
+            "families": [],
+        }
+    rechecks = [record for record in payload.get("rechecks") or [] if isinstance(record, dict)]
+    downstream_issue_ids: set[str] = set()
+    human_review_issue_ids: set[str] = set()
+    false_positive_issue_ids: set[str] = set()
+    families: list[dict[str, Any]] = []
+    for record in rechecks:
+        family_id = str(record.get("family_id") or "").strip()
+        downstream = set(_review_string_list(record.get("downstream_issue_ids")))
+        for item in record.get("grouping_recommendations") or []:
+            if isinstance(item, dict):
+                downstream.update(_review_string_list(item.get("downstream_issue_ids")))
+        downstream_issue_ids.update(downstream)
+        false_positive_issue_ids.update(_review_string_list(record.get("false_positive_issue_ids")))
+        if record.get("needs_human_review"):
+            human_review_issue_ids.update(_review_issue_ids_from_recheck(record))
+        for item in record.get("recommended_status_by_issue") or []:
+            if not isinstance(item, dict):
+                continue
+            issue_id = str(item.get("issue_id") or "").strip()
+            text = f"{item.get('status') or ''} {item.get('rationale') or ''}".lower()
+            if issue_id and "human" in text:
+                human_review_issue_ids.add(issue_id)
+        families.append(
+            {
+                "family_id": family_id,
+                "recheck_id": record.get("recheck_id"),
+                "accepted_at": record.get("accepted_at"),
+                "confidence": record.get("confidence"),
+                "needs_human_review": bool(record.get("needs_human_review")),
+                "upstream_issue_ids": _review_string_list(record.get("upstream_issue_ids")),
+                "downstream_issue_ids": sorted(downstream),
+                "false_positive_issue_ids": _review_string_list(record.get("false_positive_issue_ids")),
+                "final_report_treatment": str(record.get("final_report_treatment") or "").strip(),
+                "summary": str(record.get("summary") or "").strip(),
+            }
+        )
+    return {
+        "available": True,
+        "path": str(path),
+        "accepted_recheck_count": len(rechecks),
+        "family_count": len({item.get("family_id") for item in families if item.get("family_id")}),
+        "issue_count": len(set().union(*(_review_issue_ids_from_recheck(record) for record in rechecks)) if rechecks else set()),
+        "downstream_covered_issue_count": len(downstream_issue_ids),
+        "human_review_issue_count": len(human_review_issue_ids),
+        "false_positive_issue_count": len(false_positive_issue_ids),
+        "families": families,
+    }
+
+
+def _review_candidate_summary(paths: dict[str, Path], warnings: list[str]) -> dict[str, Any]:
+    path = paths["candidate_json"]
+    payload = _review_load_json(path, warnings, "rerun/recheck candidate inventory")
+    if not isinstance(payload, dict):
+        return {
+            "available": False,
+            "path": str(path),
+            "markdown_path": str(paths["candidate_markdown"]),
+            "candidate_count": 0,
+            "group_count": 0,
+            "candidate_type_summary": {},
+            "recommended_action_kind_counts": {},
+            "category_counts": {},
+        }
+    return {
+        "available": True,
+        "path": str(path),
+        "markdown_path": str(paths["candidate_markdown"]),
+        "generated_at": payload.get("generated_at"),
+        "candidate_count": int(payload.get("candidate_count", 0) or 0),
+        "group_count": int(payload.get("group_count", 0) or 0),
+        "candidate_type_summary": payload.get("candidate_type_summary") or {},
+        "recommended_action_kind_counts": payload.get("recommended_action_kind_counts") or {},
+        "category_counts": payload.get("category_counts") or {},
+        "source_unmodified_by_script": payload.get("source_unmodified_by_script"),
+    }
+
+
+def _review_family_summary(paths: dict[str, Path], warnings: list[str]) -> dict[str, Any]:
+    path = paths["families_json"]
+    payload = _review_load_json(path, warnings, "issue recheck families")
+    if not isinstance(payload, dict):
+        return {
+            "available": False,
+            "path": str(path),
+            "markdown_path": str(paths["families_markdown"]),
+            "total_families": 0,
+            "issue_ids_covered": 0,
+            "high_critical_unassigned": [],
+            "issues_appearing_in_multiple_families": [],
+            "families": [],
+        }
+    summary = payload.get("summary") or {}
+    families = payload.get("families") or []
+    compact_families = []
+    for family in families[:25] if isinstance(families, list) else []:
+        if not isinstance(family, dict):
+            continue
+        compact_families.append(
+            {
+                "family_id": family.get("family_id"),
+                "title": family.get("title"),
+                "priority": family.get("priority"),
+                "recommended_action": family.get("recommended_action"),
+                "primary_upstream_issue_ids": _review_string_list(family.get("primary_upstream_issue_ids")),
+                "downstream_issue_ids": _review_string_list(family.get("downstream_issue_ids")),
+                "related_issue_ids": _review_string_list(family.get("related_issue_ids")),
+                "main_references": _review_string_list(family.get("main_references")),
+                "main_symbols": _review_string_list(family.get("main_symbols")),
+            }
+        )
+    return {
+        "available": True,
+        "path": str(path),
+        "markdown_path": str(paths["families_markdown"]),
+        "generated_at": payload.get("generated_at"),
+        "total_families": int(summary.get("total_families", len(compact_families)) or 0),
+        "issue_ids_covered": int(summary.get("total_issue_ids_covered_by_families", 0) or 0),
+        "high_critical_unassigned": _review_string_list(summary.get("high_critical_issue_ids_not_assigned_to_family")),
+        "issues_appearing_in_multiple_families": summary.get("issues_appearing_in_multiple_families") or [],
+        "families": compact_families,
+        "source_unmodified_by_script": payload.get("source_unmodified_by_script"),
+    }
+
+
+def _reports_stale_due_to_issue_rechecks(freshness: dict[str, Any]) -> list[str]:
+    stale: list[str] = []
+    reports = freshness.get("reports") if isinstance(freshness, dict) else {}
+    if not isinstance(reports, dict):
+        return stale
+    for kind, info in reports.items():
+        if not isinstance(info, dict) or str(info.get("status") or "").lower() != "stale":
+            continue
+        latest = info.get("latest_source") if isinstance(info.get("latest_source"), dict) else {}
+        if str(latest.get("name") or "") == "issue recheck sidecar":
+            stale.append(str(kind))
+    return stale
+
+
+def load_post_audit_review_summary(session_or_pdf: dict[str, Any] | str | Path) -> dict[str, Any]:
+    session = _resolve_session(session_or_pdf)
+    paths = _review_sidecar_paths(session)
+    warnings: list[str] = []
+    try:
+        failed_verification = get_failed_verification_chunks(session)
+        verification_failure_count = int((failed_verification.get("summary") or {}).get("failed_result_count", 0) or 0)
+    except Exception as exc:
+        verification_failure_count = 0
+        warnings.append(f"Could not summarize failed verification results: {type(exc).__name__}: {exc}")
+    try:
+        freshness = get_report_freshness(session)
+    except Exception as exc:
+        freshness = {"reports": {}}
+        warnings.append(f"Could not summarize report freshness: {type(exc).__name__}: {exc}")
+    return {
+        "available": True,
+        "generated_at": utc_now(),
+        "workdir": str(Path(session["workdir"])),
+        "review_dir": str(paths["review_dir"]),
+        "paths": {key: str(value) for key, value in paths.items()},
+        "issue_inventory": _review_issue_inventory(session, warnings),
+        "verification_failure_count": verification_failure_count,
+        "accepted_rechecks": _review_issue_recheck_summary(paths, warnings),
+        "candidate_inventory": _review_candidate_summary(paths, warnings),
+        "issue_families": _review_family_summary(paths, warnings),
+        "report_freshness": freshness,
+        "reports_stale_due_to_issue_rechecks": _reports_stale_due_to_issue_rechecks(freshness),
+        "warnings": warnings,
+    }
+
+
+def prepare_post_audit_review_summary(
+    session_or_pdf: dict[str, Any] | str | Path,
+    *,
+    include_medium: bool = True,
+    max_context_chars: int = 2200,
+) -> dict[str, Any]:
+    session = _resolve_session(session_or_pdf)
+    audit_workdir = Path(session["workdir"])
+    paths = _review_sidecar_paths(session)
+    from scripts.prepare_issue_recheck_families import prepare_issue_recheck_families
+    from scripts.prepare_rerun_recheck_candidates import prepare_rerun_recheck_candidates
+
+    prepare_rerun_recheck_candidates(
+        audit_workdir,
+        paths["review_dir"],
+        include_medium=include_medium,
+        max_context_chars=max_context_chars,
+        allow_output_inside_audit=True,
+    )
+    prepare_issue_recheck_families(
+        audit_workdir,
+        paths["review_dir"],
+        candidates_json=paths["candidate_json"],
+        allow_output_inside_audit=True,
+    )
+    return load_post_audit_review_summary(session)
+
+
 def _format_failed_verification_context(chunk_summary: dict[str, Any]) -> str:
     lines = [
         "Verification rerun context for this chunk:",
@@ -7363,6 +7653,8 @@ __all__ = [
     "finalize_chunk",
     "get_failed_verification_chunks",
     "get_audit_status",
+    "load_post_audit_review_summary",
+    "prepare_post_audit_review_summary",
     "get_report_freshness",
     "get_verification_suite_status",
     "list_qa_threads",

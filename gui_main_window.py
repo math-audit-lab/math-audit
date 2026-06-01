@@ -457,6 +457,7 @@ class MainWindow(QMainWindow):
         self.controller.cancel_task_running_changed.connect(lambda _running: self._apply_button_states())
         self.controller.audit_settings_changed.connect(self._on_audit_settings_changed)
         self.controller.audit_context_mode_changed.connect(self._on_audit_context_mode_changed)
+        self.controller.review_summary_updated.connect(self._update_review_summary)
 
         self.model_combo.setCurrentText(DEFAULT_MODEL)
         self._refresh_reasoning_options(DEFAULT_MODEL)
@@ -865,6 +866,7 @@ class MainWindow(QMainWindow):
         advanced_layout.addWidget(rerun_box)
         reports_layout.addWidget(advanced_box)
         tabs.addTab(reports_tab, "Reports")
+        tabs.addTab(self._build_review_tab(), "Review")
 
         discussion_tab = QWidget()
         discussion_layout = QVBoxLayout(discussion_tab)
@@ -921,6 +923,79 @@ class MainWindow(QMainWindow):
         tabs.addTab(logs_tab, "Logs")
 
         return tabs
+
+    def _build_review_tab(self) -> QWidget:
+        review_tab = QWidget()
+        layout = QVBoxLayout(review_tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        review_layout = QVBoxLayout(content)
+        review_layout.setContentsMargins(8, 8, 8, 8)
+        review_layout.setSpacing(8)
+        scroll.setWidget(content)
+        layout.addWidget(scroll)
+
+        overview_box, overview_layout = self._build_reports_section(
+            "Post-audit review state",
+            "Review/recheck candidates are planning artifacts. Candidate for review/recheck does not imply full chunk rerun.",
+        )
+        self.review_status_value = QLabel("No audit session selected.")
+        self.review_status_value.setWordWrap(True)
+        overview_layout.addWidget(self.review_status_value)
+        overview_buttons = QHBoxLayout()
+        self.refresh_review_summary_button = QPushButton("Refresh Review Summary")
+        self.refresh_review_summary_button.clicked.connect(self.controller.refresh_review_summary)
+        self.prepare_review_summary_button = QPushButton("Prepare Review Summary")
+        self.prepare_review_summary_button.clicked.connect(self.controller.prepare_review_summary)
+        self.open_review_folder_button = QPushButton("Open Review Files Folder")
+        self.open_review_folder_button.clicked.connect(self._open_review_folder)
+        self.open_issue_rechecks_button = QPushButton("Open issue_rechecks.json")
+        self.open_issue_rechecks_button.clicked.connect(self._open_issue_rechecks_sidecar)
+        overview_buttons.addWidget(self.refresh_review_summary_button)
+        overview_buttons.addWidget(self.prepare_review_summary_button)
+        overview_buttons.addWidget(self.open_review_folder_button)
+        overview_buttons.addWidget(self.open_issue_rechecks_button)
+        overview_buttons.addStretch(1)
+        overview_layout.addLayout(overview_buttons)
+        review_layout.addWidget(overview_box)
+
+        accepted_box, accepted_layout = self._build_reports_section(
+            "Accepted recheck overlays",
+            "Accepted family rechecks are advisory report overlays; canonical issue records are not modified.",
+        )
+        self.review_accepted_rechecks_value = QPlainTextEdit()
+        self.review_accepted_rechecks_value.setReadOnly(True)
+        self.review_accepted_rechecks_value.setMinimumHeight(120)
+        self.review_accepted_rechecks_value.setPlainText("No accepted issue-family rechecks found.")
+        accepted_layout.addWidget(self.review_accepted_rechecks_value)
+        review_layout.addWidget(accepted_box)
+
+        candidate_box, candidate_layout = self._build_reports_section(
+            "Candidate/action inventory",
+            "Prepared sidecars summarize issue-level rechecks, grouping reviews, verification-script checks, and true chunk reruns separately.",
+        )
+        self.review_candidate_summary_value = QPlainTextEdit()
+        self.review_candidate_summary_value.setReadOnly(True)
+        self.review_candidate_summary_value.setMinimumHeight(130)
+        self.review_candidate_summary_value.setPlainText("No candidate inventory prepared yet.")
+        candidate_layout.addWidget(self.review_candidate_summary_value)
+        review_layout.addWidget(candidate_box)
+
+        family_box, family_layout = self._build_reports_section(
+            "Dependency families",
+            "Prepared family sidecars consolidate overlapping dependency-propagation groups for human review.",
+        )
+        self.review_family_summary_value = QPlainTextEdit()
+        self.review_family_summary_value.setReadOnly(True)
+        self.review_family_summary_value.setMinimumHeight(150)
+        self.review_family_summary_value.setPlainText("No issue-family summary prepared yet.")
+        family_layout.addWidget(self.review_family_summary_value)
+        review_layout.addWidget(family_box)
+
+        review_layout.addStretch(1)
+        return review_tab
 
     def _show_logs_tab(self) -> None:
         tabs = getattr(self, "tabs", None)
@@ -1229,6 +1304,7 @@ class MainWindow(QMainWindow):
             self.verification_inventory_warning_value.setText("")
 
         self._update_report_freshness_labels(payload.get("report_freshness") or {})
+        self._update_review_summary(payload.get("review_summary") or {})
         self._apply_button_states()
 
     def _update_cache_reuse_status(self, diagnostics: dict[str, Any]) -> None:
@@ -1283,6 +1359,128 @@ class MainWindow(QMainWindow):
             "Verification Report",
             reports.get("verification") if isinstance(reports.get("verification"), dict) else {},
         )
+
+    def _update_review_summary(self, summary: dict[str, Any]) -> None:
+        if not hasattr(self, "review_status_value"):
+            return
+        if isinstance(summary, dict):
+            self._last_status_payload.setdefault("review_summary", summary)
+            self._last_status_payload["review_summary"] = summary
+        if not isinstance(summary, dict) or not summary.get("available"):
+            message = str((summary or {}).get("message") or (summary or {}).get("error") or "No audit review state available.")
+            self.review_status_value.setText(message)
+            self.review_accepted_rechecks_value.setPlainText("No accepted issue-family rechecks found.")
+            self.review_candidate_summary_value.setPlainText("No candidate inventory prepared yet.")
+            self.review_family_summary_value.setPlainText("No issue-family summary prepared yet.")
+            self._refresh_review_open_buttons()
+            return
+
+        issues = summary.get("issue_inventory") or {}
+        accepted = summary.get("accepted_rechecks") or {}
+        candidates = summary.get("candidate_inventory") or {}
+        families = summary.get("issue_families") or {}
+        stale_reports = summary.get("reports_stale_due_to_issue_rechecks") or []
+        status_lines = [
+            f"Open issues: {int(issues.get('open', 0) or 0)} "
+            f"({int(issues.get('high_or_critical_open', 0) or 0)} high/critical)",
+            f"Accepted issue-family rechecks: {int(accepted.get('accepted_recheck_count', 0) or 0)}",
+            f"Prepared review candidates: {int(candidates.get('candidate_count', 0) or 0)}",
+            f"Prepared issue families: {int(families.get('total_families', 0) or 0)}",
+        ]
+        if stale_reports:
+            status_lines.append("Reports stale due to issue rechecks: " + ", ".join(str(item) for item in stale_reports))
+        warnings = summary.get("warnings") or []
+        if warnings:
+            status_lines.append("Warnings: " + "; ".join(str(item) for item in warnings[:3]))
+        self.review_status_value.setText(" | ".join(status_lines))
+        self.review_accepted_rechecks_value.setPlainText(self._format_review_rechecks(accepted))
+        self.review_candidate_summary_value.setPlainText(self._format_review_candidates(candidates))
+        self.review_family_summary_value.setPlainText(self._format_review_families(families))
+        self._refresh_review_open_buttons()
+
+    def _format_review_rechecks(self, accepted: dict[str, Any]) -> str:
+        if not isinstance(accepted, dict) or not accepted.get("available"):
+            return "No accepted issue-family rechecks found."
+        lines = [
+            f"Accepted rechecks: {int(accepted.get('accepted_recheck_count', 0) or 0)}",
+            f"Families: {int(accepted.get('family_count', 0) or 0)}",
+            f"Downstream-covered issues: {int(accepted.get('downstream_covered_issue_count', 0) or 0)}",
+            f"Human-review issue flags: {int(accepted.get('human_review_issue_count', 0) or 0)}",
+        ]
+        for family in accepted.get("families") or []:
+            if not isinstance(family, dict):
+                continue
+            lines.append("")
+            lines.append(f"{family.get('family_id') or '(family)'}")
+            upstream = ", ".join(family.get("upstream_issue_ids") or []) or "none"
+            downstream = ", ".join(family.get("downstream_issue_ids") or []) or "none"
+            lines.append(f"- Upstream: {upstream}")
+            lines.append(f"- Downstream-covered: {downstream}")
+            if family.get("needs_human_review"):
+                lines.append("- Needs human review: yes")
+            treatment = str(family.get("final_report_treatment") or "").strip()
+            if treatment:
+                lines.append(f"- Final-report treatment: {treatment}")
+            note = str(family.get("summary") or "").strip()
+            if note:
+                lines.append(f"- Summary: {note[:500]}")
+        return "\n".join(lines)
+
+    def _format_review_candidates(self, candidates: dict[str, Any]) -> str:
+        if not isinstance(candidates, dict) or not candidates.get("available"):
+            return "No candidate inventory prepared yet. Click Prepare Review Summary to create review/rerun_recheck_candidates.json."
+        type_summary = candidates.get("candidate_type_summary") or {}
+        action_counts = candidates.get("recommended_action_kind_counts") or {}
+        lines = [
+            f"Prepared at: {candidates.get('generated_at') or 'unknown'}",
+            f"Total candidates: {int(candidates.get('candidate_count', 0) or 0)}",
+            f"Dependency groups: {int(candidates.get('group_count', 0) or 0)}",
+            "",
+            "Candidate type summary",
+            f"- Full chunk rerun candidates: {int(type_summary.get('full_chunk_rerun_candidates', 0) or 0)}",
+            f"- Issue-level recheck candidates: {int(type_summary.get('issue_level_recheck_candidates', 0) or 0)}",
+            f"- Dependency grouping candidates: {int(type_summary.get('dependency_grouping_candidates', 0) or 0)}",
+            f"- Verification script/claim recheck candidates: {int(type_summary.get('verification_script_claim_recheck_candidates', 0) or 0)}",
+            f"- Technical recovery candidates: {int(type_summary.get('technical_recovery_candidates', 0) or 0)}",
+            f"- Notation/regime clarification candidates: {int(type_summary.get('notation_regime_clarification_candidates', 0) or 0)}",
+            "",
+            "Recommended action counts",
+        ]
+        for key in ("issue_recheck", "dependency_group_review", "script_recheck", "chunk_rerun", "technical_retry", "human_review"):
+            lines.append(f"- {key}: {int(action_counts.get(key, 0) or 0)}")
+        return "\n".join(lines)
+
+    def _format_review_families(self, families: dict[str, Any]) -> str:
+        if not isinstance(families, dict) or not families.get("available"):
+            return "No issue-family summary prepared yet. Click Prepare Review Summary to create review/issue_recheck_families.json."
+        lines = [
+            f"Families: {int(families.get('total_families', 0) or 0)}",
+            f"Issue IDs covered: {int(families.get('issue_ids_covered', 0) or 0)}",
+            f"High/critical unassigned: {len(families.get('high_critical_unassigned') or [])}",
+        ]
+        overlaps = families.get("issues_appearing_in_multiple_families") or []
+        if overlaps:
+            issue_ids = []
+            for item in overlaps[:8]:
+                if isinstance(item, dict):
+                    issue_ids.append(str(item.get("issue_id") or ""))
+                else:
+                    issue_ids.append(str(item))
+            lines.append("Overlaps needing review: " + ", ".join(item for item in issue_ids if item))
+        for family in families.get("families") or []:
+            if not isinstance(family, dict):
+                continue
+            lines.append("")
+            lines.append(f"{family.get('family_id')}: {family.get('title')}")
+            lines.append(f"- Priority: {family.get('priority') or 'unknown'}")
+            lines.append(f"- Recommended action: {family.get('recommended_action') or 'unknown'}")
+            upstream = ", ".join(family.get("primary_upstream_issue_ids") or []) or "none"
+            downstream = ", ".join(family.get("downstream_issue_ids") or []) or "none"
+            references = ", ".join(family.get("main_references") or []) or "none"
+            lines.append(f"- Upstream: {upstream}")
+            lines.append(f"- Downstream: {downstream}")
+            lines.append(f"- Main references: {references}")
+        return "\n".join(lines)
 
     def _set_report_freshness_label(self, label: QLabel, report_label: str, info: dict[str, Any]) -> None:
         status = str((info or {}).get("status") or "unknown").strip().lower()
@@ -1375,9 +1573,12 @@ class MainWindow(QMainWindow):
         self.build_concise_button.setEnabled(session_ready)
         self.run_verification_button.setEnabled(session_ready)
         self.rebuild_verification_button.setEnabled(session_ready)
+        self.refresh_review_summary_button.setEnabled(session_available and not self._task_running)
+        self.prepare_review_summary_button.setEnabled(session_ready)
         self.rerun_selected_button.setEnabled(session_ready and not pending_response)
         self.select_rerun_chunks_button.setEnabled(session_ready and bool(self._available_rerun_chunks()))
         self._refresh_report_open_buttons()
+        self._refresh_review_open_buttons()
         self.export_chatgpt_context_pack_button.setEnabled(session_ready)
         self._refresh_chatgpt_export_buttons()
         self.rerun_failed_verification_button.setEnabled(
@@ -1430,6 +1631,30 @@ class MainWindow(QMainWindow):
             "verification": reports_dir / f"{stem}_verification_report.tex",
         }
 
+    def _selected_review_paths(self) -> dict[str, Path]:
+        summary = (self._last_status_payload or {}).get("review_summary") or {}
+        paths = summary.get("paths") if isinstance(summary, dict) else {}
+        if isinstance(paths, dict) and paths:
+            return {
+                key: Path(value)
+                for key, value in paths.items()
+                if isinstance(value, str) and value.strip()
+            }
+        session = (self._last_status_payload or {}).get("session") or {}
+        workdir = str(session.get("workdir") or "").strip()
+        if not workdir:
+            return {}
+        root = Path(workdir)
+        review_dir = root / "review"
+        return {
+            "review_dir": review_dir,
+            "candidate_json": review_dir / "rerun_recheck_candidates.json",
+            "candidate_markdown": review_dir / "rerun_recheck_candidates.md",
+            "families_json": review_dir / "issue_recheck_families.json",
+            "families_markdown": review_dir / "issue_recheck_families.md",
+            "issue_rechecks_json": root / "state" / "issue_rechecks.json",
+        }
+
     def _refresh_report_open_buttons(self) -> None:
         if not hasattr(self, "open_full_report_button"):
             return
@@ -1440,6 +1665,15 @@ class MainWindow(QMainWindow):
             bool(paths.get("verification") and paths["verification"].is_file())
         )
         self.open_reports_folder_button.setEnabled(bool(paths.get("folder") and paths["folder"].is_dir()))
+
+    def _refresh_review_open_buttons(self) -> None:
+        if not hasattr(self, "open_review_folder_button"):
+            return
+        paths = self._selected_review_paths()
+        self.open_review_folder_button.setEnabled(bool(paths.get("review_dir") and paths["review_dir"].is_dir()))
+        self.open_issue_rechecks_button.setEnabled(
+            bool(paths.get("issue_rechecks_json") and paths["issue_rechecks_json"].is_file())
+        )
 
     def _open_path_in_default_app(self, path: Path, description: str) -> None:
         if not path.exists():
@@ -1452,6 +1686,34 @@ class MainWindow(QMainWindow):
             message = f"Could not open {description} with the system default application: {path}"
             self._append_log(message)
             self._append_report_output(message)
+
+    def _open_review_folder(self) -> None:
+        paths = self._selected_review_paths()
+        folder = paths.get("review_dir")
+        if folder is None:
+            self._append_log("No selected audit session is available for opening the review folder.")
+            return
+        if not folder.is_dir():
+            message = "Review folder has not been created yet. Click Prepare Review Summary first."
+            self._append_log(message)
+            self._append_report_output(message)
+            self._refresh_review_open_buttons()
+            return
+        self._open_path_in_default_app(folder, "review files folder")
+
+    def _open_issue_rechecks_sidecar(self) -> None:
+        paths = self._selected_review_paths()
+        path = paths.get("issue_rechecks_json")
+        if path is None:
+            self._append_log("No selected audit session is available for opening issue_rechecks.json.")
+            return
+        if not path.is_file():
+            message = "No accepted issue-family recheck sidecar exists yet."
+            self._append_log(message)
+            self._append_report_output(message)
+            self._refresh_review_open_buttons()
+            return
+        self._open_path_in_default_app(path, "issue rechecks sidecar")
 
     def _open_report_tex(self, kind: str) -> None:
         paths = self._selected_report_paths()

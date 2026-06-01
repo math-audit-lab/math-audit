@@ -566,17 +566,22 @@ def prepare_issue_recheck_families(
     output_dir: Path,
     *,
     candidates_json: Path | None = None,
+    allow_output_inside_audit: bool = False,
 ) -> dict[str, Any]:
     audit_workdir = audit_workdir.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
     if not audit_workdir.exists():
         raise RuntimeError(f"Audit workdir does not exist: {audit_workdir}")
-    if output_dir == audit_workdir or audit_workdir in output_dir.parents:
+    if not allow_output_inside_audit and (output_dir == audit_workdir or audit_workdir in output_dir.parents):
         raise RuntimeError("Output directory must not be inside the source audit workdir.")
 
     if candidates_json is None:
         candidate_dir = output_dir / "candidate_inventory"
-        candidate_manifest = prepare_rerun_recheck_candidates(audit_workdir, candidate_dir)
+        candidate_manifest = prepare_rerun_recheck_candidates(
+            audit_workdir,
+            candidate_dir,
+            allow_output_inside_audit=allow_output_inside_audit,
+        )
         candidates_json_path = candidate_dir / "rerun_recheck_candidates.json"
     else:
         candidates_json_path = candidates_json.expanduser().resolve()
@@ -599,7 +604,11 @@ def prepare_issue_recheck_families(
         "audit_workdir": str(audit_workdir),
         "candidates_json": str(candidates_json_path),
         "output_dir": str(output_dir),
-        "source_mutation_policy": "read-only; source audit folder and candidate JSON are never modified",
+        "source_mutation_policy": (
+            "read-only; canonical audit state and candidate JSON are never modified"
+            if allow_output_inside_audit
+            else "read-only; source audit folder and candidate JSON are never modified"
+        ),
         "source_fingerprint": _source_fingerprint(source_paths),
         "summary": summary,
         "families": families,

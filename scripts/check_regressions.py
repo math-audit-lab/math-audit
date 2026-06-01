@@ -2703,6 +2703,116 @@ def test_prepare_issue_recheck_families_script() -> None:
             raise RegressionFailure("Issue family script allowed output inside source audit workdir")
 
 
+def test_post_audit_review_summary_helpers() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_review_summary_regression_") as tmp:
+        root = Path(tmp)
+        source = root / "source_audit"
+        session = _seed_state(source)
+        _write_json(
+            session_paths(source)["issues"],
+            {
+                "updated_at": NEW,
+                "issues": [
+                    {
+                        "issue_id": "I057",
+                        "chunk_id": "chunk_026",
+                        "status": "open",
+                        "severity": "medium",
+                        "title": "Proof cites equation (34), the identity being proved",
+                        "description": "Reference should point to the finite-difference identity.",
+                        "evidence": "The proof cites the formula it is proving.",
+                        "proposed_fix": "Cite the earlier identity plus Leibniz rule.",
+                        "tags": ["circular-citation", "wrong-reference"],
+                    },
+                    {
+                        "issue_id": "I071",
+                        "chunk_id": "chunk_033",
+                        "status": "open",
+                        "severity": "high",
+                        "title": "Theorem 4.1 inherits equation (34) dependence",
+                        "description": "Downstream warning about equation (34).",
+                        "evidence": "The theorem uses equation (34).",
+                        "proposed_fix": "Group under I057 after review.",
+                        "tags": ["dependency", "downstream"],
+                    },
+                ],
+            },
+        )
+        _write_json(
+            session_paths(source)["manifest"],
+            {
+                "chunks": [
+                    {"chunk_id": "chunk_026", "chunk_index": 26, "page_start": 10, "page_end": 10},
+                    {"chunk_id": "chunk_033", "chunk_index": 33, "page_start": 14, "page_end": 14},
+                ]
+            },
+        )
+        issue_rechecks_path = source / "state" / "issue_rechecks.json"
+        _write_json(
+            issue_rechecks_path,
+            {
+                "schema_version": 1,
+                "updated_at": NEW,
+                "rechecks": [
+                    {
+                        "recheck_id": "recheck_F004_001",
+                        "family_id": "F004",
+                        "source_result_path": "/tmp/family_recheck_result.json",
+                        "source_output_dir": "/tmp/family_recheck",
+                        "accepted_at": NEW,
+                        "review_method": "llm_issue_family_recheck",
+                        "verdict": "I057 is upstream; I071 is downstream-covered.",
+                        "upstream_issue_ids": ["I057"],
+                        "downstream_issue_ids": ["I071"],
+                        "false_positive_issue_ids": [],
+                        "recommended_severity_by_issue": [
+                            {"issue_id": "I057", "severity": "medium", "rationale": "repairable reference issue"},
+                            {"issue_id": "I071", "severity": "downstream-covered", "rationale": "not independent"},
+                        ],
+                        "recommended_status_by_issue": [
+                            {"issue_id": "I071", "status": "downstream-covered", "rationale": "group under I057"}
+                        ],
+                        "grouping_recommendations": [
+                            {
+                                "upstream_issue_id": "I057",
+                                "downstream_issue_ids": ["I071"],
+                                "rationale": "The later issue is a consequence of the same equation (34) citation.",
+                            }
+                        ],
+                        "final_report_treatment": "Report I057 and mention I071 as downstream-covered.",
+                        "evidence_for": ["The proof cites equation (34)."],
+                        "evidence_against": [],
+                        "confidence": "medium",
+                        "needs_human_review": False,
+                        "summary": "Group downstream issue under upstream citation issue.",
+                    }
+                ],
+            },
+        )
+        before_issues = session_paths(source)["issues"].read_text(encoding="utf-8")
+        before_rechecks = issue_rechecks_path.read_text(encoding="utf-8")
+
+        summary = runtime.load_post_audit_review_summary(session)
+        _assert(summary["accepted_rechecks"]["accepted_recheck_count"] == 1, summary)
+        _assert(summary["accepted_rechecks"]["downstream_covered_issue_count"] == 1, summary)
+        _assert(not summary["candidate_inventory"]["available"], summary["candidate_inventory"])
+
+        prepared = runtime.prepare_post_audit_review_summary(session)
+        review_dir = source / "review"
+        _assert((review_dir / "rerun_recheck_candidates.json").exists(), "candidate sidecar missing")
+        _assert((review_dir / "issue_recheck_families.json").exists(), "family sidecar missing")
+        _assert(prepared["candidate_inventory"]["available"], prepared["candidate_inventory"])
+        _assert(prepared["issue_families"]["available"], prepared["issue_families"])
+        _assert(session_paths(source)["issues"].read_text(encoding="utf-8") == before_issues, "issues state changed")
+        _assert(issue_rechecks_path.read_text(encoding="utf-8") == before_rechecks, "issue recheck sidecar changed")
+
+        source_without_sidecar = root / "source_without_sidecar_audit"
+        session_without_sidecar = _seed_state(source_without_sidecar)
+        summary_without_sidecar = runtime.load_post_audit_review_summary(session_without_sidecar)
+        _assert(summary_without_sidecar["available"], summary_without_sidecar)
+        _assert(not summary_without_sidecar["accepted_rechecks"]["available"], summary_without_sidecar)
+
+
 def test_run_issue_family_recheck_dry_run() -> None:
     validate_result_schema(RESULT_SCHEMA)
     bad_schema = json.loads(json.dumps(RESULT_SCHEMA))
@@ -3038,6 +3148,7 @@ def main() -> int:
         ("issue recheck candidate script", test_prepare_issue_recheck_candidates_script),
         ("rerun/recheck candidate inventory script", test_prepare_rerun_recheck_candidates_script),
         ("issue recheck family consolidation script", test_prepare_issue_recheck_families_script),
+        ("post-audit review summary helpers", test_post_audit_review_summary_helpers),
         ("issue family recheck dry-run script", test_run_issue_family_recheck_dry_run),
         ("issue family recheck import script", test_import_issue_family_recheck_script),
         ("python check literal newline escape repair", test_python_check_literal_newline_escape_repair),

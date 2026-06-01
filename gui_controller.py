@@ -33,10 +33,12 @@ from audit_runtime import (
     get_failed_verification_chunks,
     get_audit_status,
     get_verification_suite_status,
+    load_post_audit_review_summary,
     list_qa_threads,
     load_qa_turns,
     model_choices,
     normalize_model_and_reasoning_effort,
+    prepare_post_audit_review_summary,
     request_pause,
     rerun_failed_verification_chunks as runtime_rerun_failed_verification_chunks,
     rerun_selected_chunks as runtime_rerun_selected_chunks,
@@ -255,6 +257,7 @@ class GuiController(QObject):
     cancel_task_running_changed = Signal(bool)
     audit_settings_changed = Signal(str, str)
     audit_context_mode_changed = Signal(str)
+    review_summary_updated = Signal(dict)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -711,6 +714,26 @@ class GuiController(QObject):
             self.pdf_path,
         )
 
+    def refresh_review_summary(self) -> None:
+        if not self._require_session():
+            return
+        try:
+            summary = load_post_audit_review_summary(self.pdf_path)
+        except Exception as exc:
+            summary = {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+            self.log_message.emit(f"Review summary refresh failed: {summary['error']}")
+        self.review_summary_updated.emit(summary)
+
+    def prepare_review_summary(self) -> None:
+        if not self._require_session():
+            return
+        self._run_backend_task(
+            "Prepare Review Summary",
+            prepare_post_audit_review_summary,
+            self._handle_review_summary_result,
+            self.pdf_path,
+        )
+
     def run_verification_suite(self) -> None:
         if not self._require_session():
             return
@@ -1052,6 +1075,23 @@ class GuiController(QObject):
             self.log_message.emit(message)
             self.report_output.emit(message)
 
+    def _handle_review_summary_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected review-summary result.")
+            return
+        self.review_summary_updated.emit(dict(result))
+        review_dir = str(result.get("review_dir") or "").strip()
+        candidate = result.get("candidate_inventory") or {}
+        families = result.get("issue_families") or {}
+        candidate_count = int(candidate.get("candidate_count", 0) or 0)
+        family_count = int(families.get("total_families", 0) or 0)
+        message = f"Review summary prepared: {candidate_count} candidate(s), {family_count} issue family/families."
+        if review_dir:
+            message += f"\nReview sidecars: {review_dir}"
+        self.log_message.emit(message)
+        self.report_output.emit(message)
+        self._emit_current_status()
+
     def _handle_verification_suite_result(self, result: Any) -> None:
         if not isinstance(result, dict):
             self.report_output.emit("Unexpected verification-suite result.")
@@ -1236,6 +1276,13 @@ class GuiController(QObject):
                 "inventory_warning": {"has_invalidated_obligations": False},
                 "error": f"{type(exc).__name__}: {exc}",
             }
+        try:
+            info["review_summary"] = load_post_audit_review_summary(self.pdf_path)
+        except Exception as exc:
+            info["review_summary"] = {
+                "available": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
         return self._normalize_status_payload(info)
 
     def _empty_status_payload(self, status_name: str, message: str) -> dict[str, Any]:
@@ -1283,6 +1330,7 @@ class GuiController(QObject):
                     "verification": {"status": "missing"},
                 }
             },
+            "review_summary": {"available": False, "message": message},
             "message": message,
             "session_available": False,
             "pdf_selected": bool(self.pdf_path),
@@ -1293,6 +1341,7 @@ class GuiController(QObject):
         payload["session_available"] = payload.get("session") is not None
         payload["pdf_selected"] = bool(self.pdf_path)
         payload.setdefault("report_freshness", {"reports": {}})
+        payload.setdefault("review_summary", {"available": False})
         payload.setdefault("message", "")
         return payload
 
