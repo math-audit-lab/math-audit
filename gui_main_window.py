@@ -42,6 +42,22 @@ from PySide6.QtWidgets import (
 from gui_controller import AUDIT_CONTEXT_MODE_CHOICES, AUDIT_CONTEXT_MODE_LABELS, DEFAULT_MODEL, MODEL_CHOICES, GuiController
 
 
+def _set_plain_text_preserving_scroll(widget: QPlainTextEdit, text: str) -> bool:
+    clean = str(text or "")
+    if widget.toPlainText() == clean:
+        return False
+    scrollbar = widget.verticalScrollBar()
+    previous_value = scrollbar.value()
+    previous_maximum = scrollbar.maximum()
+    was_at_bottom = previous_maximum > 0 and previous_value >= previous_maximum - 2
+    widget.setPlainText(clean)
+    if was_at_bottom:
+        scrollbar.setValue(scrollbar.maximum())
+    else:
+        scrollbar.setValue(min(previous_value, scrollbar.maximum()))
+    return True
+
+
 class AuditPromptDialog(QDialog):
     def __init__(self, controller: GuiController, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1369,9 +1385,18 @@ class MainWindow(QMainWindow):
         if not isinstance(summary, dict) or not summary.get("available"):
             message = str((summary or {}).get("message") or (summary or {}).get("error") or "No audit review state available.")
             self.review_status_value.setText(message)
-            self.review_accepted_rechecks_value.setPlainText("No accepted issue-family rechecks found.")
-            self.review_candidate_summary_value.setPlainText("No candidate inventory prepared yet.")
-            self.review_family_summary_value.setPlainText("No issue-family summary prepared yet.")
+            _set_plain_text_preserving_scroll(
+                self.review_accepted_rechecks_value,
+                "No accepted issue-family rechecks found.",
+            )
+            _set_plain_text_preserving_scroll(
+                self.review_candidate_summary_value,
+                "No candidate inventory prepared yet.",
+            )
+            _set_plain_text_preserving_scroll(
+                self.review_family_summary_value,
+                "No issue-family summary prepared yet.",
+            )
             self._refresh_review_open_buttons()
             return
 
@@ -1393,9 +1418,18 @@ class MainWindow(QMainWindow):
         if warnings:
             status_lines.append("Warnings: " + "; ".join(str(item) for item in warnings[:3]))
         self.review_status_value.setText(" | ".join(status_lines))
-        self.review_accepted_rechecks_value.setPlainText(self._format_review_rechecks(accepted))
-        self.review_candidate_summary_value.setPlainText(self._format_review_candidates(candidates))
-        self.review_family_summary_value.setPlainText(self._format_review_families(families))
+        _set_plain_text_preserving_scroll(
+            self.review_accepted_rechecks_value,
+            self._format_review_rechecks(accepted),
+        )
+        _set_plain_text_preserving_scroll(
+            self.review_candidate_summary_value,
+            self._format_review_candidates(candidates),
+        )
+        _set_plain_text_preserving_scroll(
+            self.review_family_summary_value,
+            self._format_review_families(families),
+        )
         self._refresh_review_open_buttons()
 
     def _format_review_rechecks(self, accepted: dict[str, Any]) -> str:

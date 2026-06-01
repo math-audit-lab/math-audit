@@ -1034,6 +1034,58 @@ def test_chunk_completion_log_line_formatting() -> None:
     _assert(started == "[chunk_013] started | Progress: 12/81", started)
 
 
+def test_plain_text_scroll_preservation_helper() -> None:
+    from gui_main_window import _set_plain_text_preserving_scroll
+
+    class FakeScrollBar:
+        def __init__(self, value: int, maximum: int) -> None:
+            self._value = value
+            self._maximum = maximum
+
+        def value(self) -> int:
+            return self._value
+
+        def maximum(self) -> int:
+            return self._maximum
+
+        def setValue(self, value: int) -> None:
+            self._value = int(value)
+
+    class FakePlainText:
+        def __init__(self, text: str, value: int, maximum: int) -> None:
+            self._text = text
+            self.scrollbar = FakeScrollBar(value, maximum)
+            self.set_count = 0
+            self.next_maximum = maximum
+
+        def toPlainText(self) -> str:
+            return self._text
+
+        def verticalScrollBar(self) -> FakeScrollBar:
+            return self.scrollbar
+
+        def setPlainText(self, text: str) -> None:
+            self.set_count += 1
+            self._text = text
+            self.scrollbar._maximum = self.next_maximum
+
+    unchanged = FakePlainText("same", value=30, maximum=100)
+    _assert(not _set_plain_text_preserving_scroll(unchanged, "same"), "unchanged text was rewritten")
+    _assert(unchanged.set_count == 0, "unchanged text reset the widget")
+    _assert(unchanged.scrollbar.value() == 30, "unchanged text moved the scrollbar")
+
+    changed = FakePlainText("old", value=40, maximum=100)
+    changed.next_maximum = 90
+    _assert(_set_plain_text_preserving_scroll(changed, "new"), "changed text was not written")
+    _assert(changed.set_count == 1, "changed text was not set exactly once")
+    _assert(changed.scrollbar.value() == 40, "scrollbar position was not preserved")
+
+    bottom = FakePlainText("old", value=100, maximum=100)
+    bottom.next_maximum = 180
+    _assert(_set_plain_text_preserving_scroll(bottom, "new longer text"), "bottom text was not written")
+    _assert(bottom.scrollbar.value() == 180, "bottom scroll position did not stay at bottom")
+
+
 def test_completed_status_reconciles_from_chunk_records() -> None:
     with tempfile.TemporaryDirectory(prefix="math_audit_status_reconcile_") as tmp:
         root = Path(tmp)
@@ -3131,6 +3183,7 @@ def main() -> int:
         ("fresh context issue generic-term downweighting", test_fresh_context_issue_retrieval_downweights_generic_terms),
         ("context mode mixing guardrails", test_context_mode_mixing_guardrails),
         ("chunk completion log line formatting", test_chunk_completion_log_line_formatting),
+        ("plain text scroll preservation helper", test_plain_text_scroll_preservation_helper),
         ("completed status reconciliation", test_completed_status_reconciles_from_chunk_records),
         ("persistent audit log preview", test_persistent_audit_log_preview),
         ("resume preserves saved audit context mode", test_resume_preserves_saved_audit_context_mode),
