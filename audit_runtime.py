@@ -344,18 +344,26 @@ _JSON_ESCAPE_ARTIFACTS = {
     "\x0c": r"\f",
 }
 _JSON_CONTROL_ESCAPE_ARTIFACT_RE = re.compile(r"\\u00(?:0[0-9A-Fa-f]|1[0-9A-Fa-f])", re.IGNORECASE)
+_JSON_CONTROL_TEX_COMMANDS = (
+    r"Omega|omega|sigma|vartheta|theta|lambda|Lambda|alpha|beta|gamma|delta|varepsilon|epsilon|rho|tau|phi|chi|pi|"
+    r"prod|sum|cdots|times|ge|le|mid|nmid|ne|ni|notin|nabla|infty|equiv|pm"
+)
 _PERSISTED_JSON_ESCAPE_ARTIFACT_COMMAND_RE = re.compile(
     r"\\\\(?=(?:"
     r"frac|dfrac|tfrac|binom|dbinom|tbinom|beta|blambda|bar|bmod|bigl|bigr|Bigl|Bigr"
     r")\b)"
 )
 _JSON_CONTROL_TEX_PREFIX_RE = re.compile(
-    r"[\x07\x0b](?=(?:hat|lambda|rho|frac|beta|alpha|gamma|theta|varepsilon|epsilon|sigma|omega|mu|nu|ell)\b)"
+    rf"[\x04\x07\x0b](?=(?:hat|mu|nu|ell|{_JSON_CONTROL_TEX_COMMANDS})\b)"
 )
 _JSON_CONTROL_ESCAPE_TEX_PREFIX_RE = re.compile(
-    r"\\u00(?:07|0b)(?=(?:hat|lambda|rho|frac|beta|alpha|gamma|theta|varepsilon|epsilon|sigma|omega|mu|nu|ell)\b)",
+    rf"\\u00(?:04|07|0b)(?=(?:hat|mu|nu|ell|{_JSON_CONTROL_TEX_COMMANDS})\b)",
     re.IGNORECASE,
 )
+_JSON_NEWLINE_TEX_N_COMMAND_RE = re.compile(r"\n(?=(?:abla|e\b|i\b|mid\b|otin\b|u\b))")
+_JSON_NEWLINE_TEX_COMMAND_RE = re.compile(r"\n(?=times)")
+_JSON_TAB_TEX_COMMAND_RE = re.compile(r"\t(?=(?:imes|heta|au\b|o\b))")
+_JSON_CR_TEX_COMMAND_RE = re.compile(r"\r(?=(?:ho\b|ight\b))")
 _PERSISTED_HAT_BLAMBDA_ARTIFACT_RE = re.compile(r"(?<![A-Za-z])\\?hat\\blambda\b")
 _PERSISTED_HAT_BARE_LAMBDA_ARTIFACT_RE = re.compile(r"(\\hat\\lambda=)lambda\b")
 
@@ -366,6 +374,10 @@ def _repair_json_escape_artifacts(text: str) -> str:
         text = text.replace(bad, replacement)
     text = _JSON_CONTROL_TEX_PREFIX_RE.sub(lambda _m: "\\", text)
     text = _JSON_CONTROL_ESCAPE_TEX_PREFIX_RE.sub(lambda _m: "\\", text)
+    text = _JSON_NEWLINE_TEX_N_COMMAND_RE.sub(lambda _m: r"\n", text)
+    text = _JSON_NEWLINE_TEX_COMMAND_RE.sub(lambda _m: "\\", text)
+    text = _JSON_TAB_TEX_COMMAND_RE.sub(lambda _m: r"\t", text)
+    text = _JSON_CR_TEX_COMMAND_RE.sub(lambda _m: r"\r", text)
     # Older runs persisted repaired JSON escapes as ``\\frac``/``\\beta``.
     # In math mode that renders as a line break plus plain letters, so restore
     # the intended single TeX command slash for the compact artifact forms.
@@ -373,6 +385,42 @@ def _repair_json_escape_artifacts(text: str) -> str:
     text = _PERSISTED_HAT_BLAMBDA_ARTIFACT_RE.sub(lambda _m: r"\hat\lambda", text)
     text = _PERSISTED_HAT_BARE_LAMBDA_ARTIFACT_RE.sub(lambda m: m.group(1) + r"\lambda", text)
     text = _JSON_CONTROL_ESCAPE_ARTIFACT_RE.sub(" ", text)
+    return text
+
+
+_STRIPPED_MATH_COMMANDS = (
+    "Omega",
+    "omega",
+    "sigma",
+    "vartheta",
+    "theta",
+    "lambda",
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "varepsilon",
+    "epsilon",
+    "rho",
+    "tau",
+    "phi",
+    "chi",
+    "pi",
+    "cdots",
+)
+_STRIPPED_MATH_COMMAND_RE = re.compile(
+    r"(?<![\\A-Za-z])(" + "|".join(_STRIPPED_MATH_COMMANDS) + r")\b"
+)
+
+
+def repair_report_latex_math_command_artifacts(text: str) -> str:
+    """Restore compact TeX command artifacts inside a known math span."""
+    text = _repair_json_escape_artifacts("" if text is None else str(text))
+    text = re.sub(r"(?<!\\)(prod|sum)(?=_)", lambda m: "\\" + m.group(1), text)
+    text = _STRIPPED_MATH_COMMAND_RE.sub(lambda m: "\\" + m.group(1), text)
+    text = re.sub(r"(?<!\\)(?<=[0-9A-Za-z}\]])times(?=[0-9A-Za-z({])", r"\\times ", text)
+    text = re.sub(r"(?<!\\)(?<=[0-9A-Za-z}\]])ge(?=[0-9A-Za-z({])", r"\\ge ", text)
+    text = re.sub(r"(?<!\\)(?<=[0-9A-Za-z}\]])le(?=[0-9A-Za-z({])", r"\\le ", text)
     return text
 
 
@@ -528,6 +576,7 @@ def report_latex_paragraph(text: str) -> str:
         if (part.startswith("$$") and part.endswith("$$")) or (part.startswith("$") and part.endswith("$")):
             delim = "$$" if part.startswith("$$") else "$"
             body = part[len(delim) : -len(delim)]
+            body = repair_report_latex_math_command_artifacts(body)
             body = sanitize_ascii_punctuation(body)
             body = normalize_report_latex_unicode_math(body)
             if _DANGEROUS_MATH_COMMAND_RE.search(body) or _contains_latex_unsupported_unicode(body):

@@ -1287,6 +1287,36 @@ def test_report_latex_unicode_math_safety() -> None:
         _assert(r"\sigma " in rendered_lmj, rendered_lmj)
         _assert(r"\Omega " in rendered_lmj, rendered_lmj)
 
+        i080_valid_math = (
+            r"Example: $n=p^s\prod_{i=1}^s(2q_i-1)$, "
+            r"$\sigma(p^{s+1})$, $1+p+\cdots+p^{s+1}$, "
+            r"$\Omega(n)$, and $3\times13$."
+        )
+        rendered_i080_valid = renderer(i080_valid_math)
+        _assert(r"\prod_{i=1}^s" in rendered_i080_valid, rendered_i080_valid)
+        _assert(r"\sigma(p^{s+1})" in rendered_i080_valid, rendered_i080_valid)
+        _assert(r"\cdots" in rendered_i080_valid, rendered_i080_valid)
+        _assert(r"\Omega(n)" in rendered_i080_valid, rendered_i080_valid)
+        _assert(r"\times13" in rendered_i080_valid, rendered_i080_valid)
+
+        i080_persisted_artifacts = (
+            "Artifact: $n=p^s"
+            + "\x04"
+            + "prod_{i=1}^s(2q_i-1)$, $1+p+cdots+p^{s+1}=sigma(p^{s+1})$, "
+            + "$n\n"
+            + "i S_sigma^{s+1}$, $p\n"
+            + "e 13$, and $n=3\n"
+            + "times13=39$."
+        )
+        rendered_i080_artifacts = renderer(i080_persisted_artifacts)
+        _assert(r"\prod_{i=1}^s" in rendered_i080_artifacts, rendered_i080_artifacts)
+        _assert(r"\cdots" in rendered_i080_artifacts, rendered_i080_artifacts)
+        _assert(r"\sigma(p^{s+1})" in rendered_i080_artifacts, rendered_i080_artifacts)
+        _assert(r"\ni S_\sigma" in rendered_i080_artifacts, rendered_i080_artifacts)
+        _assert(r"\ne 13" in rendered_i080_artifacts, rendered_i080_artifacts)
+        _assert(r"\times13" in rendered_i080_artifacts, rendered_i080_artifacts)
+        _assert("[U+" not in rendered_i080_artifacts, rendered_i080_artifacts)
+
         json_escaped_tex = (
             "Recovered commands: $e^{-\\rho j}\\exp(-"
             + "\x0c"

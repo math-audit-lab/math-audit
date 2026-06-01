@@ -46,6 +46,7 @@ from audit_runtime import (
     format_list_for_markdown,
     normalize_math_delimiters,
     normalize_report_latex_unicode_math,
+    repair_report_latex_math_command_artifacts,
     report_latex_paragraph,
     sanitize_latex_unsupported_unicode,
     sanitize_ascii_punctuation,
@@ -2016,6 +2017,7 @@ def _report_latex_paragraph_local(text: str) -> str:
         if (part.startswith("$$") and part.endswith("$$")) or (part.startswith("$") and part.endswith("$")):
             delim = "$$" if part.startswith("$$") else "$"
             body = part[len(delim) : -len(delim)]
+            body = repair_report_latex_math_command_artifacts(body)
             body = sanitize_ascii_punctuation(body)
             body = _normalize_report_latex_unicode_math(body)
             if _report_math_text_looks_unsafe(body):
