@@ -56,7 +56,7 @@ Private development notebooks may exist outside this public preview. New user-fa
 
 ## Basic Use
 
-See [QUICKSTART.md](QUICKSTART.md) for setup and first-run instructions.
+See [QUICKSTART.md](QUICKSTART.md) for setup and first-run instructions. For a more detailed screenshot-based walkthrough, see [docs/user_guide.md](docs/user_guide.md).
 
 At a high level:
 

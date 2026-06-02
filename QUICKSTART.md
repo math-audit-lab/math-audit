@@ -1,6 +1,6 @@
 # Quickstart
 
-This guide gets the experimental Math Paper Audit GUI running from a fresh checkout.
+This guide gets the experimental Math Paper Audit GUI running from a fresh checkout. For a fuller screenshot-based walkthrough, see [`docs/user_guide.md`](docs/user_guide.md).
 
 ## 1. Create the Conda Environment
 
