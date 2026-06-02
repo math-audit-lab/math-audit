@@ -34,10 +34,10 @@ This does not run an audit or make an OpenAI API call. Missing optional items su
 
 The GUI has an API key field in the setup area. Paste your key there before starting/resuming an audit or using the discussion pane.
 
-For notebook/backend maintenance work, you can also set:
+For backend or developer maintenance work, you can also set:
 
 ```bash
-export OPENAI_API_KEY="sk-..."
+export OPENAI_API_KEY="your_api_key_here"
 ```
 
 The current GUI live-call guard expects the key to be entered in the GUI field.
@@ -50,7 +50,7 @@ From the activated environment:
 python audit_gui.py
 ```
 
-The PySide6 app is the primary maintained frontend. The notebook is secondary/debug-maintenance only.
+The PySide6 app is the primary maintained frontend for this public preview.
 
 ## 4. Basic Workflow
 
@@ -79,6 +79,14 @@ The GUI can open the generated TeX report files and the reports folder. To compi
 The audit can generate local Python verification scripts. The GUI shows how many scripts exist, which script is running, and PASS/FAIL/TIMEOUT/SKIPPED outcomes.
 
 Verification scripts are heuristic support evidence. They are not a substitute for mathematical judgment.
+
+## Experimental Context Modes
+
+The default context mode is the stable continuous-conversation audit flow. The `fresh_context_experimental` mode is still experimental: it can be useful for long audits or for reducing dependence on a single long conversation/file-service state, but continuous mode may be cheaper for short PDF-only audits when context-cache reuse is good.
+
+## Public Release Hygiene
+
+Do not commit audit outputs, paper PDFs/TeX sources, request/response logs, generated reports, verification scripts/results, rerun folders, or review sidecars. These artifacts may contain paper text, model responses, local filesystem paths, and sensitive review material.
 
 ## ChatGPT Context Pack Export
 

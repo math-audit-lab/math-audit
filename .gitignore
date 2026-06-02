@@ -35,11 +35,20 @@ venv/
 *_audit/
 *_audit_archived_*/
 exports/
+requests/
+responses/
+reports/
+review/
+state/
+prompts/
+latex_patches/
 logs/
 reruns/
 qa/
 verification_results/
 python_checks/
+*.request.json
+*.raw.txt
 
 # Packaging/build scratch
 build/

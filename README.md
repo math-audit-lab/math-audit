@@ -2,7 +2,7 @@
 
 Math Paper Audit is an experimental research prototype for auditing mathematical papers chunk by chunk with the OpenAI API. It is designed to help a researcher inspect long papers, preserve audit state, generate reports, and run lightweight verification checks. It is not a production proof assistant, theorem prover, or substitute for expert mathematical review.
 
-The PySide6 GUI is the primary maintained frontend. The Jupyter notebook is kept as a secondary maintenance, debugging, and experimentation frontend for inspecting saved state, rebuilding reports, running recovery helpers, and trying one-off analysis.
+The PySide6 GUI is the primary maintained frontend. Private development branches may use notebooks for maintenance and experiments, but this public preview ships the GUI and shared backend modules as the supported interface.
 
 ## Current Status
 
@@ -16,6 +16,7 @@ The `examples/` directory is intentionally ignored by Git. It is local regressio
 - Pause a running audit and cancel a pending/current chunk when recovery is needed.
 - Chunk papers from PDF plus companion TeX when available, with PDF-only fallback when TeX is unavailable.
 - Preserve audit state in an audit workdir next to the selected paper.
+- Use the default continuous-conversation audit mode; `fresh_context_experimental` is available for experiments but remains explicitly experimental.
 - Generate full, concise, and verification reports in Markdown, TeX, and JSON.
 - Track report freshness so stale reports are visible after audit state changes.
 - Run generated local Python verification scripts and view progress/results.
@@ -42,14 +43,14 @@ The GUI frontend lives in:
 - `gui_controller.py`
 - `gui_main_window.py`
 
-The notebook `automatic_math_paper_audit_consolidated.ipynb` remains available for developer maintenance/debugging only. New user-facing features should be implemented in the GUI/backend modules first.
+Private development notebooks may exist outside this public preview. New user-facing features should be implemented in the GUI/backend modules first.
 
 ## Repository Layout
 
 - `audit_gui.py`, `gui_controller.py`, and `gui_main_window.py` implement the primary PySide6 GUI.
 - `audit_runtime.py`, `audit_policy_hooks.py`, `audit_hooks.py`, `audit_state.py`, `audit_chunking.py`, `audit_verification.py`, and `audit_prompts.py` are the shared backend modules.
 - `gui_assets/` contains bundled local MathJax and font assets. These are intentionally kept in the repository so the rendered discussion pane can typeset math without a CDN dependency.
-- `automatic_math_paper_audit_consolidated.ipynb` is retained as a secondary developer/debug notebook, not as the production frontend.
+- Private development notebooks are not part of this public preview; the GUI/backend modules are the production code path.
 - `audit_prompt_profiles.json` stores GUI-edited prompt profile overrides. The checked-in file is an empty/default profile; avoid committing local prompt experiments or sensitive/proprietary prompt text.
 - `examples/` is local ignored regression/test data. Generated audit workdirs, report outputs, verification results, reruns, discussion turns, and export folders should stay out of Git.
 
@@ -78,9 +79,12 @@ paper_audit/
 
 That workdir contains state JSON, chunk records, prompts/requests/responses, generated reports, verification scripts/results, discussion turns, rerun logs, and export folders. These are local audit artifacts and are generally not meant to be committed.
 
+Do not commit audit outputs, paper PDFs/TeX sources, request/response logs, generated reports, verification scripts/results, rerun folders, or review sidecars. They may contain paper text, model responses, local filesystem paths, and sensitive review material.
+
 ## Limitations
 
 - The app can find real issues, but generated audits and verification checks can be incomplete or mistaken.
+- The `fresh_context_experimental` context mode is still experimental. It can help with long audits or context/file-service robustness, while continuous mode may be cheaper for short PDF-only audits with good cache reuse.
 - PDF-only chunking depends on text extraction quality.
 - TeX-aware chunking is preferred when a companion `.tex` file is available and covers the paper reliably.
 - Report TeX is intended to be robust, but local LaTeX installations still vary.
@@ -91,7 +95,7 @@ That workdir contains state JSON, chunk records, prompts/requests/responses, gen
 
 - Keep the GUI as the primary user-facing frontend.
 - Keep shared backend modules canonical.
-- Treat the notebook as secondary/debug-maintenance only.
+- Keep public workflow logic in the GUI/backend modules; private notebooks should remain outside the public release branch.
 - Do not commit generated audit outputs or local `examples/` data.
 - Run `python scripts/check_regressions.py` for a lightweight no-API regression check of recent report-freshness and PDF-label behavior.
 - Prefer small, focused changes that preserve backward compatibility with existing audit folders.
