@@ -91,6 +91,10 @@ Do not commit audit outputs, paper PDFs/TeX sources, request/response logs, gene
 - The GUI discussion rendered mode depends on bundled local MathJax assets.
 - Pricing/cost estimates are local calculations and may differ from platform billing in edge cases.
 
+## License
+
+This project is released under the MIT License. See [LICENSE](LICENSE).
+
 ## Development Notes
 
 - Keep the GUI as the primary user-facing frontend.

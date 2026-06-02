@@ -88,6 +88,10 @@ The default context mode is the stable continuous-conversation audit flow. The `
 
 Do not commit audit outputs, paper PDFs/TeX sources, request/response logs, generated reports, verification scripts/results, rerun folders, or review sidecars. These artifacts may contain paper text, model responses, local filesystem paths, and sensitive review material.
 
+## License
+
+Math Paper Audit is released under the MIT License. See `LICENSE`.
+
 ## ChatGPT Context Pack Export
 
 The Reports tab can export a handoff folder for manual use in ChatGPT. The export is one-way only. It does not upload files, automate a browser, or sync responses back into the app.
