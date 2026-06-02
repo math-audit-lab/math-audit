@@ -1086,6 +1086,15 @@ def test_plain_text_scroll_preservation_helper() -> None:
     _assert(bottom.scrollbar.value() == 180, "bottom scroll position did not stay at bottom")
 
 
+def test_review_tab_feature_flag() -> None:
+    from gui_main_window import review_tab_enabled
+
+    _assert(not review_tab_enabled({}), "Review tab should be hidden by default")
+    _assert(not review_tab_enabled({"MATH_AUDIT_ENABLE_REVIEW_TAB": "0"}), "Only exact value 1 should enable Review tab")
+    _assert(review_tab_enabled({"MATH_AUDIT_ENABLE_REVIEW_TAB": "1"}), "Review tab env flag did not enable")
+    _assert(not review_tab_enabled({"MATH_AUDIT_ENABLE_REVIEW_TAB": "true"}), "Non-1 flag should not enable Review tab")
+
+
 def test_completed_status_reconciles_from_chunk_records() -> None:
     with tempfile.TemporaryDirectory(prefix="math_audit_status_reconcile_") as tmp:
         root = Path(tmp)
@@ -3320,6 +3329,7 @@ def main() -> int:
         ("context mode mixing guardrails", test_context_mode_mixing_guardrails),
         ("chunk completion log line formatting", test_chunk_completion_log_line_formatting),
         ("plain text scroll preservation helper", test_plain_text_scroll_preservation_helper),
+        ("review tab feature flag", test_review_tab_feature_flag),
         ("completed status reconciliation", test_completed_status_reconciles_from_chunk_records),
         ("persistent audit log preview", test_persistent_audit_log_preview),
         ("resume preserves saved audit context mode", test_resume_preserves_saved_audit_context_mode),

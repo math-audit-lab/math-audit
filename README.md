@@ -95,3 +95,4 @@ That workdir contains state JSON, chunk records, prompts/requests/responses, gen
 - Do not commit generated audit outputs or local `examples/` data.
 - Run `python scripts/check_regressions.py` for a lightweight no-API regression check of recent report-freshness and PDF-label behavior.
 - Prefer small, focused changes that preserve backward compatibility with existing audit folders.
+- The experimental Review tab is hidden by default; developers can enable it with `MATH_AUDIT_ENABLE_REVIEW_TAB=1 python audit_gui.py`.

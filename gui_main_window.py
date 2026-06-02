@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import html
+import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QCloseEvent, QDesktopServices
@@ -40,6 +41,11 @@ from PySide6.QtWidgets import (
 )
 
 from gui_controller import AUDIT_CONTEXT_MODE_CHOICES, AUDIT_CONTEXT_MODE_LABELS, DEFAULT_MODEL, MODEL_CHOICES, GuiController
+
+
+def review_tab_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
+    env = os.environ if environ is None else environ
+    return str(env.get("MATH_AUDIT_ENABLE_REVIEW_TAB") or "") == "1"
 
 
 def _set_plain_text_preserving_scroll(widget: QPlainTextEdit, text: str) -> bool:
@@ -883,7 +889,9 @@ class MainWindow(QMainWindow):
         advanced_layout.addWidget(rerun_box)
         reports_layout.addWidget(advanced_box)
         tabs.addTab(reports_tab, "Reports")
-        tabs.addTab(self._build_review_tab(), "Review")
+        self._review_tab = self._build_review_tab()
+        if review_tab_enabled():
+            tabs.addTab(self._review_tab, "Review")
 
         discussion_tab = QWidget()
         discussion_layout = QVBoxLayout(discussion_tab)
