@@ -8,7 +8,12 @@ Math Paper Audit helps a researcher audit a mathematical manuscript chunk by chu
 
 Math Paper Audit breaks a mathematical paper into smaller pieces called chunks. For each chunk, it sends the chunk text and relevant context to the OpenAI API and asks the model to look for mathematical errors, proof gaps, notation problems, missing assumptions, inconsistent references, and other issues.
 
-The app saves structured issue records as it works. After an audit, it can build full and concise reports, and it can generate local Python verification scripts for some claims. Those scripts can provide useful supporting evidence, but they are not formal proofs.
+The app saves structured issue records as it works. After an audit, it builds two main report types:
+
+- The **concise report** is the recommended first report to open. It focuses on the main actionable findings and is closer to a reader-facing or referee-style summary.
+- The **full report** is a much longer, meticulous audit archive. It can be much longer than the original manuscript, sometimes ten or twenty times longer than the paper itself, because it preserves detailed per-chunk findings, local issues, verification suggestions, notes, and supporting context.
+
+The app can also generate local Python verification scripts for some claims. Those scripts can provide useful supporting evidence, but they are not formal proofs.
 
 All findings are provisional. The app is meant to help a human mathematician review a paper more systematically; it is not a theorem prover, proof assistant, automatic referee, or guarantee of correctness.
 
@@ -145,6 +150,8 @@ The default context mode is the continuous-conversation audit flow. It is the st
 
 After selecting the PDF, choose model/reasoning settings and click **Start Fresh Audit**. The app will break the paper into chunks and audit them using OpenAI API calls. It creates an audit workdir next to the selected PDF; that folder contains the generated reports and saved audit state.
 
+For serious research-level mathematical manuscript analysis, GPT-5.5 with `xhigh` reasoning effort is the recommended setting. Lower reasoning effort or cheaper/earlier models can reduce cost, but they may noticeably reduce audit quality. It is reasonable to experiment with cheaper settings while testing the app or reading mostly expository material, but be cautious about relying on lower-quality settings for real mathematical auditing.
+
 For a paper named `demo_paper.pdf`, the default workdir is:
 
 ```text
@@ -178,6 +185,12 @@ A chunk completion line may include:
 ## 8. Reports
 
 After a successful audit, the app automatically generates the full audit report and the concise audit report. The verification report is generated after you run the verification suite.
+
+The **concise report** is usually the first report to read. It emphasizes the main actionable findings and is better for deciding what matters. It is easier to read than the full report, but it is not automatically complete or authoritative; use the full report when you need detailed checking or audit provenance.
+
+The **full report** is a detailed audit archive and meticulous technical report. It is useful for tracing every issue back to chunk-level output, local notes, verification suggestions, and supporting context. It can be much longer than the manuscript itself, sometimes ten or twenty times longer.
+
+The **verification report** summarizes local Python verification results after you run the verification suite. Verification scripts are supporting evidence, not formal proof.
 
 Generated report formats may include:
 
