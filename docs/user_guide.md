@@ -1,12 +1,8 @@
 # Math Paper Audit User Guide
 
-This guide is a screenshot-based walkthrough for the public research-preview GUI. Screenshots should use sanitized demo material only.
+This guide walks through the public research-preview GUI.
 
 Math Paper Audit helps a researcher audit a mathematical manuscript chunk by chunk with the OpenAI API, preserve audit state, build reports, and run local Python verification scripts. It is a human-assisted review tool, not a proof assistant, theorem prover, or automatic referee.
-
-## Screenshot Safety
-
-Use public-safe demo material for screenshots. Do not show API keys, private paths, personal names, confidential manuscripts, real audit outputs, request/response logs, or sensitive review material. Prefer neutral demo filenames such as `demo_paper.pdf`, `demo_paper.tex`, and `demo_paper_audit/`.
 
 ## 1. Installation Assumptions
 
