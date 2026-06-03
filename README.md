@@ -58,17 +58,17 @@ Private development notebooks may exist outside this public preview. New user-fa
 
 See [QUICKSTART.md](QUICKSTART.md) for setup and first-run instructions. For a more detailed screenshot-based walkthrough, see [docs/user_guide.md](docs/user_guide.md).
 
-### macOS Quick Start
+### Easy Launchers
 
-For the easiest macOS startup path:
+For the easiest startup path:
 
 1. Download/unzip this repository or clone it.
-2. Double-click `run_math_audit.command`.
-3. If macOS Gatekeeper blocks the launcher, right-click it and choose **Open**.
+2. On macOS, double-click `run_math_audit.command`. If Gatekeeper blocks it, right-click it and choose **Open**.
+3. On Windows, double-click `run_math_audit.bat`.
 4. The launcher will create or reuse the `math-audit` Conda environment, run the setup check, and open the GUI.
 5. Paste your OpenAI API key into the GUI, then select a paper PDF.
 
-A packaged `.app` is a future milestone; the `.command` launcher is the current public-preview convenience path.
+Windows support is experimental and less tested than macOS. Linux users should use the manual Conda setup for now. A packaged `.app` or installer is a future milestone; the `.command` and `.bat` launchers are the current public-preview convenience paths.
 
 At a high level:
 

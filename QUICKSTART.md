@@ -2,19 +2,19 @@
 
 This guide gets the experimental Math Paper Audit GUI running from a fresh checkout. For a fuller screenshot-based walkthrough, see [`docs/user_guide.md`](docs/user_guide.md).
 
-## 1. macOS Launcher
+## 1. Easy Launchers
 
-On macOS, the easiest startup path is:
+On macOS and Windows, the easiest startup path is:
 
 1. Download/unzip this repository or clone it.
-2. Double-click `run_math_audit.command`.
-3. If macOS Gatekeeper blocks the launcher, right-click it and choose **Open**.
+2. On macOS, double-click `run_math_audit.command`. If Gatekeeper blocks it, right-click it and choose **Open**.
+3. On Windows, double-click `run_math_audit.bat`.
 4. Wait while the launcher creates or reuses the `math-audit` Conda environment.
 5. Paste your OpenAI API key into the GUI, then select a paper PDF.
 
 The launcher runs `python scripts/check_setup.py` before opening the GUI. It does not store or request your API key and does not run an audit by itself.
 
-A packaged `.app` is a future milestone; for now, `run_math_audit.command` is the public-preview convenience launcher.
+Windows support is experimental and less tested than macOS. Linux users should use the manual Conda setup below for now. A packaged `.app` or installer is a future milestone; for now, `run_math_audit.command` and `run_math_audit.bat` are the public-preview convenience launchers.
 
 ## 2. Manual/Developer Conda Setup
 
