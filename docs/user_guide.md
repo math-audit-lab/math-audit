@@ -6,15 +6,39 @@ Math Paper Audit helps a researcher audit a mathematical manuscript chunk by chu
 
 ## 1. Installation Assumptions
 
-The public preview is mainly tested on macOS with a Conda environment. The GUI depends on PySide6, Qt WebEngine, the OpenAI Python SDK, PDF parsing packages, and optional local LaTeX tooling for compiling generated TeX reports.
+Math Paper Audit is a Python app distributed as a research-preview source package. The launcher scripts do not bundle Python. They use Miniforge/Conda to create a local `math-audit` environment for the app.
 
-Follow the quick setup in [`../QUICKSTART.md`](../QUICKSTART.md):
+Install Miniforge first:
+
+- [conda-forge download page](https://conda-forge.org/download/)
+- [Miniforge GitHub repository](https://github.com/conda-forge/miniforge)
+
+Choose the installer that matches your computer:
+
+- macOS Apple Silicon: macOS arm64
+- Intel Mac: macOS x86_64
+- Windows: Windows x86_64
+
+After installing Miniforge, you may need to restart Terminal or Command Prompt before Conda is visible to launcher scripts.
+
+Then use the launcher workflow:
+
+1. Download/unzip this repository or clone it.
+2. On macOS, double-click `run_math_audit.command`.
+3. On Windows, double-click `run_math_audit.bat`.
+4. The launcher creates or reuses the `math-audit` environment from `environment.yml`.
+5. The launcher runs `python scripts/check_setup.py`.
+6. If setup succeeds, the launcher starts the GUI.
+
+Required Python/GUI packages are installed into the `math-audit` Conda environment from `environment.yml`. They are not supposed to be included in Miniforge itself. You should not manually install PySide6, Qt WebEngine, the OpenAI SDK, PyMuPDF, or similar app dependencies one by one.
+
+If the setup check reports a missing required package, the environment may be incomplete or stale. Nontechnical users can try rerunning the launcher or ask a technical colleague for help. Advanced users can refresh the environment from the project root:
 
 ```bash
-conda env create -f environment.yml
-conda activate math-audit
-python scripts/check_setup.py
+conda env update -f environment.yml --prune
 ```
+
+LaTeX is separate. `pdflatex` is optional but recommended if you want to compile generated `.tex` reports into PDF. The launcher does not install MacTeX, MiKTeX, or TeX Live.
 
 The setup check does not call the OpenAI API or run an audit. Missing optional items such as `pdflatex` or an unset API key are reported as warnings.
 
@@ -22,7 +46,9 @@ The setup check does not call the OpenAI API or run an audit. Missing optional i
 
 ## 2. Launching the GUI
 
-Start the app from the activated environment:
+If you used the macOS or Windows launcher, the GUI opens automatically after the setup check passes.
+
+Advanced users can also start the app manually from an activated `math-audit` environment:
 
 ```bash
 python audit_gui.py

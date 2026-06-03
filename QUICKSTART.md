@@ -4,7 +4,16 @@ This guide gets the experimental Math Paper Audit GUI running from a fresh check
 
 ## 1. Easy Launchers
 
-On macOS and Windows, the easiest startup path is:
+Math Paper Audit is a Python app distributed as a research-preview source package. The launcher scripts do not bundle Python; they need Miniforge/Conda so they can create the `math-audit` environment from `environment.yml`.
+
+Install Miniforge first:
+
+- [conda-forge download page](https://conda-forge.org/download/)
+- [Miniforge GitHub repository](https://github.com/conda-forge/miniforge)
+
+Choose the installer for your machine: macOS Apple Silicon uses macOS arm64, Intel Macs use macOS x86_64, and most Windows users should choose Windows x86_64. You may need to restart Terminal or Command Prompt after installing Miniforge.
+
+Then use the easiest startup path:
 
 1. Download/unzip this repository or clone it.
 2. On macOS, double-click `run_math_audit.command`. If Gatekeeper blocks it, right-click it and choose **Open**.
@@ -13,6 +22,8 @@ On macOS and Windows, the easiest startup path is:
 5. Paste your OpenAI API key into the GUI, then select a paper PDF.
 
 The launcher runs `python scripts/check_setup.py` before opening the GUI. It does not store or request your API key and does not run an audit by itself.
+
+Required Python/GUI packages such as PySide6, Qt WebEngine, the OpenAI SDK, and PDF packages are installed automatically into the `math-audit` environment from `environment.yml`; they are not part of Miniforge itself. If setup reports a missing required package, rerun the launcher or use the manual update command below.
 
 Windows support is experimental and less tested than macOS. Linux users should use the manual Conda setup below for now. A packaged `.app` or installer is a future milestone; for now, `run_math_audit.command` and `run_math_audit.bat` are the public-preview convenience launchers.
 
@@ -43,6 +54,14 @@ python scripts/check_setup.py
 ```
 
 This does not run an audit or make an OpenAI API call. Missing optional items such as `OPENAI_API_KEY` or `pdflatex` are reported as warnings.
+
+Do not manually install individual app packages unless you are debugging. If the environment is stale or incomplete, refresh it with:
+
+```bash
+conda env update -f environment.yml --prune
+```
+
+LaTeX is optional and separate. Install MacTeX, MiKTeX, or TeX Live yourself if you want to compile generated `.tex` reports into PDF; the launcher does not install a TeX distribution.
 
 ## 3. Configure an OpenAI API Key
 

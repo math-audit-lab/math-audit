@@ -62,13 +62,14 @@ See [QUICKSTART.md](QUICKSTART.md) for setup and first-run instructions. For a m
 
 For the easiest startup path:
 
-1. Download/unzip this repository or clone it.
-2. On macOS, double-click `run_math_audit.command`. If Gatekeeper blocks it, right-click it and choose **Open**.
-3. On Windows, double-click `run_math_audit.bat`.
-4. The launcher will create or reuse the `math-audit` Conda environment, run the setup check, and open the GUI.
-5. Paste your OpenAI API key into the GUI, then select a paper PDF.
+1. Install Miniforge from the [conda-forge download page](https://conda-forge.org/download/) or the [Miniforge GitHub repository](https://github.com/conda-forge/miniforge).
+2. Download/unzip this repository or clone it.
+3. On macOS, double-click `run_math_audit.command`. If Gatekeeper blocks it, right-click it and choose **Open**.
+4. On Windows, double-click `run_math_audit.bat`.
+5. The launcher will create or reuse the `math-audit` Conda environment from `environment.yml`, run the setup check, and open the GUI.
+6. Paste your OpenAI API key into the GUI, then select a paper PDF.
 
-Windows support is experimental and less tested than macOS. Linux users should use the manual Conda setup for now. A packaged `.app` or installer is a future milestone; the `.command` and `.bat` launchers are the current public-preview convenience paths.
+The launcher does not bundle Python. Required Python/GUI dependencies are installed into the `math-audit` environment automatically; users should not manually install PySide6, Qt WebEngine, the OpenAI SDK, or PDF packages one by one. Windows support is experimental and less tested than macOS. Linux users should use the manual Conda setup for now. A packaged `.app` or installer is a future milestone; the `.command` and `.bat` launchers are the current public-preview convenience paths.
 
 At a high level:
 
