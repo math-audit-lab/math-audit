@@ -4,9 +4,9 @@ This guide walks through the public research-preview GUI.
 
 Math Paper Audit helps a researcher audit a mathematical manuscript chunk by chunk with the OpenAI API, preserve audit state, build reports, and run local Python verification scripts. It is a human-assisted review tool, not a proof assistant, theorem prover, or automatic referee.
 
-## 1. Installation Assumptions
+## 1. Install Miniforge and Download Math Paper Audit
 
-Math Paper Audit is a Python app distributed as a research-preview source package. The launcher scripts do not bundle Python. They use Miniforge/Conda to create a local `math-audit` environment for the app.
+Math Paper Audit is currently distributed as a research-preview source package. It is not yet a packaged `.app` or Windows installer, and the launcher scripts do not bundle Python. The launchers use Miniforge/Conda to create or reuse a local `math-audit` environment for the app.
 
 Install Miniforge first:
 
@@ -21,16 +21,17 @@ Choose the installer that matches your computer:
 
 After installing Miniforge, you may need to restart Terminal or Command Prompt before Conda is visible to launcher scripts.
 
-Then use the launcher workflow:
+Then download Math Paper Audit:
 
-1. Download/unzip this repository or clone it.
-2. On macOS, double-click `run_math_audit.command`.
-3. On Windows, double-click `run_math_audit.bat`.
-4. The launcher creates or reuses the `math-audit` environment from `environment.yml`.
-5. The launcher runs `python scripts/check_setup.py`.
-6. If setup succeeds, the launcher starts the GUI.
+1. Open the [Math Audit releases page](https://github.com/math-audit-lab/math-audit/releases).
+2. Download the latest release source-code ZIP.
+3. Unzip it.
+4. Open the unzipped `math-audit` folder.
+5. On macOS, double-click `run_math_audit.command`.
+6. On Windows, double-click `run_math_audit.bat`.
+7. The launcher creates or reuses the `math-audit` environment from `environment.yml`, runs a setup check, and starts the GUI.
 
-Required Python/GUI packages are installed into the `math-audit` Conda environment from `environment.yml`. They are not supposed to be included in Miniforge itself. You should not manually install PySide6, Qt WebEngine, the OpenAI SDK, PyMuPDF, or similar app dependencies one by one.
+Required Python/GUI packages are installed into the `math-audit` Conda environment from `environment.yml`. They are not supposed to be included in Miniforge itself. You should not manually install PySide6, Qt WebEngine, the OpenAI SDK, PDF parsing packages, NumPy, SymPy, Markdown, or similar app dependencies one by one.
 
 If the setup check reports a missing required package, the environment may be incomplete or stale. Nontechnical users can try rerunning the launcher or ask a technical colleague for help. Advanced users can refresh the environment from the project root:
 
@@ -41,8 +42,6 @@ conda env update -f environment.yml --prune
 LaTeX is separate. `pdflatex` is optional but recommended if you want to compile generated `.tex` reports into PDF. The launcher does not install MacTeX, MiKTeX, or TeX Live.
 
 The setup check does not call the OpenAI API or run an audit. Missing optional items such as `pdflatex` or an unset API key are reported as warnings.
-
-![Setup check](screenshots/01_setup_check.png)
 
 ## 2. Launching the GUI
 
