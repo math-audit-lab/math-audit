@@ -15,6 +15,8 @@ For new users, Miniforge is recommended because it is lightweight and uses conda
 
 Choose the installer for your machine: macOS Apple Silicon uses macOS arm64, Intel Macs use macOS x86_64, and most Windows users should choose Windows x86_64. You may need to restart Terminal or Command Prompt after installing Miniforge.
 
+Miniforge needs about 400 MB for installation. The downloaded Math Paper Audit source folder is about 80 MB after unzipping. It contains the app source code, documentation, screenshots, launcher scripts, and bundled local GUI assets, but it does not include the installed Python/GUI libraries needed to run the app. On first launch, Conda creates a separate `math-audit` environment from `environment.yml` and downloads packages such as PySide6, Qt WebEngine, the OpenAI SDK, PDF-processing libraries, NumPy, SymPy, and Markdown. This environment can require several additional GB of disk space. We recommend at least 5 GB of free disk space, and 10 GB if possible. A full LaTeX distribution, if installed separately for PDF report compilation, requires additional space.
+
 Then use the easiest startup path:
 
 1. Download/unzip this repository or clone it.
