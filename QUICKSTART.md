@@ -48,6 +48,15 @@ This does not run an audit or make an OpenAI API call. Missing optional items su
 
 The GUI has an API key field in the setup area. Paste your key there before starting/resuming an audit or using the discussion pane.
 
+An OpenAI API key is a private access token for the OpenAI API, not the same thing as being logged into ChatGPT in a browser. You can create/manage keys using OpenAI's official links:
+
+- [Where do I find my OpenAI API Key?](https://help.openai.com/en/articles/4936850-where-do-i-find-my-openai-api-key)
+- [OpenAI API Keys](https://platform.openai.com/api-keys)
+
+Live audits and live discussion calls can incur costs on your OpenAI API account. Setup checks and reading existing reports do not require a key.
+
+Do not share your key, include it in screenshots, or commit it to Git. The full secret key is only shown when it is created; if it is lost or exposed, create a new one and revoke/delete the old one.
+
 For backend or developer maintenance work, you can also set:
 
 ```bash

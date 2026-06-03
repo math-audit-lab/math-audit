@@ -38,7 +38,35 @@ On first launch, the app should open to the main audit setup screen. The stable 
 
 ## 3. API Key Setup
 
-Paste your OpenAI API key into the GUI API key field before starting or resuming an audit or using live discussion. The setup check may warn that no API key is set; that is expected for offline smoke checks.
+An OpenAI API key is a private access token that lets this local app send requests to the OpenAI API from your own OpenAI API account. It is different from simply being logged into ChatGPT in a browser.
+
+The app needs an API key for live audit calls and live Discussion calls. Setup checks, opening existing reports, and reading existing audit outputs do not require an API key.
+
+API usage can incur costs on your OpenAI API account. Check your OpenAI account billing and usage settings before running long audits.
+
+To get a key, use OpenAI's official instructions and API key page:
+
+- [Where do I find my OpenAI API Key?](https://help.openai.com/en/articles/4936850-where-do-i-find-my-openai-api-key)
+- [OpenAI API Keys](https://platform.openai.com/api-keys)
+
+For most users, the simplest app-side setup is to paste the key into the GUI API key field before starting or resuming an audit or using live discussion. The key is used for the current app session.
+
+For advanced or developer use, you can instead set the key in the shell before launching the GUI:
+
+```bash
+export OPENAI_API_KEY="your_api_key_here"
+python audit_gui.py
+```
+
+The current GUI live-call guard still expects the key to be entered in the GUI field, so the GUI field is the recommended public path.
+
+Security reminders:
+
+- Do not share your API key.
+- Do not include it in screenshots.
+- Do not commit it to Git.
+- The full secret key is only shown when it is created; copy it somewhere safe, such as a password manager.
+- If a key is lost or exposed, create a new key and revoke/delete the old one.
 
 Never capture an API key in screenshots. If you need a screenshot of the setup area, clear the key field or use a mock placeholder that is not key-like.
 
