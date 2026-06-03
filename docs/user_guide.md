@@ -4,11 +4,13 @@ This guide walks through the public research-preview GUI.
 
 Math Paper Audit helps a researcher audit a mathematical manuscript chunk by chunk with the OpenAI API, preserve audit state, build reports, and run local Python verification scripts. It is a human-assisted review tool, not a proof assistant, theorem prover, or automatic referee.
 
-## 1. Install Miniforge and Download Math Paper Audit
+## 1. Install Conda/Miniforge and Download Math Paper Audit
 
-Math Paper Audit is currently distributed as a research-preview source package. It is not yet a packaged `.app` or Windows installer, and the launcher scripts do not bundle Python. The launchers use Miniforge/Conda to create or reuse a local `math-audit` environment for the app.
+Math Paper Audit is currently distributed as a research-preview source package. It is not yet a packaged `.app` or Windows installer, and the launcher scripts do not bundle Python. The launchers need a working Conda or Mamba command so they can create or reuse a local `math-audit` environment for the app.
 
-Install Miniforge first:
+If you already have Anaconda, Miniconda, Miniforge, or Mambaforge installed, you can usually skip installing Miniforge and go straight to the launcher workflow below. The launcher searches for Conda/Mamba in your shell `PATH` and in common installation locations.
+
+For new users, Miniforge is recommended because it is lightweight and uses conda-forge by default:
 
 - [conda-forge download page](https://conda-forge.org/download/)
 - [Miniforge GitHub repository](https://github.com/conda-forge/miniforge)
@@ -20,6 +22,8 @@ Choose the installer that matches your computer:
 - Windows: Windows x86_64
 
 After installing Miniforge, you may need to restart Terminal or Command Prompt before Conda is visible to launcher scripts.
+
+Existing Anaconda or Miniconda installations usually work, but very old, heavily customized, or misconfigured Conda installations can sometimes cause package-solving or environment-creation problems. If you see package conflicts or missing required packages, try rerunning the launcher, refreshing the environment, or installing Miniforge as a clean Conda option.
 
 Then download Math Paper Audit:
 
@@ -38,6 +42,8 @@ If the setup check reports a missing required package, the environment may be in
 ```bash
 conda env update -f environment.yml --prune
 ```
+
+If problems persist, creating the environment from a clean Miniforge installation may be the easiest path.
 
 LaTeX is separate. `pdflatex` is optional but recommended if you want to compile generated `.tex` reports into PDF. The launcher does not install MacTeX, MiKTeX, or TeX Live.
 

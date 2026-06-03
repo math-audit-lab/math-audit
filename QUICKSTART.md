@@ -4,9 +4,11 @@ This guide gets the experimental Math Paper Audit GUI running from a fresh check
 
 ## 1. Easy Launchers
 
-Math Paper Audit is a Python app distributed as a research-preview source package. The launcher scripts do not bundle Python; they need Miniforge/Conda so they can create the `math-audit` environment from `environment.yml`.
+Math Paper Audit is a Python app distributed as a research-preview source package. The launcher scripts do not bundle Python; they need a working Conda or Mamba command so they can create the `math-audit` environment from `environment.yml`.
 
-Install Miniforge first:
+If you already have Anaconda, Miniconda, Miniforge, or Mambaforge installed, you can usually skip installing Miniforge as long as `conda` or `mamba` is available. The launcher searches in your shell `PATH` and common installation locations.
+
+For new users, Miniforge is recommended because it is lightweight and uses conda-forge by default:
 
 - [conda-forge download page](https://conda-forge.org/download/)
 - [Miniforge GitHub repository](https://github.com/conda-forge/miniforge)
@@ -24,6 +26,8 @@ Then use the easiest startup path:
 The launcher runs `python scripts/check_setup.py` before opening the GUI. It does not store or request your API key and does not run an audit by itself.
 
 Required Python/GUI packages such as PySide6, Qt WebEngine, the OpenAI SDK, and PDF packages are installed automatically into the `math-audit` environment from `environment.yml`; they are not part of Miniforge itself. If setup reports a missing required package, rerun the launcher or use the manual update command below.
+
+Existing Anaconda or Miniconda installations usually work, but very old, heavily customized, or misconfigured Conda installations may cause package-solving or environment-creation problems. If package conflicts persist, a clean Miniforge installation is often the easiest recovery path.
 
 Windows support is experimental and less tested than macOS. Linux users should use the manual Conda setup below for now. A packaged `.app` or installer is a future milestone; for now, `run_math_audit.command` and `run_math_audit.bat` are the public-preview convenience launchers.
 
