@@ -1,10 +1,12 @@
 # Math Paper Audit User Guide
 
-This guide is a screenshot-based walkthrough for the public research-preview GUI. The screenshots are placeholders for now; future screenshots should use sanitized demo material only.
+This guide is a screenshot-based walkthrough for the public research-preview GUI. Screenshots should use sanitized demo material only.
 
 Math Paper Audit helps a researcher audit a mathematical manuscript chunk by chunk with the OpenAI API, preserve audit state, build reports, and run local Python verification scripts. It is a human-assisted review tool, not a proof assistant, theorem prover, or automatic referee.
 
+## Screenshot Safety
 
+Use public-safe demo material for screenshots. Do not show API keys, private paths, personal names, confidential manuscripts, real audit outputs, request/response logs, or sensitive review material. Prefer neutral demo filenames such as `demo_paper.pdf`, `demo_paper.tex`, and `demo_paper_audit/`.
 
 ## 1. Installation Assumptions
 
@@ -57,16 +59,16 @@ the app will try TeX-aware chunking. If TeX is unavailable or incomplete, the ap
 
 ## 5. Choosing a Context Mode
 
-The default context mode is the continuous-conversation audit flow. It is the stable public default and can be cheaper for  auditing shorter papers of less than 20 something pages long  when context-cache reuse is good.
+The default context mode is the continuous-conversation audit flow. It is the stable public default and may be cheaper for shorter PDF-only audits when context-cache reuse is good.
 
-`fresh_context_experimental` is experimental. It may help with long audits of papers of  more than 30 or 40 pages  or robustness against very long conversation/file-service state, but it is still a research feature and should be compared carefully before relying on it.
+`fresh_context_experimental` is experimental. It may help with longer audits or robustness against accumulated conversation/file-service problems, but it is still a research feature and should be compared carefully before relying on it.
 
 
 ![Context mode selector](screenshots/05_context_mode.png)
 
 ## 6. Starting an Audit
 
-After selecting the PDF, choose model/reasoning settings and click **Start Fresh Audit**. The app will break the paper into a number of chunks and audit them using GPT API calls. The app will create a workdir in the same folder that the PDF is located. That is the folder that will eventually contain the audit report files and all the data that comes along.
+After selecting the PDF, choose model/reasoning settings and click **Start Fresh Audit**. The app will break the paper into chunks and audit them using OpenAI API calls. It creates an audit workdir next to the selected PDF; that folder contains the generated reports and saved audit state.
 
 For a paper named `demo_paper.pdf`, the default workdir is:
 
@@ -76,7 +78,7 @@ demo_paper_audit/
 
 
 
-![Start fresh audit](screenshots/06_start_audit.png)
+![Audit settings](screenshots/04_audit_settings.png)
 
 ## 7. Reading the Logs Tab
 
@@ -100,11 +102,13 @@ A chunk completion line may include:
 
 ## 8. Reports
 
-After the app finishes the audit it automatically generates the audit reports in LaTeX format:
+After a successful audit, the app automatically generates the full audit report and the concise audit report. The verification report is generated after you run the verification suite.
 
-- Full audit reports.
-- Concise audit reports.
-- Verification reports.
+Generated report formats may include:
+
+- Markdown reports for quick reading.
+- TeX reports for local compilation.
+- JSON sidecars for structured metadata.
 
 
 Reports are written under the audit workdir, usually:
@@ -112,9 +116,8 @@ Reports are written under the audit workdir, usually:
 ```text
 demo_paper_audit/reports/
 ```
-You can access them either going to that folder or clicking on **Open Full Report**, **Open Concise Report** or **Open Verification Report** after which the program will open the chosen
-report in the default app for handling .tex files. 
-You will need to compile TeX reports using  local LaTeX installation such as TeXShop or command-line `pdflatex`.
+
+You can access them by opening that folder or by clicking **Open Full Report**, **Open Concise Report**, or **Open Verification Report** when the corresponding report exists. The app opens generated `.tex` files with your system default application for TeX files. If that is not the LaTeX editor/compiler you want, open the generated file manually in TeXShop, TeXworks, VS Code, or compile it from the command line with `pdflatex`.
 
 ![Reports tab](screenshots/08_reports_tab.png)
 
@@ -124,19 +127,17 @@ The GUI tracks whether reports may be stale after audit state, verification stat
 
 Use freshness warnings as a prompt to rebuild reports after reruns or verification changes.
 
-![Report freshness warning](screenshots/09_report_freshness.png)
-
 ## 10. Verification Suite
 
-Some chunk audits generate local Python verification scripts. These are small python programs for checking certain identities, inequalities etc. The GUI can discover and run these scripts, then show PASS, FAIL, TIMEOUT, or SKIPPED outcomes.
+Some chunk audits generate local Python verification scripts. These are small Python programs for checking certain identities, inequalities, or numerical examples. The GUI can discover and run these scripts, then show PASS, FAIL, TIMEOUT, or SKIPPED outcomes.
 
-Verification scripts are support evidence only. A PASS can mean different things depending on what the script was designed to test, including successfully finding a counterexample to a suspected claim. Always inspect the script purpose and output before drawing mathematical conclusions. The scripts routinely fail due to programming issues rather than the underlying mathematical problems. 
+Verification scripts are supporting evidence only, not formal proof. A PASS can mean different things depending on what the script was designed to test, including successfully finding a counterexample to a suspected claim. Always inspect the script purpose and output before drawing mathematical conclusions. Scripts can fail because of programming issues rather than underlying mathematical problems.
 
-![Verification controls](screenshots/10_verification.png)
+![Verification controls](screenshots/07_verification.png)
 
 ## 11. Rerunning Failed Verification Chunks
 
-If verification script fails or times out, the GUI can help rerun chunks associated with failed verification scripts. Use this selectively. A failed script may indicate:
+If a verification script fails or times out, the GUI can help rerun chunks associated with failed verification scripts. Use this selectively. A failed script may indicate:
 
 - The script is wrong.
 - The paper claim is wrong.
@@ -144,8 +145,6 @@ If verification script fails or times out, the GUI can help rerun chunks associa
 - The test needs a different numerical or symbolic setup.
 
 Reruns can consume API budget. Confirm that a rerun is useful before starting it.
-
-![Failed verification rerun](screenshots/11_failed_verification_rerun.png)
 
 ## 12. Discussion and Context Export
 
@@ -175,8 +174,6 @@ demo_paper_audit/
 
 These artifacts are local review outputs. They may contain manuscript text, model responses, request metadata, local paths, cost details, and sensitive review analysis. They should stay out of Git unless you have intentionally created a sanitized demo fixture.
 
-![Audit workdir structure](screenshots/13_output_structure.png)
-
 ## 14. Privacy and Cost Warnings
 
 Before using the app on a real manuscript:
@@ -186,8 +183,6 @@ Before using the app on a real manuscript:
 - Avoid screenshots that reveal manuscript text, issue details, local paths, or API credentials.
 - Keep generated audit folders private unless they have been deliberately sanitized.
 - Treat all model-generated findings as provisional until checked by a human.
-
-![Privacy and cost warning](screenshots/14_privacy_cost.png)
 
 ## 15. Troubleshooting
 
@@ -224,5 +219,3 @@ Rebuild the report after reruns, verification changes, or issue-state changes. S
 ### Verification Results Are Confusing
 
 Open the script and result details. A verification result is not a formal proof; it is a local sanity check or counterexample search that needs mathematical interpretation.
-
-
