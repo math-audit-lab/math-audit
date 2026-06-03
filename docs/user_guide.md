@@ -4,6 +4,26 @@ This guide walks through the public research-preview GUI.
 
 Math Paper Audit helps a researcher audit a mathematical manuscript chunk by chunk with the OpenAI API, preserve audit state, build reports, and run local Python verification scripts. It is a human-assisted review tool, not a proof assistant, theorem prover, or automatic referee.
 
+## What the App Does
+
+Math Paper Audit breaks a mathematical paper into smaller pieces called chunks. For each chunk, it sends the chunk text and relevant context to the OpenAI API and asks the model to look for mathematical errors, proof gaps, notation problems, missing assumptions, inconsistent references, and other issues.
+
+The app saves structured issue records as it works. After an audit, it can build full and concise reports, and it can generate local Python verification scripts for some claims. Those scripts can provide useful supporting evidence, but they are not formal proofs.
+
+All findings are provisional. The app is meant to help a human mathematician review a paper more systematically; it is not a theorem prover, proof assistant, automatic referee, or guarantee of correctness.
+
+## Cost Expectations
+
+API usage can cost real money. Cost depends on the model, reasoning effort, paper length, mathematical density, chunking, cached input, reruns, and model output length. Platform pricing can also change, so check OpenAI's current pricing page before running long audits:
+
+- [OpenAI API pricing](https://openai.com/api/pricing/)
+
+As a rough planning estimate, GPT-5.5 with `xhigh` reasoning effort may cost about $1 per PDF page for mathematically dense audits. Nontechnical or expository pages may cost less, while proof-heavy pages may cost more. A 20-page PDF with GPT-5.5 at `xhigh` may plausibly cost around $15-$25, but this is only an estimate, not a promise.
+
+Cheaper models or lower reasoning effort can reduce cost, but they may noticeably reduce audit quality.
+
+> **Cost warning for GPT-5.5-pro:** GPT-5.5-pro is much more expensive than regular GPT-5.5. Its token rates are roughly 6 times higher, and it may not receive the same cached-input discount. Do not choose GPT-5.5-pro unless you are prepared for a much larger bill. A 20-page audit that might cost around $15-$25 with GPT-5.5 could plausibly exceed $100 with GPT-5.5-pro depending on token use and reasoning output.
+
 ## 1. Install Conda/Miniforge and Download Math Paper Audit
 
 Math Paper Audit is currently distributed as a research-preview source package. It is not yet a packaged `.app` or Windows installer, and the launcher scripts do not bundle Python. The launchers need a working Conda or Mamba command so they can create or reuse a local `math-audit` environment for the app.
