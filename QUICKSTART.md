@@ -2,7 +2,21 @@
 
 This guide gets the experimental Math Paper Audit GUI running from a fresh checkout. For a fuller screenshot-based walkthrough, see [`docs/user_guide.md`](docs/user_guide.md).
 
-## 1. Create the Conda Environment
+## 1. macOS Launcher
+
+On macOS, the easiest startup path is:
+
+1. Download/unzip this repository or clone it.
+2. Double-click `run_math_audit.command`.
+3. If macOS Gatekeeper blocks the launcher, right-click it and choose **Open**.
+4. Wait while the launcher creates or reuses the `math-audit` Conda environment.
+5. Paste your OpenAI API key into the GUI, then select a paper PDF.
+
+The launcher runs `python scripts/check_setup.py` before opening the GUI. It does not store or request your API key and does not run an audit by itself.
+
+A packaged `.app` is a future milestone; for now, `run_math_audit.command` is the public-preview convenience launcher.
+
+## 2. Manual/Developer Conda Setup
 
 From the project root:
 
@@ -30,7 +44,7 @@ python scripts/check_setup.py
 
 This does not run an audit or make an OpenAI API call. Missing optional items such as `OPENAI_API_KEY` or `pdflatex` are reported as warnings.
 
-## 2. Configure an OpenAI API Key
+## 3. Configure an OpenAI API Key
 
 The GUI has an API key field in the setup area. Paste your key there before starting/resuming an audit or using the discussion pane.
 
@@ -42,7 +56,7 @@ export OPENAI_API_KEY="your_api_key_here"
 
 The current GUI live-call guard expects the key to be entered in the GUI field.
 
-## 3. Launch the GUI
+## 4. Launch the GUI Manually
 
 From the activated environment:
 
@@ -52,7 +66,7 @@ python audit_gui.py
 
 The PySide6 app is the primary maintained frontend for this public preview.
 
-## 4. Basic Workflow
+## 5. Basic Workflow
 
 1. Choose a paper PDF with **Browse...**.
 2. Optionally place a same-basename TeX file next to the PDF, for example `paper.pdf` and `paper.tex`.
