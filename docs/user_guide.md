@@ -57,17 +57,16 @@ the app will try TeX-aware chunking. If TeX is unavailable or incomplete, the ap
 
 ## 5. Choosing a Context Mode
 
-The default context mode is the continuous-conversation audit flow. It is the stable public default and can be cheaper for short PDF-only audits when context-cache reuse is good.
+The default context mode is the continuous-conversation audit flow. It is the stable public default and can be cheaper for  auditing shorter papers of less than 20 something pages long  when context-cache reuse is good.
 
-`fresh_context_experimental` is experimental. It may help with long audits or robustness against very long conversation/file-service state, but it is still a research feature and should be compared carefully before relying on it.
+`fresh_context_experimental` is experimental. It may help with long audits of papers of  more than 30 or 40 pages  or robustness against very long conversation/file-service state, but it is still a research feature and should be compared carefully before relying on it.
 
-For public walkthrough screenshots, show the default mode unless the screenshot is explicitly explaining the experimental option.
 
 ![Context mode selector](screenshots/05_context_mode.png)
 
 ## 6. Starting an Audit
 
-After selecting the PDF, choose model/reasoning settings and click **Start Fresh Audit**. If an audit workdir already exists for the selected PDF, confirm that you are not overwriting work you meant to keep.
+After selecting the PDF, choose model/reasoning settings and click **Start Fresh Audit**. The app will break the paper into a number of chunks and audit them using GPT API calls. The app will create a workdir in the same folder that the PDF is located. That is the folder that will eventually contain the audit report files and all the data that comes along.
 
 For a paper named `demo_paper.pdf`, the default workdir is:
 
@@ -75,7 +74,7 @@ For a paper named `demo_paper.pdf`, the default workdir is:
 demo_paper_audit/
 ```
 
-Do not start a real audit while preparing public documentation screenshots. Use mock/demo material only.
+
 
 ![Start fresh audit](screenshots/06_start_audit.png)
 
@@ -101,19 +100,21 @@ A chunk completion line may include:
 
 ## 8. Reports
 
-The app can build and open:
+After the app finishes the audit it automatically generates the audit reports in LaTeX format:
 
 - Full audit reports.
 - Concise audit reports.
 - Verification reports.
+
 
 Reports are written under the audit workdir, usually:
 
 ```text
 demo_paper_audit/reports/
 ```
-
-Markdown and JSON reports can be inspected directly. TeX reports can be compiled with a local LaTeX installation such as TeXShop or command-line `pdflatex`.
+You can access them either going to that folder or clicking on **Open Full Report**, **Open Concise Report** or **Open Verification Report** after which the program will open the chosen
+report in the default app for handling .tex files. 
+You will need to compile TeX reports using  local LaTeX installation such as TeXShop or command-line `pdflatex`.
 
 ![Reports tab](screenshots/08_reports_tab.png)
 
@@ -127,15 +128,15 @@ Use freshness warnings as a prompt to rebuild reports after reruns or verificati
 
 ## 10. Verification Suite
 
-Some chunk audits generate local Python verification scripts. The GUI can discover and run these scripts, then show PASS, FAIL, TIMEOUT, or SKIPPED outcomes.
+Some chunk audits generate local Python verification scripts. These are small python programs for checking certain identities, inequalities etc. The GUI can discover and run these scripts, then show PASS, FAIL, TIMEOUT, or SKIPPED outcomes.
 
-Verification scripts are support evidence only. A PASS can mean different things depending on what the script was designed to test, including successfully finding a counterexample to a suspected claim. Always inspect the script purpose and output before drawing mathematical conclusions.
+Verification scripts are support evidence only. A PASS can mean different things depending on what the script was designed to test, including successfully finding a counterexample to a suspected claim. Always inspect the script purpose and output before drawing mathematical conclusions. The scripts routinely fail due to programming issues rather than the underlying mathematical problems. 
 
 ![Verification controls](screenshots/10_verification.png)
 
 ## 11. Rerunning Failed Verification Chunks
 
-If verification fails or times out, the GUI can help rerun chunks associated with failed verification scripts. Use this selectively. A failed script may indicate:
+If verification script fails or times out, the GUI can help rerun chunks associated with failed verification scripts. Use this selectively. A failed script may indicate:
 
 - The script is wrong.
 - The paper claim is wrong.
@@ -150,7 +151,7 @@ Reruns can consume API budget. Confirm that a rerun is useful before starting it
 
 After an audit, the **Discussion** tab can ask follow-up questions using saved audit context. The app also supports a one-way ChatGPT context-pack export from the reports area. The export is manual: it prepares files and a starter prompt for you to attach/paste elsewhere.
 
-Do not include private discussion turns or exported context packs in public screenshots.
+
 
 ![Discussion tab](screenshots/12_discussion.png)
 
@@ -224,15 +225,4 @@ Rebuild the report after reruns, verification changes, or issue-state changes. S
 
 Open the script and result details. A verification result is not a formal proof; it is a local sanity check or counterexample search that needs mathematical interpretation.
 
-## 16. Public Screenshot Checklist
 
-Before committing screenshots under `docs/screenshots/`, check:
-
-- The image contains no API key, token, or secret.
-- The image contains no private path, username, email, or personal identifier.
-- The selected file is a sanitized demo PDF/TeX file.
-- Logs and reports do not reveal real manuscript text or model output.
-- Costs, response IDs, and request metadata are sanitized or omitted.
-- The hidden experimental Review tab is not shown as part of the public workflow.
-
-Placeholder files in this guide should be replaced only with screenshots that pass this checklist.
