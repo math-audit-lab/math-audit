@@ -2468,6 +2468,36 @@ def build_concise_report(
     return policy_build_concise_report(session_or_pdf, **kwargs)
 
 
+def build_audit_completion_reports(
+    session: dict[str, Any],
+    include_verification_summary_in_final_report: Optional[bool] = None,
+    write_separate_verification_report: Optional[bool] = None,
+) -> dict[str, Any]:
+    full_paths = build_final_report(
+        session,
+        include_verification_summary_in_final_report=include_verification_summary_in_final_report,
+        write_separate_verification_report=write_separate_verification_report,
+    )
+    combined_paths = dict(full_paths)
+    warnings: list[str] = []
+    concise_paths: Optional[dict[str, str]] = None
+    try:
+        # options=None intentionally reuses the same strict default as the GUI button.
+        concise_paths = build_concise_report(session)
+        combined_paths.update({f"concise_{key}": value for key, value in concise_paths.items()})
+    except Exception as exc:
+        warnings.append(
+            "Concise report generation failed after audit completion; "
+            f"the audit remains completed. {type(exc).__name__}: {exc}"
+        )
+    return {
+        "report_paths": combined_paths,
+        "full_report_paths": full_paths,
+        "concise_report_paths": concise_paths,
+        "report_generation_warnings": warnings,
+    }
+
+
 def _display_verification_script_path(session: dict[str, Any], result: dict[str, Any]) -> str:
     script_path_text = str(result.get("script_path") or "").strip()
     if not script_path_text:
@@ -7685,20 +7715,31 @@ def audit_the_paper(
                 f"{summary.get('skipped', 0)} skipped"
             )
     session = _resolve_session(pdf_path)
-    paths = build_final_report(
+    report_result = build_audit_completion_reports(
         session,
         include_verification_summary_in_final_report=include_verification_summary_in_final_report,
         write_separate_verification_report=write_separate_verification_report,
     )
+    paths = report_result["report_paths"]
     if verbose:
         print("Final report:", paths.get("markdown"))
         print("JSON report:", paths.get("json"))
         print("TeX report:", paths.get("tex"))
+        concise_paths = report_result.get("concise_report_paths") or {}
+        if concise_paths:
+            print("Concise report:", concise_paths.get("markdown"))
+            print("Concise JSON report:", concise_paths.get("json"))
+            print("Concise TeX report:", concise_paths.get("tex"))
+        for warning in report_result.get("report_generation_warnings") or []:
+            print("Report generation warning:", warning)
     return {
         "session": session,
         "status": load_status(session),
         "usage": load_usage(session),
         "report_paths": paths,
+        "full_report_paths": report_result.get("full_report_paths"),
+        "concise_report_paths": report_result.get("concise_report_paths"),
+        "report_generation_warnings": report_result.get("report_generation_warnings") or [],
     }
 
 
@@ -7819,6 +7860,7 @@ __all__ = [
     "ask_about_paper",
     "AUDIT_CONTEXT_MODES",
     "audit_the_paper",
+    "build_audit_completion_reports",
     "build_fresh_audit_context_for_chunk",
     "build_concise_report",
     "build_final_report",

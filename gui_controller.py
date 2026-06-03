@@ -1061,6 +1061,8 @@ class GuiController(QObject):
         usage = result.get("usage") or {}
         totals = usage.get("totals") or {}
         report_paths = result.get("report_paths")
+        concise_report_paths = result.get("concise_report_paths")
+        report_warnings = result.get("report_generation_warnings") or []
         pause_result = result.get("pause_result")
         recovery_result = result.get("recovery_result")
         chunks_completed = int(status.get("chunks_completed", 0) or 0)
@@ -1074,7 +1076,13 @@ class GuiController(QObject):
         )
 
         if report_paths:
-            self.log_message.emit(f"Audit completed: {completion_summary}. Reports generated.")
+            if concise_report_paths:
+                self.log_message.emit(f"Audit completed: {completion_summary}. Full and concise reports generated.")
+                self.log_message.emit("Concise report generated with default settings.")
+            else:
+                self.log_message.emit(f"Audit completed: {completion_summary}. Full report generated.")
+            for warning in report_warnings:
+                self.log_message.emit(f"Report generation warning: {warning}")
             self.report_output.emit(self._format_path_payload("Audit report outputs", report_paths))
             self.report_paths_updated.emit(dict(report_paths))
             self._emit_current_status()

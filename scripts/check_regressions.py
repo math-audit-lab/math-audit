@@ -28,6 +28,7 @@ from audit_policy_hooks import (
     build_concise_report_json,
     build_concise_report_markdown,
     build_concise_report_tex,
+    build_final_report as policy_build_final_report,
     build_final_report_markdown,
     build_final_report_tex,
     build_user_message_for_chunk,
@@ -110,6 +111,7 @@ def _synthetic_session(workdir: Path) -> dict[str, Any]:
         "workdir": str(workdir),
         "pdf_path": str(workdir.parent / "paper.pdf"),
         "model": "gpt-5.4",
+        "reasoning_effort": "high",
         "audit_started_at": OLD,
         "audit_finished_at": OLD,
         "active_qa_thread_id": "thread_legacy",
@@ -217,6 +219,70 @@ def test_report_freshness_detection() -> None:
         _write_report_metadata(session, "verification", MID)
         freshness = get_report_freshness(session)
         _assert(freshness["reports"]["verification"]["status"] == "current", freshness["reports"]["verification"]["reason"])
+
+
+def test_audit_completion_builds_full_and_concise_reports() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_completion_reports_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        old_hook = runtime._FINAL_REPORT_BUILDER_HOOK
+        try:
+            runtime.set_final_report_builder(policy_build_final_report)
+            result = runtime.build_audit_completion_reports(
+                session,
+                include_verification_summary_in_final_report=True,
+                write_separate_verification_report=False,
+            )
+        finally:
+            runtime._FINAL_REPORT_BUILDER_HOOK = old_hook
+
+        full_paths = result.get("full_report_paths") or {}
+        concise_paths = result.get("concise_report_paths") or {}
+        _assert(full_paths, str(result))
+        _assert(concise_paths, str(result))
+        _assert(not result.get("report_generation_warnings"), str(result.get("report_generation_warnings")))
+        for payload in (full_paths, concise_paths):
+            for key in ("markdown", "tex", "json"):
+                path = Path(payload.get(key) or "")
+                _assert(path.is_file(), f"missing {key}: {path}")
+        combined = result.get("report_paths") or {}
+        _assert("concise_markdown" in combined, str(combined))
+        _assert("concise_tex" in combined, str(combined))
+        _assert("concise_json" in combined, str(combined))
+
+        freshness = get_report_freshness(session)
+        _assert(freshness["reports"]["full"]["status"] == "current", freshness["reports"]["full"]["reason"])
+        _assert(freshness["reports"]["concise"]["status"] == "current", freshness["reports"]["concise"]["reason"])
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_completion_concise_fail_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        old_hook = runtime._FINAL_REPORT_BUILDER_HOOK
+        old_concise_builder = runtime.build_concise_report
+
+        def _failing_concise_report(*_args: Any, **_kwargs: Any) -> dict[str, str]:
+            raise RuntimeError("synthetic concise failure")
+
+        try:
+            runtime.set_final_report_builder(policy_build_final_report)
+            runtime.build_concise_report = _failing_concise_report
+            result = runtime.build_audit_completion_reports(
+                session,
+                include_verification_summary_in_final_report=True,
+                write_separate_verification_report=False,
+            )
+        finally:
+            runtime.build_concise_report = old_concise_builder
+            runtime._FINAL_REPORT_BUILDER_HOOK = old_hook
+
+        _assert(result.get("full_report_paths"), str(result))
+        _assert(result.get("concise_report_paths") is None, str(result))
+        warnings = result.get("report_generation_warnings") or []
+        _assert(any("audit remains completed" in warning for warning in warnings), str(warnings))
+        status = json.loads(session_paths(workdir)["status"].read_text(encoding="utf-8"))
+        _assert(status.get("status") == "completed", str(status))
+        freshness = get_report_freshness(session)
+        _assert(freshness["reports"]["full"]["status"] == "current", freshness["reports"]["full"]["reason"])
 
 
 def test_invalidated_verification_inventory_warning() -> None:
@@ -3317,6 +3383,7 @@ def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
 def main() -> int:
     cases: list[tuple[str, Callable[[], None]]] = [
         ("report freshness detection", test_report_freshness_detection),
+        ("audit completion builds full and concise reports", test_audit_completion_builds_full_and_concise_reports),
         ("invalidated verification inventory warning", test_invalidated_verification_inventory_warning),
         ("successful selected rerun restores completed status", test_successful_selected_rerun_restores_completed_status),
         ("PDF display label heuristics", test_pdf_display_labels),
