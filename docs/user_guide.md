@@ -240,9 +240,13 @@ Reruns can consume API budget. Confirm that a rerun is useful before starting it
 
 ## 12. Discussion and Context Export
 
-After an audit, the **Discussion** tab can ask follow-up questions using saved audit context. The app also supports a one-way ChatGPT context-pack export from the reports area. The export is manual: it prepares files and a starter prompt for you to attach/paste elsewhere.
+After an audit, the **Discussion** tab can ask follow-up questions using saved audit context. This uses the OpenAI API through the app and may incur API costs.
 
+The **ChatGPT Context Pack Export** is different. It prepares a small set of files plus a starter prompt for continuing the audit discussion in the normal ChatGPT app. To use it, start a new ChatGPT conversation, paste the starter prompt from the export pack, and attach the remaining exported files to that same conversation. This gives ChatGPT background about the paper structure, audit findings, report summaries, verification information, and related audit state, so you can ask follow-up questions about the paper or the audit results inside ChatGPT.
 
+This can be useful if you want to continue discussion in ChatGPT without spending additional API budget through this app. ChatGPT and the OpenAI API platform are billed separately, so ChatGPT usage is governed by your ChatGPT plan, file-upload limits, usage limits, and usage policies rather than this app's API key. The export is one-way: answers you get in ChatGPT are not automatically imported back into the audit state.
+
+The exported files may contain manuscript text, audit findings, summaries, issue descriptions, and verification context. Only upload them to ChatGPT if you are allowed to share that manuscript/audit material there. Do not share export packs publicly unless they have been sanitized.
 
 ![Discussion tab](screenshots/12_discussion.png)
 

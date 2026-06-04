@@ -144,7 +144,7 @@ Math Paper Audit is released under the MIT License. See `LICENSE`.
 
 ## ChatGPT Context Pack Export
 
-The Reports tab can export a handoff folder for manual use in ChatGPT. The export is one-way only. It does not upload files, automate a browser, or sync responses back into the app.
+The Reports tab can export a handoff folder for manual use in the normal ChatGPT app. This is different from the in-app Discussion tab: exported ChatGPT context packs do not make additional API calls through this app and do not use this app's API key. ChatGPT usage is governed by your ChatGPT plan, file-upload limits, usage limits, and usage policies.
 
 Default handoff contents include:
 
@@ -154,7 +154,9 @@ Default handoff contents include:
 - the TeX source if available and selected
 - selected Markdown reports if available and selected
 
-Use **Copy Starter Prompt** after export and paste the prompt manually into ChatGPT with the exported files attached.
+Use **Copy Starter Prompt** after export, start a new ChatGPT conversation, paste the prompt, and attach the exported files to the same conversation. This gives ChatGPT context about the paper structure, audit findings, report summaries, and verification information so you can keep asking questions there.
+
+The export is one-way only. It does not upload files, automate a browser, sync responses back into the app, or import ChatGPT answers into audit state. Exported files can contain manuscript text and sensitive audit findings, so only upload them to ChatGPT if you are allowed to share that material there.
 
 ## Troubleshooting
 

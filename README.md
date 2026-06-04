@@ -22,7 +22,7 @@ The `examples/` directory is intentionally ignored by Git. It is local regressio
 - Run generated local Python verification scripts and view progress/results.
 - Rerun selected chunks or chunks with failed/timed-out verification results.
 - Ask post-audit questions in the Discussion pane, with saved thread history and rendered Markdown/math output.
-- Export a one-way ChatGPT context pack for continuing work manually outside the app.
+- Export a one-way ChatGPT context pack for continuing discussion in the regular ChatGPT app without making further API calls through the app.
 - Manage the shipped audit prompt and optional model-specific prompt overrides from the GUI.
 
 ## Architecture
