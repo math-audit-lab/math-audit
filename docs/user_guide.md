@@ -263,6 +263,8 @@ This can be useful if you want to continue discussion in ChatGPT without spendin
 
 The exported files may contain manuscript text, audit findings, summaries, issue descriptions, and verification context. Only upload them to ChatGPT if you are allowed to share that manuscript/audit material there. Do not share export packs publicly unless they have been sanitized.
 
+![ChatGPT context pack export](screenshots/13_context_pack_export.png)
+
 ## 13. Output Folder Structure
 
 An audit workdir may contain:
