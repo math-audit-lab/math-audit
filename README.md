@@ -73,6 +73,8 @@ The launcher does not bundle Python. It searches for Conda/Mamba in `PATH` and c
 
 At a high level:
 
+> **Important: use searchable PDFs, not scanned PDFs.** Best results come from PDFs compiled from TeX/LaTeX, but any PDF with good selectable text may work. The app does not perform OCR, so scanned/image-only PDFs can produce empty or corrupted chunks and unreliable audits.
+
 1. Create and activate the conda environment.
 2. Optionally run `python scripts/check_setup.py` to smoke-check local dependencies without running an audit.
 3. Launch the GUI with `python audit_gui.py`.
@@ -98,7 +100,7 @@ Do not commit audit outputs, paper PDFs/TeX sources, request/response logs, gene
 
 - The app can find real issues, but generated audits and verification checks can be incomplete or mistaken.
 - The `fresh_context_experimental` context mode is still experimental. It can help with long audits or context/file-service robustness, while continuous mode may be cheaper for short PDF-only audits with good cache reuse.
-- PDF-only chunking depends on text extraction quality.
+- PDF-only chunking depends on text extraction quality; scanned/image-only PDFs are not recommended because the app does not perform OCR.
 - TeX-aware chunking is preferred when a companion `.tex` file is available and covers the paper reliably.
 - Report TeX is intended to be robust, but local LaTeX installations still vary.
 - The GUI discussion rendered mode depends on bundled local MathJax assets.

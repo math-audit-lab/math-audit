@@ -102,6 +102,8 @@ The PySide6 app is the primary maintained frontend for this public preview.
 
 ## 5. Basic Workflow
 
+> **Important: use searchable PDFs, not scanned PDFs.** Best results come from PDFs compiled from TeX/LaTeX, but any PDF with good selectable text may work. The app does not perform OCR, so scanned or image-only PDFs may produce empty, incomplete, or corrupted chunks. A quick test is to open the PDF and try to select/copy a paragraph or formula.
+
 1. Choose a paper PDF with **Browse...**.
 2. Optionally place a same-basename TeX file next to the PDF, for example `paper.pdf` and `paper.tex`.
 3. Click **Start Fresh Audit**.

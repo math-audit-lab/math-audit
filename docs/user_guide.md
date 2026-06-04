@@ -128,6 +128,8 @@ Never capture an API key in screenshots. If you need a screenshot of the setup a
 
 ## 4. Selecting a PDF and Optional TeX Source
 
+> **Important: use searchable PDFs, not scanned PDFs.** Math Paper Audit depends on extractable text. Best results come from PDFs compiled from TeX/LaTeX, especially when the matching `.tex` source is available next to the PDF. A publisher or arXiv PDF without source may still work if its text is selectable/searchable. Scanned PDFs or image-only PDFs are not recommended: the app does not perform OCR, and scanned documents may produce empty, incomplete, or corrupted chunks, leading to unreliable audit results. A quick test is to open the PDF in a normal PDF viewer and try to select/copy a paragraph or formula. If you cannot select text, the PDF is probably not suitable.
+
 Use **Browse...** to select a paper PDF. If a same-basename TeX source exists next to the PDF, for example:
 
 ```text
