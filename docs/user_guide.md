@@ -17,6 +17,18 @@ The app can also generate local Python verification scripts for some claims. Tho
 
 All findings are provisional. The app is meant to help a human mathematician review a paper more systematically; it is not a theorem prover, proof assistant, automatic referee, or guarantee of correctness.
 
+## Who Is This For?
+
+Math Paper Audit is intended for researchers who want a structured, AI-assisted second pass through a mathematical manuscript. Typical uses include:
+
+- Authors preparing a paper for journal or arXiv submission.
+- Researchers checking a paper whose results are important for their own work.
+- Referees or reviewers, only when journal policy, confidentiality rules, and the manuscript situation allow use of an external API-based tool.
+
+In limited testing, the app has been able to find mathematical issues, proof gaps, incorrect references, and typographical errors in places that are easy to miss during ordinary reading. It can also help turn a long, difficult reading task into a more structured review process.
+
+Use it cautiously. The app is not an automatic referee, proof assistant, or theorem prover. It can miss errors, overstate issues, and produce false positives. Findings are provisional and require human mathematical checking. For refereeing or review use, you are responsible for ensuring that use of an external API is allowed.
+
 ## Cost Expectations
 
 API usage can cost real money. Cost depends on the model, reasoning effort, paper length, mathematical density, chunking, cached input, reruns, and model output length. Platform pricing can also change, so check OpenAI's current pricing page before running long audits:

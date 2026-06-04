@@ -10,6 +10,14 @@ This project is under active development and should be treated cautiously. The a
 
 The `examples/` directory is intentionally ignored by Git. It is local regression and test data, not committed source code.
 
+## Who Is This For?
+
+Math Paper Audit is intended for researchers who want a structured, AI-assisted second pass through a mathematical manuscript. Typical uses include authors preparing a paper for journal or arXiv submission, researchers checking a paper whose results are important for their own work, and referees/reviewers only when journal policy, confidentiality rules, and the manuscript situation allow use of an external API-based tool.
+
+In limited testing, the app has been able to find mathematical issues, proof gaps, incorrect references, and typographical errors in places that are easy to miss during ordinary reading. It can also help turn a long, difficult reading task into a more structured review process.
+
+Use it cautiously. The app is not an automatic referee, proof assistant, or theorem prover. It can miss errors, overstate issues, and produce false positives. Findings are provisional and require human mathematical checking. For refereeing or review use, you are responsible for ensuring that use of an external API is allowed.
+
 ## Major Features
 
 - Start fresh audits or resume existing audit sessions.
