@@ -1516,6 +1516,16 @@ def test_report_latex_unicode_math_safety() -> None:
         _assert(r"\require{cancel}" not in rendered_mathjax, rendered_mathjax)
         _assert(r"\textbackslash{}require" in rendered_mathjax, rendered_mathjax)
 
+        escaped_dollar_artifacts = (
+            r'The page says "where $\$ : \mathbb N\to\mathbb R$ is given by '
+            r'$\$(n,m):=\log(n)/\log(m)$." '
+            r"The constant depends on $x=\$(n,m)$."
+        )
+        rendered_escaped_dollars = renderer(escaped_dollar_artifacts)
+        _assert(r"$\textbackslash{}$" not in rendered_escaped_dollars, rendered_escaped_dollars)
+        _assert(r"\textbackslash{}$(n,m)" not in rendered_escaped_dollars, rendered_escaped_dollars)
+        _assert(r"\$\textbackslash{}\$" in rendered_escaped_dollars, rendered_escaped_dollars)
+
         unsupported_unicode = "Tag: l格range-inversion."
         rendered_unicode = renderer(unsupported_unicode)
         _assert("格" not in rendered_unicode, rendered_unicode)

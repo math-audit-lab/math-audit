@@ -534,6 +534,11 @@ def _contains_latex_unsupported_unicode(text: str) -> bool:
 
 def _report_math_delimiters_look_unsafe(text: str) -> bool:
     text = "" if text is None else str(text)
+    # Escaped dollars from extracted/model text (for example ``$\$(n,m)$``)
+    # confuse the simple report splitter because it is not a full TeX parser.
+    # Prefer a safe prose fallback over emitting mismatched live math.
+    if r"\$" in text:
+        return True
     for match in re.finditer(r"\$\$(.*?)\$\$", text, flags=re.DOTALL):
         if "$" in match.group(1):
             return True
