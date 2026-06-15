@@ -366,6 +366,7 @@ _JSON_TAB_TEX_COMMAND_RE = re.compile(r"\t(?=(?:imes|heta|au\b|o\b))")
 _JSON_CR_TEX_COMMAND_RE = re.compile(r"\r(?=(?:ho\b|ight\b))")
 _PERSISTED_HAT_BLAMBDA_ARTIFACT_RE = re.compile(r"(?<![A-Za-z])\\?hat\\blambda\b")
 _PERSISTED_HAT_BARE_LAMBDA_ARTIFACT_RE = re.compile(r"(\\hat\\lambda=)lambda\b")
+_PERSISTED_BLAMBDA_ARTIFACT_RE = re.compile(r"(?<![A-Za-z])\\blambda\b")
 
 
 def _repair_json_escape_artifacts(text: str) -> str:
@@ -384,6 +385,7 @@ def _repair_json_escape_artifacts(text: str) -> str:
     text = _PERSISTED_JSON_ESCAPE_ARTIFACT_COMMAND_RE.sub(lambda _m: "\\", text)
     text = _PERSISTED_HAT_BLAMBDA_ARTIFACT_RE.sub(lambda _m: r"\hat\lambda", text)
     text = _PERSISTED_HAT_BARE_LAMBDA_ARTIFACT_RE.sub(lambda m: m.group(1) + r"\lambda", text)
+    text = _PERSISTED_BLAMBDA_ARTIFACT_RE.sub(lambda _m: r"\lambda", text)
     text = _JSON_CONTROL_ESCAPE_ARTIFACT_RE.sub(" ", text)
     return text
 
@@ -542,6 +544,210 @@ def _report_math_delimiters_look_unsafe(text: str) -> bool:
 _DANGEROUS_MATH_COMMAND_RE = re.compile(
     r"\\(?:usepackage|documentclass|begin|end|input|include|newcommand|renewcommand|providecommand|def|write18|openout|catcode|usetikzlibrary|ref|eqref|autoref|cref|Cref|cite|require)\b"
 )
+_REPORT_LATEX_COMMAND_RE = re.compile(r"\\([A-Za-z@]+)")
+_REPORT_MATH_ALLOWED_COMMANDS = frozenset(
+    {
+        # Greek and common symbols.
+        "Alpha",
+        "Beta",
+        "Gamma",
+        "Delta",
+        "Epsilon",
+        "Lambda",
+        "Omega",
+        "Phi",
+        "Pi",
+        "Psi",
+        "Sigma",
+        "Theta",
+        "Upsilon",
+        "Xi",
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+        "epsilon",
+        "varepsilon",
+        "zeta",
+        "eta",
+        "theta",
+        "vartheta",
+        "iota",
+        "kappa",
+        "lambda",
+        "mu",
+        "nu",
+        "xi",
+        "pi",
+        "rho",
+        "varrho",
+        "sigma",
+        "tau",
+        "upsilon",
+        "phi",
+        "varphi",
+        "chi",
+        "psi",
+        "omega",
+        "ell",
+        # Relations, arrows, and operators.
+        "le",
+        "ge",
+        "leq",
+        "geq",
+        "neq",
+        "ne",
+        "in",
+        "ni",
+        "notin",
+        "not",
+        "subset",
+        "subseteq",
+        "supset",
+        "supseteq",
+        "sim",
+        "simeq",
+        "equiv",
+        "cong",
+        "approx",
+        "asymp",
+        "propto",
+        "ll",
+        "gg",
+        "to",
+        "mapsto",
+        "rightarrow",
+        "leftarrow",
+        "Rightarrow",
+        "Leftarrow",
+        "leftrightarrow",
+        "Leftrightarrow",
+        "uparrow",
+        "downarrow",
+        "vee",
+        "wedge",
+        "cup",
+        "cap",
+        "setminus",
+        "mid",
+        "nmid",
+        "vert",
+        "Vert",
+        "cdot",
+        "times",
+        "pm",
+        "mp",
+        "ast",
+        "star",
+        "circ",
+        "bullet",
+        "oplus",
+        "otimes",
+        "partial",
+        "nabla",
+        "infty",
+        # Large operators and functions.
+        "sum",
+        "prod",
+        "int",
+        "iint",
+        "iiint",
+        "lim",
+        "limsup",
+        "liminf",
+        "sup",
+        "inf",
+        "max",
+        "min",
+        "argmax",
+        "argmin",
+        "log",
+        "ln",
+        "exp",
+        "sin",
+        "cos",
+        "tan",
+        "sinh",
+        "cosh",
+        "det",
+        "gcd",
+        "Pr",
+        # Layout, accents, and fonts expected in report math.
+        "frac",
+        "dfrac",
+        "tfrac",
+        "binom",
+        "dbinom",
+        "tbinom",
+        "sqrt",
+        "left",
+        "right",
+        "big",
+        "Big",
+        "bigg",
+        "Bigg",
+        "langle",
+        "rangle",
+        "lvert",
+        "rvert",
+        "lVert",
+        "rVert",
+        "lbrace",
+        "rbrace",
+        "lfloor",
+        "rfloor",
+        "lceil",
+        "rceil",
+        "hat",
+        "widehat",
+        "tilde",
+        "widetilde",
+        "bar",
+        "overline",
+        "underline",
+        "vec",
+        "dot",
+        "ddot",
+        "prime",
+        "mathbb",
+        "mathcal",
+        "mathfrak",
+        "mathbf",
+        "mathrm",
+        "mathit",
+        "mathsf",
+        "mathtt",
+        "boldsymbol",
+        "bm",
+        "operatorname",
+        "stackrel",
+        "substack",
+        # Spacing and ellipses.
+        "quad",
+        "qquad",
+        " ",
+        ",",
+        ":",
+        ";",
+        "!",
+        "ldots",
+        "cdots",
+        "dots",
+        "dotsc",
+        "dotsm",
+        "bmod",
+        "pmod",
+        "mod",
+    }
+)
+_REPORT_MATH_SUSPICIOUS_COMMANDS = frozenset({"wed", "bi"})
+_SERIOUS_LATEX_LOG_PATTERNS = (
+    "Undefined control sequence",
+    "Emergency stop",
+    "Fatal error",
+    "! LaTeX Error:",
+    "Runaway argument?",
+)
 
 
 def _report_escape_text(s: str) -> str:
@@ -563,6 +769,79 @@ def _report_escape_text(s: str) -> str:
     return "".join(repl.get(ch, ch) for ch in s)
 
 
+def _report_math_span_has_suspicious_command(text: str) -> bool:
+    """Return True when a math span likely contains non-compiling PDF artifacts."""
+    text = "" if text is None else str(text)
+    for match in _REPORT_LATEX_COMMAND_RE.finditer(text):
+        command = match.group(1)
+        if command in _REPORT_MATH_SUSPICIOUS_COMMANDS:
+            return True
+        if command not in _REPORT_MATH_ALLOWED_COMMANDS:
+            return True
+        if command == "bm":
+            # The JNT PDF extraction produced fragments such as ``\bm\le`` and
+            # ``\bm\delta``.  Treat unbraced \bm as suspicious rather than
+            # silently changing the visible mathematics.
+            rest = text[match.end() :].lstrip()
+            if not rest.startswith("{"):
+                return True
+    return False
+
+
+def report_latex_compile_health(tex_path: str | Path) -> dict[str, Any]:
+    """Inspect a sibling LaTeX log, when present, for serious compile errors."""
+    tex = Path(tex_path)
+    log_path = tex.with_suffix(".log")
+    health: dict[str, Any] = {
+        "tex_path": str(tex),
+        "log_path": str(log_path),
+        "log_available": log_path.is_file(),
+        "status": "not_compiled",
+        "serious_error_count": 0,
+        "serious_errors": [],
+        "warning": "",
+    }
+    if not log_path.is_file():
+        return health
+
+    try:
+        stale = tex.is_file() and log_path.stat().st_mtime < tex.stat().st_mtime
+    except OSError:
+        stale = False
+    health["log_stale"] = bool(stale)
+
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        health.update(
+            {
+                "status": "unreadable_log",
+                "warning": f"Could not read LaTeX log: {type(exc).__name__}: {exc}",
+            }
+        )
+        return health
+
+    errors: list[dict[str, Any]] = []
+    for idx, line in enumerate(lines, start=1):
+        if any(pattern in line for pattern in _SERIOUS_LATEX_LOG_PATTERNS):
+            errors.append({"line": idx, "text": line.strip()})
+
+    health["serious_error_count"] = len(errors)
+    health["serious_errors"] = errors[:20]
+    if stale:
+        health["status"] = "stale_log_with_errors" if errors else "stale_log_clean"
+        return health
+    if errors:
+        health["status"] = "compile_errors"
+        health["warning"] = (
+            f"LaTeX log for {tex.name} contains {len(errors)} serious compile error(s); "
+            "the generated PDF, if present, should not be treated as clean."
+        )
+    else:
+        health["status"] = "clean"
+    return health
+
+
 def report_latex_paragraph(text: str) -> str:
     text = normalize_math_delimiters("" if text is None else str(text))
     text = _strip_unsafe_control_chars(_repair_json_escape_artifacts(text))
@@ -579,7 +858,11 @@ def report_latex_paragraph(text: str) -> str:
             body = repair_report_latex_math_command_artifacts(body)
             body = sanitize_ascii_punctuation(body)
             body = normalize_report_latex_unicode_math(body)
-            if _DANGEROUS_MATH_COMMAND_RE.search(body) or _contains_latex_unsupported_unicode(body):
+            if (
+                _DANGEROUS_MATH_COMMAND_RE.search(body)
+                or _contains_latex_unsupported_unicode(body)
+                or _report_math_span_has_suspicious_command(body)
+            ):
                 out.append(r"\texttt{" + _report_escape_text(part) + "}")
             else:
                 out.append(delim + body + delim)
@@ -2468,6 +2751,15 @@ def build_concise_report(
     return policy_build_concise_report(session_or_pdf, **kwargs)
 
 
+def _append_latex_compile_health_warning(warnings: list[str], label: str, paths: dict[str, str]) -> None:
+    tex_path = paths.get("tex")
+    if not tex_path:
+        return
+    health = report_latex_compile_health(tex_path)
+    if health.get("status") == "compile_errors" and health.get("warning"):
+        warnings.append(f"{label} report LaTeX compile warning: {health['warning']}")
+
+
 def build_audit_completion_reports(
     session: dict[str, Any],
     include_verification_summary_in_final_report: Optional[bool] = None,
@@ -2480,11 +2772,13 @@ def build_audit_completion_reports(
     )
     combined_paths = dict(full_paths)
     warnings: list[str] = []
+    _append_latex_compile_health_warning(warnings, "Full", full_paths)
     concise_paths: Optional[dict[str, str]] = None
     try:
         # options=None intentionally reuses the same strict default as the GUI button.
         concise_paths = build_concise_report(session)
         combined_paths.update({f"concise_{key}": value for key, value in concise_paths.items()})
+        _append_latex_compile_health_warning(warnings, "Concise", concise_paths)
     except Exception as exc:
         warnings.append(
             "Concise report generation failed after audit completion; "
@@ -2596,6 +2890,8 @@ def _verification_report_tex(
 \usepackage[utf8]{inputenc}
 \usepackage{lmodern}
 \usepackage{microtype}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
 \usepackage{hyperref}
 \usepackage{enumitem}
 \usepackage{xcolor}
@@ -4811,6 +5107,8 @@ def _qa_report_tex(session: dict[str, Any], turns: list[dict[str, Any]]) -> str:
 \usepackage[utf8]{inputenc}
 \usepackage{lmodern}
 \usepackage{microtype}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
 \usepackage{hyperref}
 \usepackage{enumitem}
 \usepackage{xcolor}
@@ -7890,6 +8188,7 @@ __all__ = [
     "DEFAULT_QA_CONTEXT_MODE",
     "rebuild_qa_report",
     "recover_pending_chunk",
+    "report_latex_compile_health",
     "request_pause",
     "rerun_failed_verification_chunks",
     "rerun_selected_chunks",

@@ -54,6 +54,7 @@ from audit_runtime import (
     get_report_freshness,
     get_verification_suite_status,
     report_latex_paragraph,
+    report_latex_compile_health,
 )
 from audit_state import save_json, session_paths, usage_cache_diagnostics
 from gui_controller import (
@@ -1414,6 +1415,28 @@ def test_report_latex_unicode_math_safety() -> None:
         _assert(r"\sigma " in rendered_lmj, rendered_lmj)
         _assert(r"\Omega " in rendered_lmj, rendered_lmj)
 
+        jnt_pdf_artifacts = (
+            r"The parsed text produced $1\wed\ge 0$, $k\bi\ge0$, "
+            r"$p\bm\le m$, and $2\bm\delta$."
+        )
+        rendered_jnt = renderer(jnt_pdf_artifacts)
+        _assert(r"\wed" not in rendered_jnt, rendered_jnt)
+        _assert(r"\bi" not in rendered_jnt, rendered_jnt)
+        _assert(r"\bm\le" not in rendered_jnt, rendered_jnt)
+        _assert(r"\bm\delta" not in rendered_jnt, rendered_jnt)
+        _assert(r"\textbackslash{}wed" in rendered_jnt, rendered_jnt)
+        _assert(r"\textbackslash{}bi" in rendered_jnt, rendered_jnt)
+
+        legitimate_math = (
+            r"Legitimate math should stay live: "
+            r"$\frac{\rho+\lambda}{\prod_{p\le n}p}\ge\sqrt{\delta+\alpha}$ "
+            r"and $\bm{\lambda}\le\mathbf{x}$."
+        )
+        rendered_legitimate = renderer(legitimate_math)
+        for token in (r"\frac", r"\rho", r"\lambda", r"\prod", r"\le", r"\ge", r"\sqrt", r"\delta", r"\bm{\lambda}"):
+            _assert(token in rendered_legitimate, rendered_legitimate)
+        _assert(r"\textbackslash{}frac" not in rendered_legitimate, rendered_legitimate)
+
         i080_valid_math = (
             r"Example: $n=p^s\prod_{i=1}^s(2q_i-1)$, "
             r"$\sigma(p^{s+1})$, $1+p+\cdots+p^{s+1}$, "
@@ -1453,7 +1476,8 @@ def test_report_latex_unicode_math_safety() -> None:
         )
         rendered_json_escaped = renderer(json_escaped_tex)
         _assert(r"\frac{\rho j^2}{2k}" in rendered_json_escaped, rendered_json_escaped)
-        _assert(r"\blambda" in rendered_json_escaped, rendered_json_escaped)
+        _assert(r"\lambda" in rendered_json_escaped, rendered_json_escaped)
+        _assert(r"\blambda" not in rendered_json_escaped, rendered_json_escaped)
         _assert(r"\\frac" not in rendered_json_escaped, rendered_json_escaped)
         _assert(r"\\blambda" not in rendered_json_escaped, rendered_json_escaped)
 
@@ -1502,6 +1526,24 @@ def test_report_latex_unicode_math_safety() -> None:
     _assert("格" not in verbatim, verbatim)
     _assert(r"\approx" in verbatim, verbatim)
     _assert("[U+683C]" in verbatim, verbatim)
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_latex_log_health_") as tmp:
+        tex_path = Path(tmp) / "report.tex"
+        log_path = Path(tmp) / "report.log"
+        _write_text(tex_path, r"\documentclass{article}\begin{document}Synthetic\end{document}" + "\n")
+        _write_text(
+            log_path,
+            "./report.tex:12: Undefined control sequence.\n"
+            r"l.12 $1\wed" + "\n",
+        )
+        health = report_latex_compile_health(tex_path)
+        _assert(health.get("status") == "compile_errors", str(health))
+        _assert(health.get("serious_error_count") == 1, str(health))
+        _assert("Undefined control sequence" in (health.get("serious_errors") or [{}])[0].get("text", ""), str(health))
+
+        _write_text(log_path, "Output written on report.pdf (1 page).\n")
+        health = report_latex_compile_health(tex_path)
+        _assert(health.get("status") == "clean", str(health))
 
 
 def test_issue_severity_summary_in_audit_summary() -> None:

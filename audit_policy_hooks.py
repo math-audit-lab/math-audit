@@ -39,6 +39,7 @@ from audit_runtime import (
     _repair_json_escape_artifacts,
     _contains_latex_unsupported_unicode,
     _report_math_delimiters_look_unsafe,
+    _report_math_span_has_suspicious_command,
     _strip_unsafe_control_chars,
     _verification_inventory_warning,
     build_fresh_audit_context_for_chunk,
@@ -48,6 +49,7 @@ from audit_runtime import (
     normalize_report_latex_unicode_math,
     repair_report_latex_math_command_artifacts,
     report_latex_paragraph,
+    report_latex_compile_health,
     sanitize_latex_unsupported_unicode,
     sanitize_ascii_punctuation,
     _verbatim_block,
@@ -269,6 +271,7 @@ def _report_math_text_looks_unsafe(text: str) -> bool:
         or text.count(r"\left") != text.count(r"\right")
         or _report_math_delimiters_look_unsafe(text)
         or _contains_latex_unsupported_unicode(normalized)
+        or _report_math_span_has_suspicious_command(normalized)
     )
 
 
@@ -2227,6 +2230,7 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
 \usepackage{lmodern}
 \usepackage{microtype}
 \usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
 \usepackage{hyperref}
 \usepackage{enumitem}
 \usepackage{longtable}
@@ -3182,6 +3186,7 @@ def build_final_report(
 
     md_path.write_text(md_text, encoding="utf-8")
     tex_path.write_text(tex_text, encoding="utf-8")
+    latex_compile_health = report_latex_compile_health(tex_path)
 
     report_json = {
         "session": load_session_from_pdf(session["pdf_path"]),
@@ -3196,6 +3201,7 @@ def build_final_report(
         "issue_recheck_summary": issue_recheck_overlay.get("issue_recheck_summary", {}),
         "issue_recheck_overlay": issue_recheck_overlay,
         "grouped_downstream_issues": issue_recheck_overlay.get("grouped_downstream_issues", {}),
+        "latex_compile_health": latex_compile_health,
         "generated_at": utc_now(),
     }
     save_json(json_path, report_json)
@@ -3586,6 +3592,7 @@ def build_concise_report_tex(
 \usepackage{lmodern}
 \usepackage{microtype}
 \usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
 \usepackage{hyperref}
 \usepackage{enumitem}
 \usepackage{longtable}
@@ -3706,6 +3713,7 @@ def build_concise_report(
 
     md_path.write_text(md_text, encoding="utf-8")
     tex_path.write_text(tex_text, encoding="utf-8")
+    report_json["latex_compile_health"] = report_latex_compile_health(tex_path)
     save_json(json_path, report_json)
 
     return {
