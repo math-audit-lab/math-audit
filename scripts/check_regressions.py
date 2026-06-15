@@ -53,6 +53,7 @@ from audit_runtime import (
     get_audit_status,
     get_report_freshness,
     get_verification_suite_status,
+    refresh_report_latex_compile_health_sidecar,
     report_latex_paragraph,
     report_latex_compile_health,
 )
@@ -1539,21 +1540,66 @@ def test_report_latex_unicode_math_safety() -> None:
 
     with tempfile.TemporaryDirectory(prefix="math_audit_latex_log_health_") as tmp:
         tex_path = Path(tmp) / "report.tex"
+        json_path = Path(tmp) / "report.json"
         log_path = Path(tmp) / "report.log"
         _write_text(tex_path, r"\documentclass{article}\begin{document}Synthetic\end{document}" + "\n")
+        _write_json(json_path, {"generated_at": OLD})
+        health = refresh_report_latex_compile_health_sidecar(tex_path, json_path)
+        _assert(health.get("status") == "not_compiled", str(health))
+        sidecar = json.loads(json_path.read_text(encoding="utf-8"))
+        _assert(sidecar.get("latex_compile_health", {}).get("status") == "not_compiled", str(sidecar))
+
         _write_text(
             log_path,
             "./report.tex:12: Undefined control sequence.\n"
-            r"l.12 $1\wed" + "\n",
+            r"l.12 $1\wed" + "\n"
+            "! Missing $ inserted.\n",
         )
         health = report_latex_compile_health(tex_path)
         _assert(health.get("status") == "compile_errors", str(health))
-        _assert(health.get("serious_error_count") == 1, str(health))
+        _assert(health.get("serious_error_count") == 2, str(health))
         _assert("Undefined control sequence" in (health.get("serious_errors") or [{}])[0].get("text", ""), str(health))
+        refreshed = refresh_report_latex_compile_health_sidecar(tex_path, json_path)
+        _assert(refreshed.get("status") == "compile_errors", str(refreshed))
+        sidecar = json.loads(json_path.read_text(encoding="utf-8"))
+        _assert(sidecar.get("latex_compile_health", {}).get("status") == "compile_errors", str(sidecar))
 
         _write_text(log_path, "Output written on report.pdf (1 page).\n")
         health = report_latex_compile_health(tex_path)
         _assert(health.get("status") == "clean", str(health))
+        refreshed = refresh_report_latex_compile_health_sidecar(tex_path, json_path)
+        _assert(refreshed.get("status") == "clean", str(refreshed))
+        sidecar = json.loads(json_path.read_text(encoding="utf-8"))
+        _assert(sidecar.get("latex_compile_health", {}).get("status") == "clean", str(sidecar))
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_report_health_freshness_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        reports_dir = workdir / "reports"
+        tex_path = reports_dir / "paper_audit_report.tex"
+        json_path = reports_dir / "paper_audit_report.json"
+        log_path = reports_dir / "paper_audit_report.log"
+        _write_text(tex_path, r"\documentclass{article}\begin{document}Synthetic\end{document}" + "\n")
+        _write_text(log_path, "Output written on paper_audit_report.pdf (1 page).\n")
+        _write_json(
+            json_path,
+            {
+                "generated_at": NEW,
+                "latex_compile_health": {
+                    "tex_path": str(tex_path),
+                    "log_path": str(log_path),
+                    "log_available": False,
+                    "status": "not_compiled",
+                    "serious_error_count": 0,
+                    "serious_errors": [],
+                    "warning": "",
+                },
+            },
+        )
+        freshness = get_report_freshness(session)
+        _assert(freshness.get("reports", {}).get("full", {}).get("generated_at") == NEW, str(freshness))
+        sidecar = json.loads(json_path.read_text(encoding="utf-8"))
+        _assert(sidecar.get("latex_compile_health", {}).get("status") == "clean", str(sidecar))
 
 
 def test_issue_severity_summary_in_audit_summary() -> None:

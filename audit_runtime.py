@@ -748,6 +748,7 @@ _REPORT_MATH_ALLOWED_COMMANDS = frozenset(
 _REPORT_MATH_SUSPICIOUS_COMMANDS = frozenset({"wed", "bi"})
 _SERIOUS_LATEX_LOG_PATTERNS = (
     "Undefined control sequence",
+    "Missing $ inserted",
     "Emergency stop",
     "Fatal error",
     "! LaTeX Error:",
@@ -844,6 +845,37 @@ def report_latex_compile_health(tex_path: str | Path) -> dict[str, Any]:
         )
     else:
         health["status"] = "clean"
+    return health
+
+
+def refresh_report_latex_compile_health_sidecar(
+    tex_path: str | Path,
+    json_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Refresh a report JSON sidecar's compile-health block from the current log.
+
+    Report builders write JSON before users or external tools may compile the
+    generated TeX.  Re-reading the sibling log here keeps the advisory sidecar
+    accurate without changing report content or generated_at metadata.
+    """
+    tex = Path(tex_path)
+    sidecar = Path(json_path) if json_path is not None else tex.with_suffix(".json")
+    health = report_latex_compile_health(tex)
+    if not sidecar.is_file():
+        return health
+    try:
+        data = load_json(sidecar)
+    except Exception:
+        return health
+    if not isinstance(data, dict):
+        return health
+    if data.get("latex_compile_health") == health:
+        return health
+    data["latex_compile_health"] = health
+    try:
+        save_json(sidecar, data)
+    except Exception:
+        return health
     return health
 
 
@@ -1193,6 +1225,7 @@ def _report_freshness_sources(session: dict[str, Any], kind: str) -> list[dict[s
 
 def _report_freshness_for_kind(session: dict[str, Any], kind: str) -> dict[str, Any]:
     paths = _report_paths_for_kind(session, kind)
+    refresh_report_latex_compile_health_sidecar(paths["tex"], paths["json"])
     sources = _report_freshness_sources(session, kind)
     generated_at = _report_generated_at(paths)
     latest_source = None
@@ -2987,6 +3020,7 @@ def build_verification_report(session_or_pdf: dict[str, Any] | str | Path) -> di
             "generated_at": utc_now(),
         },
     )
+    refresh_report_latex_compile_health_sidecar(tex_path, json_path)
     state["report_paths"] = {
         "markdown": str(md_path),
         "tex": str(tex_path),
@@ -8193,6 +8227,7 @@ __all__ = [
     "DEFAULT_QA_CONTEXT_MODE",
     "rebuild_qa_report",
     "recover_pending_chunk",
+    "refresh_report_latex_compile_health_sidecar",
     "report_latex_compile_health",
     "request_pause",
     "rerun_failed_verification_chunks",

@@ -48,6 +48,7 @@ from audit_runtime import (
     normalize_math_delimiters,
     normalize_report_latex_unicode_math,
     repair_report_latex_math_command_artifacts,
+    refresh_report_latex_compile_health_sidecar,
     report_latex_paragraph,
     report_latex_compile_health,
     sanitize_latex_unsupported_unicode,
@@ -3205,6 +3206,7 @@ def build_final_report(
         "generated_at": utc_now(),
     }
     save_json(json_path, report_json)
+    refresh_report_latex_compile_health_sidecar(tex_path, json_path)
 
     paths = {
         "markdown": str(md_path),
@@ -3715,6 +3717,7 @@ def build_concise_report(
     tex_path.write_text(tex_text, encoding="utf-8")
     report_json["latex_compile_health"] = report_latex_compile_health(tex_path)
     save_json(json_path, report_json)
+    refresh_report_latex_compile_health_sidecar(tex_path, json_path)
 
     return {
         "markdown": str(md_path),
