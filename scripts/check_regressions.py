@@ -23,6 +23,7 @@ from audit_policy_hooks import (
     FRESH_CONTEXT_RETRIEVAL_PROFILE,
     _audit_summary_markdown,
     _audit_summary_tex,
+    _augment_source_labels_in_text,
     _build_running_audit_context_for_chunk,
     _load_aux_label_map,
     _report_latex_paragraph_local,
@@ -1783,6 +1784,10 @@ def test_aux_printed_label_display_in_reports() -> None:
             "\n".join(
                 [
                     r"\newlabel{eq:test}{{3.5}{8}}",
+                    r"\newlabel{eq:main}{{3.5}{8}}",
+                    r"\newlabel{lemma:sizebiasgeom}{{4.3}{11}{Size bias}{theorem.4.3}{}}",
+                    r"\newlabel{lem:technicalf1}{{4.1}{10}{Technical lemma}{lemma.4.1}{}}",
+                    r"\newlabel{lem:kolmmain}{{5.2}{12}{Main theorem}{theorem.5.2}{}}",
                     r"\newlabel{lem:main}{{5.2}{12}{Main lemma}{lemma.5.2}{}}",
                     r"\newlabel{foo:bar}{{A.1}{20}}",
                 ]
@@ -1793,9 +1798,44 @@ def test_aux_printed_label_display_in_reports() -> None:
         _assert(label_map["eq:test"]["printed_label"] == "Equation (3.5)", label_map)
         _assert(label_map["eq:test"]["printed_number"] == "3.5", label_map)
         _assert(label_map["eq:test"]["page"] == "8", label_map)
+        _assert(label_map["lemma:sizebiasgeom"]["printed_label"] == "Theorem 4.3", label_map)
+        _assert(label_map["lem:technicalf1"]["printed_label"] == "Lemma 4.1", label_map)
+        _assert(label_map["lem:kolmmain"]["printed_label"] == "Theorem 5.2", label_map)
         _assert(label_map["lem:main"]["printed_label"] == "Lemma 5.2", label_map)
         _assert(label_map["lem:main"]["anchor"] == "lemma.5.2", label_map)
         _assert(label_map["foo:bar"]["printed_label"] == "A.1", label_map)
+        ref_state = {"label_map": label_map}
+        _assert(
+            _augment_source_labels_in_text("By Lemma lemma:sizebiasgeom", ref_state)
+            == "By Theorem 4.3 [source label: lemma:sizebiasgeom]",
+            label_map,
+        )
+        _assert(
+            "By Theorem 4.3 [source label: lemma:sizebiasgeom]"
+            in _augment_source_labels_in_text("The proof says 'By Lemma lemma:sizebiasgeom'.", ref_state),
+            label_map,
+        )
+        _assert(
+            _augment_source_labels_in_text("the lemma labeled lemma:sizebiasgeom", ref_state)
+            == "the result labeled Theorem 4.3 [source label: lemma:sizebiasgeom]",
+            label_map,
+        )
+        _assert(
+            _augment_source_labels_in_text("see eq:main", ref_state)
+            == "see Equation (3.5) [source label: eq:main]",
+            label_map,
+        )
+        singly_enriched = _augment_source_labels_in_text(
+            "Theorem 4.3 [source label: lemma:sizebiasgeom]",
+            ref_state,
+        )
+        _assert(singly_enriched.count("[source label: lemma:sizebiasgeom]") == 1, singly_enriched)
+        _assert(_augment_source_labels_in_text("lemma:unknown", ref_state) == "lemma:unknown", label_map)
+        _assert(
+            _augment_source_labels_in_text("prefixlemma:sizebiasgeomsuffix", ref_state)
+            == "prefixlemma:sizebiasgeomsuffix",
+            label_map,
+        )
         _write_json(
             paths["status"],
             {
@@ -1835,9 +1875,14 @@ def test_aux_printed_label_display_in_reports() -> None:
                         "status": "open",
                         "title": "Equation reference needs checking",
                         "location": "eq:test",
-                        "description": "The issue location is a raw source label.",
-                        "evidence": "The source label should be displayed with the printed equation number.",
-                        "proposed_fix": "Check the printed equation.",
+                        "description": (
+                            "By Lemma lemma:sizebiasgeom and see eq:test. Unknown lemma:unknown and "
+                            "prefixlemma:sizebiasgeomsuffix remain raw."
+                        ),
+                        "evidence": (
+                            "Theorem 4.3 [source label: lemma:sizebiasgeom] should not be double-enriched."
+                        ),
+                        "proposed_fix": "Replace the lemma labeled lem:technicalf1 reference if needed.",
                         "tags": ["reference"],
                     },
                     {
@@ -1847,7 +1892,7 @@ def test_aux_printed_label_display_in_reports() -> None:
                         "status": "open",
                         "title": "Lemma reference needs checking",
                         "location": "lem:main",
-                        "description": "The issue location is a raw lemma label.",
+                        "description": "The proof also cites the lemma labeled lem:kolmmain in prose.",
                         "evidence": "The source label should be displayed with the printed lemma number.",
                         "proposed_fix": "Check the printed lemma.",
                         "tags": ["reference"],
@@ -1873,21 +1918,45 @@ def test_aux_printed_label_display_in_reports() -> None:
         _assert("Location detail: Equation (3.5) [source label: eq:test]" in concise_markdown, concise_markdown)
         _assert("Location detail: Lemma 5.2 [source label: lem:main]" in concise_markdown, concise_markdown)
         _assert("Location detail: A.1 [source label: foo:bar]" in concise_markdown, concise_markdown)
-        _assert("Compiled AUX label recovery: 1 .aux file(s) found; 3 printed label(s) recovered; available: True." in concise_markdown, concise_markdown)
+        _assert(
+            "Description: By Theorem 4.3 [source label: lemma:sizebiasgeom] and see Equation (3.5) [source label: eq:test]."
+            in concise_markdown,
+            concise_markdown,
+        )
+        _assert("lemma:unknown" in concise_markdown, concise_markdown)
+        _assert("prefixlemma:sizebiasgeomsuffix remain raw" in concise_markdown, concise_markdown)
+        _assert(
+            "Evidence: Theorem 4.3 [source label: lemma:sizebiasgeom] should not be double-enriched."
+            in concise_markdown,
+            concise_markdown,
+        )
+        _assert(
+            "Proposed fix: Replace the result labeled Lemma 4.1 [source label: lem:technicalf1] reference if needed."
+            in concise_markdown,
+            concise_markdown,
+        )
+        _assert("the result labeled Theorem 5.2 [source label: lem:kolmmain]" in concise_markdown, concise_markdown)
+        _assert("Compiled AUX label recovery: 1 .aux file(s) found; 7 printed label(s) recovered; available: True." in concise_markdown, concise_markdown)
 
         concise_tex = build_concise_report_tex(session)
         _assert("Location detail: Equation (3.5) [source label: eq:test]" in concise_tex, concise_tex)
         _assert("Location detail: Lemma 5.2 [source label: lem:main]" in concise_tex, concise_tex)
+        _assert("By Theorem 4.3 [source label: lemma:sizebiasgeom]" in concise_tex, concise_tex)
+        _assert("Replace the result labeled Lemma 4.1 [source label: lem:technicalf1]" in concise_tex, concise_tex)
 
         full_markdown = build_final_report_markdown(session)
         _assert("- Location: Equation (3.5) [source label: eq:test]" in full_markdown, full_markdown)
         _assert("- Location: Lemma 5.2 [source label: lem:main]" in full_markdown, full_markdown)
+        _assert("- Description: By Theorem 4.3 [source label: lemma:sizebiasgeom]" in full_markdown, full_markdown)
+        _assert("- Proposed fix: Replace the result labeled Lemma 4.1 [source label: lem:technicalf1]" in full_markdown, full_markdown)
 
         report_json = build_concise_report_json(session)
         _assert(report_json["source_ingestion_diagnostics"]["printed_label_recovery_available"], report_json)
         location_details = [entry["location_detail"] for entry in report_json["high_issue_entries"]]
         _assert("Equation (3.5) [source label: eq:test]" in location_details, location_details)
         _assert("Lemma 5.2 [source label: lem:main]" in location_details, location_details)
+        descriptions = [entry["description_display"] for entry in report_json["high_issue_entries"]]
+        _assert(any("By Theorem 4.3 [source label: lemma:sizebiasgeom]" in item for item in descriptions), descriptions)
 
     with tempfile.TemporaryDirectory(prefix="math_audit_old_reference_map_display_") as tmp:
         root = Path(tmp)

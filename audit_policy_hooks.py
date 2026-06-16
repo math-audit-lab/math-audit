@@ -1532,13 +1532,41 @@ def _approx_page_location_text(
     return f"Approx. pages: {start}{sep}{end}{suffix}"
 
 
-def _augment_source_labels_in_text(text: str, ref_state: Optional[dict[str, Any]]) -> str:
-    text = str(text or "")
-    if not text or "source label:" in text.lower():
-        return text
-    label_map = ref_state.get("label_map", {}) if isinstance(ref_state, dict) else {}
-    if not isinstance(label_map, dict) or not label_map:
-        return text
+_SOURCE_LABEL_BOUNDARY_CHARS = r"A-Za-z0-9_:\-"
+_SOURCE_LABEL_KIND_WORDS = (
+    r"lemma|theorem|proposition|corollary|definition|remark|equation|formula|identity|section"
+)
+
+
+def _source_label_match_is_safe(text: str, start: int, end: int) -> bool:
+    """Return False for contexts where replacing a raw source label would be too surprising."""
+    left_context = text[max(0, start - 48) : start].lower()
+    if re.search(r"\[\s*source label:\s*$", left_context):
+        return False
+    quoted_edge = (start > 0 and text[start - 1] in {"'", '"', "`"}) or (
+        end < len(text) and text[end] in {"'", '"', "`"}
+    )
+    if quoted_edge and re.search(r"""['"]?[\w .-]+['"]?\s*:\s*['"]?$""", text[max(0, start - 48) : start]):
+        return False
+
+    token_start = start
+    while token_start > 0 and not text[token_start - 1].isspace():
+        token_start -= 1
+    token_end = end
+    while token_end < len(text) and not text[token_end].isspace():
+        token_end += 1
+    token = text[token_start:token_end]
+    if "://" in token or "/" in token or "\\" in token:
+        return False
+    if any(ch in token for ch in "{}[]"):
+        return False
+    return True
+
+
+def _augment_source_labels_in_plain_text_segment(
+    text: str,
+    label_map: dict[str, Any],
+) -> str:
     out = text
     for label, info in sorted(label_map.items(), key=lambda item: len(str(item[0])), reverse=True):
         label_text = str(label or "").strip()
@@ -1547,9 +1575,80 @@ def _augment_source_labels_in_text(text: str, ref_state: Optional[dict[str, Any]
         display = _reference_display_with_source_label(label_text, info if isinstance(info, dict) else {})
         if display == f"source label: {label_text}":
             continue
-        pattern = re.compile(rf"(?<![A-Za-z0-9_:\-]){re.escape(label_text)}(?![A-Za-z0-9_:\-])")
-        out = pattern.sub(display, out)
+        label_pattern = rf"(?<![{_SOURCE_LABEL_BOUNDARY_CHARS}])(?P<label>{re.escape(label_text)})(?![{_SOURCE_LABEL_BOUNDARY_CHARS}])"
+
+        by_pattern = re.compile(
+            rf"\b(?P<by>by)\s+(?:the\s+)?(?:{_SOURCE_LABEL_KIND_WORDS})\s+{label_pattern}",
+            flags=re.IGNORECASE,
+        )
+
+        def by_repl(match: re.Match[str]) -> str:
+            start, end = match.start("label"), match.end("label")
+            if not _source_label_match_is_safe(out, start, end):
+                return match.group(0)
+            prefix = "By" if match.group("by")[:1].isupper() else "by"
+            return f"{prefix} {display}"
+
+        out = by_pattern.sub(by_repl, out)
+
+        labeled_pattern = re.compile(
+            rf"\b(?P<prefix>(?:the|this|that)\s+)?(?:{_SOURCE_LABEL_KIND_WORDS})\s+labeled\s+{label_pattern}",
+            flags=re.IGNORECASE,
+        )
+
+        def labeled_repl(match: re.Match[str]) -> str:
+            start, end = match.start("label"), match.end("label")
+            if not _source_label_match_is_safe(out, start, end):
+                return match.group(0)
+            prefix = match.group("prefix") or ""
+            return f"{prefix}result labeled {display}"
+
+        out = labeled_pattern.sub(labeled_repl, out)
+
+        generic_pattern = re.compile(label_pattern)
+
+        def generic_repl(match: re.Match[str]) -> str:
+            start, end = match.start("label"), match.end("label")
+            if not _source_label_match_is_safe(out, start, end):
+                return match.group(0)
+            return display
+
+        out = generic_pattern.sub(generic_repl, out)
     return out
+
+
+def _augment_source_labels_in_text(text: str, ref_state: Optional[dict[str, Any]]) -> str:
+    text = str(text or "")
+    if not text:
+        return text
+    label_map = ref_state.get("label_map", {}) if isinstance(ref_state, dict) else {}
+    if not isinstance(label_map, dict) or not label_map:
+        return text
+    parts = re.split(r"(```.*?```|`[^`]*`)", text, flags=re.DOTALL)
+    return "".join(
+        part if part.startswith("`") else _augment_source_labels_in_plain_text_segment(part, label_map)
+        for part in parts
+    )
+
+
+def _issue_report_display_fields(issue: dict[str, Any], ref_state: Optional[dict[str, Any]]) -> dict[str, str]:
+    return {
+        "title_display": normalize_whitespace(
+            _augment_source_labels_in_text(str(issue.get("title", "") or ""), ref_state)
+        ),
+        "location_detail": normalize_whitespace(
+            _augment_source_labels_in_text(str(issue.get("location", "") or ""), ref_state)
+        ),
+        "description_display": normalize_whitespace(
+            _augment_source_labels_in_text(str(issue.get("description", "") or ""), ref_state)
+        ),
+        "evidence_display": normalize_whitespace(
+            _augment_source_labels_in_text(str(issue.get("evidence", "") or ""), ref_state)
+        ),
+        "proposed_fix_display": normalize_whitespace(
+            _augment_source_labels_in_text(str(issue.get("proposed_fix", "") or ""), ref_state)
+        ),
+    }
 
 
 def _extract_searchable_phrases(issue: dict[str, Any], max_items: int = 2) -> list[str]:
@@ -1585,6 +1684,7 @@ def _collect_typographical_issue_entries(
         if not _is_pure_typographical_issue(issue):
             continue
         rec = chunk_map.get(str(issue.get("chunk_id") or "").strip())
+        display_fields = _issue_report_display_fields(issue, ref_state)
         entries.append(
             {
                 "issue": issue,
@@ -1593,9 +1693,7 @@ def _collect_typographical_issue_entries(
                 "page_text_tex": _page_range_text(rec, markdown=False),
                 "location_text_md": _approx_page_location_text(rec, str(issue.get("chunk_id") or ""), markdown=True),
                 "location_text_tex": _approx_page_location_text(rec, str(issue.get("chunk_id") or ""), markdown=False),
-                "location_detail": normalize_whitespace(
-                    _augment_source_labels_in_text(str(issue.get("location", "") or ""), ref_state)
-                ),
+                **display_fields,
                 "searchable_phrases": _extract_searchable_phrases(issue),
                 "incorrect_text": _extract_incorrect_text(issue),
                 "page_start_sort": int(rec.get("page_start") or 10**9) if isinstance(rec, dict) else 10**9,
@@ -1622,7 +1720,7 @@ def _issue_report_entry(
         "chunk_record": rec,
         "location_text_md": _approx_page_location_text(rec, chunk_id, markdown=True),
         "location_text_tex": _approx_page_location_text(rec, chunk_id, markdown=False),
-        "location_detail": normalize_whitespace(_augment_source_labels_in_text(str(issue.get("location", "") or ""), ref_state)),
+        **_issue_report_display_fields(issue, ref_state),
         "recheck": (issue_recheck_overlay or {}).get("issue_recommendations", {}).get(issue_id, {}),
     }
 
@@ -1912,7 +2010,7 @@ def _typographical_errors_markdown(entries: list[dict[str, Any]]) -> str:
     for entry in entries:
         issue = entry["issue"]
         lines.append(
-            f"### {issue.get('issue_id', 'issue')} — {normalize_math_delimiters(issue.get('title', 'Untitled issue'))} [{issue.get('severity', 'low')}]"
+            f"### {issue.get('issue_id', 'issue')} — {normalize_math_delimiters(entry.get('title_display') or issue.get('title', 'Untitled issue'))} [{issue.get('severity', 'low')}]"
         )
         if entry.get("location_text_md"):
             lines.append(f"- {entry['location_text_md']}")
@@ -1925,7 +2023,9 @@ def _typographical_errors_markdown(entries: list[dict[str, Any]]) -> str:
         if entry.get("incorrect_text"):
             lines.append(f"- Incorrect text: {normalize_math_delimiters(entry['incorrect_text'])}")
         if issue.get("proposed_fix"):
-            lines.append(f"- Suggested correction: {normalize_math_delimiters(issue.get('proposed_fix', ''))}")
+            lines.append(
+                f"- Suggested correction: {normalize_math_delimiters(entry.get('proposed_fix_display') or issue.get('proposed_fix', ''))}"
+            )
         lines.append("")
     return "\n".join(lines)
 
@@ -1939,7 +2039,7 @@ def _typographical_errors_tex(entries: list[dict[str, Any]]) -> str:
     for entry in entries:
         issue = entry["issue"]
         title = render(
-            f"{issue.get('issue_id', 'issue')} -- {issue.get('title', 'Untitled issue')} [{issue.get('severity', 'low')}]"
+            f"{issue.get('issue_id', 'issue')} -- {entry.get('title_display') or issue.get('title', 'Untitled issue')} [{issue.get('severity', 'low')}]"
         )
         parts.append(r"\subsection*{" + title + "}")
         parts.append(r"\begin{itemize}")
@@ -1954,7 +2054,7 @@ def _typographical_errors_tex(entries: list[dict[str, Any]]) -> str:
         if entry.get("incorrect_text"):
             parts.append(r"\item Incorrect text: " + render(entry["incorrect_text"]))
         if issue.get("proposed_fix"):
-            parts.append(r"\item Suggested correction: " + render(issue.get("proposed_fix", "")))
+            parts.append(r"\item Suggested correction: " + render(entry.get("proposed_fix_display") or issue.get("proposed_fix", "")))
         parts.append(r"\end{itemize}")
     return "\n".join(parts) + "\n"
 
@@ -2203,19 +2303,21 @@ def _build_final_report_markdown_base(session: dict[str, Any], report_title: Opt
     open_issues = [x for x in issues_state["issues"] if x.get("status", "open") == "open"]
     typo_entries = _collect_typographical_issue_entries(open_issues, chunk_records, ref_state=ref_state)
     main_open_issues = [x for x in open_issues if not _is_pure_typographical_issue(x)]
+    chunk_map = _chunk_record_map(chunk_records)
     if not main_open_issues:
         lines.append("- No open mathematical/correctness issues.")
     else:
         for issue in main_open_issues:
+            entry = _issue_report_entry(issue, chunk_map, issue_recheck_overlay, ref_state=ref_state)
             recheck_rec = issue_recheck_overlay.get("issue_recommendations", {}).get(str(issue.get("issue_id") or ""), {})
             lines.extend(
                 [
-                    f"### {issue['issue_id']} — {normalize_math_delimiters(issue['title'])} [{issue['severity']}]",
+                    f"### {issue['issue_id']} — {normalize_math_delimiters(entry.get('title_display') or issue['title'])} [{issue['severity']}]",
                     f"- Chunk: {issue['chunk_id']}",
-                    f"- Location: {normalize_math_delimiters(_augment_source_labels_in_text(issue['location'], ref_state))}",
-                    f"- Description: {normalize_math_delimiters(issue['description'])}",
-                    f"- Evidence: {normalize_math_delimiters(issue['evidence'])}",
-                    f"- Proposed fix: {normalize_math_delimiters(issue['proposed_fix'])}",
+                    f"- Location: {normalize_math_delimiters(entry.get('location_detail') or issue['location'])}",
+                    f"- Description: {normalize_math_delimiters(entry.get('description_display') or issue['description'])}",
+                    f"- Evidence: {normalize_math_delimiters(entry.get('evidence_display') or issue['evidence'])}",
+                    f"- Proposed fix: {normalize_math_delimiters(entry.get('proposed_fix_display') or issue['proposed_fix'])}",
                     f"- Tags: {', '.join(issue.get('tags', [])) if issue.get('tags') else 'none'}",
                 ]
             )
@@ -2259,12 +2361,13 @@ def _build_final_report_markdown_base(session: dict[str, Any], report_title: Opt
             chunk_issues = [issue for issue in (audit.get("issues") or []) if not _is_pure_typographical_issue(issue)]
             if chunk_issues:
                 for issue in chunk_issues:
+                    display_fields = _issue_report_display_fields(issue, ref_state)
                     lines.extend(
                         [
-                            f"- {normalize_math_delimiters(issue.get('title','Untitled issue'))} [{issue.get('severity','low')}]",
-                            f"  - Location: {normalize_math_delimiters(_augment_source_labels_in_text(issue.get('location',''), ref_state))}",
-                            f"  - Description: {normalize_math_delimiters(issue.get('description',''))}",
-                            f"  - Proposed fix: {normalize_math_delimiters(issue.get('proposed_fix',''))}",
+                            f"- {normalize_math_delimiters(display_fields.get('title_display') or issue.get('title','Untitled issue'))} [{issue.get('severity','low')}]",
+                            f"  - Location: {normalize_math_delimiters(display_fields.get('location_detail') or issue.get('location',''))}",
+                            f"  - Description: {normalize_math_delimiters(display_fields.get('description_display') or issue.get('description',''))}",
+                            f"  - Proposed fix: {normalize_math_delimiters(display_fields.get('proposed_fix_display') or issue.get('proposed_fix',''))}",
                         ]
                     )
             elif audit.get("issues"):
@@ -2373,23 +2476,27 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
     open_issues = [x for x in issues_state["issues"] if x.get("status", "open") == "open"]
     typo_entries = _collect_typographical_issue_entries(open_issues, chunk_records, ref_state=ref_state)
     main_open_issues = [x for x in open_issues if not _is_pure_typographical_issue(x)]
+    chunk_map = _chunk_record_map(chunk_records)
     if not main_open_issues:
         parts.append("No open mathematical/correctness issues.\n")
     else:
         for issue in main_open_issues:
+            entry = _issue_report_entry(issue, chunk_map, issue_recheck_overlay, ref_state=ref_state)
             recheck_rec = issue_recheck_overlay.get("issue_recommendations", {}).get(str(issue.get("issue_id") or ""), {})
-            title_line = _report_latex_paragraph_local(f"{issue['issue_id']} -- {issue['title']} [{issue['severity']}]")
+            title_line = _report_latex_paragraph_local(
+                f"{issue['issue_id']} -- {entry.get('title_display') or issue['title']} [{issue['severity']}]"
+            )
             parts.append(r"\subsection*{" + title_line + "}" + "\n")
             parts.append(r"\begin{itemize}" + "\n")
             parts.append(r"\item Chunk: " + _report_latex_paragraph_local(issue["chunk_id"]) + "\n")
             parts.append(
                 r"\item Location: "
-                + _report_latex_paragraph_local(_augment_source_labels_in_text(issue.get("location", ""), ref_state))
+                + _report_latex_paragraph_local(entry.get("location_detail") or issue.get("location", ""))
                 + "\n"
             )
-            parts.append(r"\item Description: " + _report_latex_paragraph_local(issue.get("description", "")) + "\n")
-            parts.append(r"\item Evidence: " + _report_latex_paragraph_local(issue.get("evidence", "")) + "\n")
-            parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(issue.get("proposed_fix", "")) + "\n")
+            parts.append(r"\item Description: " + _report_latex_paragraph_local(entry.get("description_display") or issue.get("description", "")) + "\n")
+            parts.append(r"\item Evidence: " + _report_latex_paragraph_local(entry.get("evidence_display") or issue.get("evidence", "")) + "\n")
+            parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(entry.get("proposed_fix_display") or issue.get("proposed_fix", "")) + "\n")
             tag_text = ", ".join(issue.get("tags", [])) if issue.get("tags") else "none"
             parts.append(r"\item Tags: " + _report_latex_paragraph_local(tag_text) + "\n")
             for item in _issue_recheck_tex_items(issue, recheck_rec):
@@ -2441,10 +2548,11 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
             chunk_issues = [issue for issue in (audit.get("issues") or []) if not _is_pure_typographical_issue(issue)]
             if chunk_issues:
                 for issue in chunk_issues:
+                    display_fields = _issue_report_display_fields(issue, ref_state)
                     parts.append(
                         r"\subparagraph*{"
                         + _report_latex_paragraph_local(
-                            f"{issue.get('title','Untitled issue')} [{issue.get('severity','low')}]"
+                            f"{display_fields.get('title_display') or issue.get('title','Untitled issue')} [{issue.get('severity','low')}]"
                         )
                         + "}"
                         + "\n"
@@ -2452,12 +2560,12 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
                     parts.append(r"\begin{itemize}" + "\n")
                     parts.append(
                         r"\item Location: "
-                        + _report_latex_paragraph_local(_augment_source_labels_in_text(issue.get("location", ""), ref_state))
+                        + _report_latex_paragraph_local(display_fields.get("location_detail") or issue.get("location", ""))
                         + "\n"
                     )
-                    parts.append(r"\item Description: " + _report_latex_paragraph_local(issue.get("description", "")) + "\n")
-                    parts.append(r"\item Evidence: " + _report_latex_paragraph_local(issue.get("evidence", "")) + "\n")
-                    parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(issue.get("proposed_fix", "")) + "\n")
+                    parts.append(r"\item Description: " + _report_latex_paragraph_local(display_fields.get("description_display") or issue.get("description", "")) + "\n")
+                    parts.append(r"\item Evidence: " + _report_latex_paragraph_local(display_fields.get("evidence_display") or issue.get("evidence", "")) + "\n")
+                    parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(display_fields.get("proposed_fix_display") or issue.get("proposed_fix", "")) + "\n")
                     tag_text = ", ".join(issue.get("tags", [])) if issue.get("tags") else "none"
                     parts.append(r"\item Tags: " + _report_latex_paragraph_local(tag_text) + "\n")
                     parts.append(r"\end{itemize}" + "\n")
@@ -3703,12 +3811,12 @@ def _high_priority_issues_markdown(entries: list[dict[str, Any]], options: Optio
         issue = entry["issue"]
         lines.extend(
             [
-                f"### {issue.get('issue_id', 'issue')} — {normalize_math_delimiters(issue.get('title', 'Untitled issue'))} [{issue.get('severity', 'high')}]",
+                f"### {issue.get('issue_id', 'issue')} — {normalize_math_delimiters(entry.get('title_display') or issue.get('title', 'Untitled issue'))} [{issue.get('severity', 'high')}]",
                 f"- {entry.get('location_text_md') or ('Chunk: ' + str(issue.get('chunk_id', '')))}",
                 f"- Location detail: {normalize_math_delimiters(entry.get('location_detail') or issue.get('location', ''))}",
-                f"- Description: {normalize_math_delimiters(issue.get('description', ''))}",
-                f"- Evidence: {normalize_math_delimiters(issue.get('evidence', ''))}",
-                f"- Proposed fix: {normalize_math_delimiters(issue.get('proposed_fix', ''))}",
+                f"- Description: {normalize_math_delimiters(entry.get('description_display') or issue.get('description', ''))}",
+                f"- Evidence: {normalize_math_delimiters(entry.get('evidence_display') or issue.get('evidence', ''))}",
+                f"- Proposed fix: {normalize_math_delimiters(entry.get('proposed_fix_display') or issue.get('proposed_fix', ''))}",
                 f"- Tags: {', '.join(issue.get('tags', [])) if issue.get('tags') else 'none'}",
             ]
         )
@@ -3726,7 +3834,7 @@ def _high_priority_issues_tex(entries: list[dict[str, Any]], options: Optional[d
     for entry in entries:
         issue = entry["issue"]
         title = _report_latex_paragraph_local(
-            f"{issue.get('issue_id', 'issue')} -- {issue.get('title', 'Untitled issue')} [{issue.get('severity', 'high')}]"
+            f"{issue.get('issue_id', 'issue')} -- {entry.get('title_display') or issue.get('title', 'Untitled issue')} [{issue.get('severity', 'high')}]"
         )
         parts.append(r"\subsection*{" + title + "}")
         parts.append(r"\begin{itemize}")
@@ -3738,9 +3846,9 @@ def _high_priority_issues_tex(entries: list[dict[str, Any]], options: Optional[d
             r"\item Location detail: "
             + _report_latex_paragraph_local(entry.get("location_detail") or issue.get("location", ""))
         )
-        parts.append(r"\item Description: " + _report_latex_paragraph_local(issue.get("description", "")))
-        parts.append(r"\item Evidence: " + _report_latex_paragraph_local(issue.get("evidence", "")))
-        parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(issue.get("proposed_fix", "")))
+        parts.append(r"\item Description: " + _report_latex_paragraph_local(entry.get("description_display") or issue.get("description", "")))
+        parts.append(r"\item Evidence: " + _report_latex_paragraph_local(entry.get("evidence_display") or issue.get("evidence", "")))
+        parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(entry.get("proposed_fix_display") or issue.get("proposed_fix", "")))
         tag_text = ", ".join(issue.get("tags", [])) if issue.get("tags") else "none"
         parts.append(r"\item Tags: " + _report_latex_paragraph_local(tag_text))
         parts.extend(_issue_recheck_tex_items(issue, entry.get("recheck")))
@@ -3756,12 +3864,12 @@ def _notable_proof_reference_issues_markdown(entries: list[dict[str, Any]]) -> s
         issue = entry["issue"]
         lines.extend(
             [
-                f"### {issue.get('issue_id', 'issue')} — {normalize_math_delimiters(issue.get('title', 'Untitled issue'))} [{issue.get('severity', 'medium')}]",
+                f"### {issue.get('issue_id', 'issue')} — {normalize_math_delimiters(entry.get('title_display') or issue.get('title', 'Untitled issue'))} [{issue.get('severity', 'medium')}]",
                 f"- {entry.get('location_text_md') or ('Chunk: ' + str(issue.get('chunk_id', '')))}",
                 f"- Location detail: {normalize_math_delimiters(entry.get('location_detail') or issue.get('location', ''))}",
-                f"- Description: {normalize_math_delimiters(issue.get('description', ''))}",
-                f"- Evidence: {normalize_math_delimiters(issue.get('evidence', ''))}",
-                f"- Proposed fix: {normalize_math_delimiters(issue.get('proposed_fix', ''))}",
+                f"- Description: {normalize_math_delimiters(entry.get('description_display') or issue.get('description', ''))}",
+                f"- Evidence: {normalize_math_delimiters(entry.get('evidence_display') or issue.get('evidence', ''))}",
+                f"- Proposed fix: {normalize_math_delimiters(entry.get('proposed_fix_display') or issue.get('proposed_fix', ''))}",
                 f"- Tags: {', '.join(issue.get('tags', [])) if issue.get('tags') else 'none'}",
             ]
         )
@@ -3777,7 +3885,7 @@ def _notable_proof_reference_issues_tex(entries: list[dict[str, Any]]) -> str:
     for entry in entries:
         issue = entry["issue"]
         title = _report_latex_paragraph_local(
-            f"{issue.get('issue_id', 'issue')} -- {issue.get('title', 'Untitled issue')} [{issue.get('severity', 'medium')}]"
+            f"{issue.get('issue_id', 'issue')} -- {entry.get('title_display') or issue.get('title', 'Untitled issue')} [{issue.get('severity', 'medium')}]"
         )
         parts.append(r"\subsection*{" + title + "}")
         parts.append(r"\begin{itemize}")
@@ -3789,9 +3897,9 @@ def _notable_proof_reference_issues_tex(entries: list[dict[str, Any]]) -> str:
             r"\item Location detail: "
             + _report_latex_paragraph_local(entry.get("location_detail") or issue.get("location", ""))
         )
-        parts.append(r"\item Description: " + _report_latex_paragraph_local(issue.get("description", "")))
-        parts.append(r"\item Evidence: " + _report_latex_paragraph_local(issue.get("evidence", "")))
-        parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(issue.get("proposed_fix", "")))
+        parts.append(r"\item Description: " + _report_latex_paragraph_local(entry.get("description_display") or issue.get("description", "")))
+        parts.append(r"\item Evidence: " + _report_latex_paragraph_local(entry.get("evidence_display") or issue.get("evidence", "")))
+        parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(entry.get("proposed_fix_display") or issue.get("proposed_fix", "")))
         tag_text = ", ".join(issue.get("tags", [])) if issue.get("tags") else "none"
         parts.append(r"\item Tags: " + _report_latex_paragraph_local(tag_text))
         parts.extend(_issue_recheck_tex_items(issue, entry.get("recheck")))
