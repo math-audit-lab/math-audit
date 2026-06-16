@@ -24,6 +24,7 @@ from audit_policy_hooks import (
     _audit_summary_markdown,
     _audit_summary_tex,
     _build_running_audit_context_for_chunk,
+    _load_aux_label_map,
     _report_latex_paragraph_local,
     build_concise_report_json,
     build_concise_report_markdown,
@@ -1743,10 +1744,11 @@ def test_source_ingestion_diagnostics_in_reports() -> None:
         _assert(diag["status"] == "tex_partial_structural_recovery", diag)
         _assert(diag["fallback_gap_chunk_count"] == 3, diag)
         _assert(diag["label_map_empty_despite_tex"], diag)
-        _assert(len(diag["warnings"]) == 2, diag)
+        _assert(len(diag["warnings"]) == 3, diag)
         markdown = build_concise_report_markdown(session)
         _assert("many chunks used fallback/gap source" in markdown, markdown)
         _assert("no labels were recovered" in markdown, markdown)
+        _assert("no compiled .aux label map was available" in markdown, markdown)
         tex = build_concise_report_tex(session)
         _assert(r"\section*{Source ingestion status}" in tex, tex)
         _assert("many chunks used fallback/gap source" in tex, tex)
@@ -1763,8 +1765,184 @@ def test_source_ingestion_diagnostics_in_reports() -> None:
         diag = source_ingestion_diagnostics(session)
         _assert(diag["fallback_gap_chunk_count"] == 0, diag)
         _assert(diag["label_map_empty_despite_tex"], diag)
-        _assert(len(diag["warnings"]) == 1, diag)
-        _assert("no labels were recovered" in diag["warnings"][0], diag)
+        _assert(len(diag["warnings"]) == 2, diag)
+        _assert(any("no labels were recovered" in warning for warning in diag["warnings"]), diag)
+        _assert(any("no compiled .aux label map" in warning for warning in diag["warnings"]), diag)
+
+
+def test_aux_printed_label_display_in_reports() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_aux_label_display_") as tmp:
+        root = Path(tmp)
+        workdir = root / "paper_audit"
+        session = _seed_state(workdir)
+        session["tex_path"] = str(root / "paper.tex")
+        paths = session_paths(workdir)
+        _write_json(paths["session"], session)
+        _write_text(
+            root / "paper.aux",
+            "\n".join(
+                [
+                    r"\newlabel{eq:test}{{3.5}{8}}",
+                    r"\newlabel{lem:main}{{5.2}{12}{Main lemma}{lemma.5.2}{}}",
+                    r"\newlabel{foo:bar}{{A.1}{20}}",
+                ]
+            )
+            + "\n",
+        )
+        label_map = _load_aux_label_map(root / "paper.aux")
+        _assert(label_map["eq:test"]["printed_label"] == "Equation (3.5)", label_map)
+        _assert(label_map["eq:test"]["printed_number"] == "3.5", label_map)
+        _assert(label_map["eq:test"]["page"] == "8", label_map)
+        _assert(label_map["lem:main"]["printed_label"] == "Lemma 5.2", label_map)
+        _assert(label_map["lem:main"]["anchor"] == "lemma.5.2", label_map)
+        _assert(label_map["foo:bar"]["printed_label"] == "A.1", label_map)
+        _write_json(
+            paths["status"],
+            {
+                "status": "completed",
+                "chunks_completed": 1,
+                "chunks_total": 1,
+                "estimated_pages_completed": 1,
+                "estimated_pages_total": 1,
+                "updated_at": NEW,
+            },
+        )
+        _write_json(
+            paths["manifest"],
+            {
+                "chunking_mode": "tex",
+                "chunks": [
+                    {
+                        "chunk_id": "chunk_001",
+                        "chunk_index": 1,
+                        "page_start": 1,
+                        "page_end": 1,
+                        "source_kind": "tex",
+                    }
+                ],
+                "updated_at": NEW,
+            },
+        )
+        _write_json(
+            paths["issues"],
+            {
+                "next_issue_id": 4,
+                "issues": [
+                    {
+                        "issue_id": "I001",
+                        "chunk_id": "chunk_001",
+                        "severity": "high",
+                        "status": "open",
+                        "title": "Equation reference needs checking",
+                        "location": "eq:test",
+                        "description": "The issue location is a raw source label.",
+                        "evidence": "The source label should be displayed with the printed equation number.",
+                        "proposed_fix": "Check the printed equation.",
+                        "tags": ["reference"],
+                    },
+                    {
+                        "issue_id": "I002",
+                        "chunk_id": "chunk_001",
+                        "severity": "high",
+                        "status": "open",
+                        "title": "Lemma reference needs checking",
+                        "location": "lem:main",
+                        "description": "The issue location is a raw lemma label.",
+                        "evidence": "The source label should be displayed with the printed lemma number.",
+                        "proposed_fix": "Check the printed lemma.",
+                        "tags": ["reference"],
+                    },
+                    {
+                        "issue_id": "I003",
+                        "chunk_id": "chunk_001",
+                        "severity": "high",
+                        "status": "open",
+                        "title": "Unknown reference kind is still readable",
+                        "location": "foo:bar",
+                        "description": "Unknown label kinds should still show the printed number.",
+                        "evidence": "The source label should not be lost.",
+                        "proposed_fix": "Keep both identifiers.",
+                        "tags": ["reference"],
+                    },
+                ],
+                "updated_at": NEW,
+            },
+        )
+
+        concise_markdown = build_concise_report_markdown(session)
+        _assert("Location detail: Equation (3.5) [source label: eq:test]" in concise_markdown, concise_markdown)
+        _assert("Location detail: Lemma 5.2 [source label: lem:main]" in concise_markdown, concise_markdown)
+        _assert("Location detail: A.1 [source label: foo:bar]" in concise_markdown, concise_markdown)
+        _assert("Compiled AUX label recovery: 1 .aux file(s) found; 3 printed label(s) recovered; available: True." in concise_markdown, concise_markdown)
+
+        concise_tex = build_concise_report_tex(session)
+        _assert("Location detail: Equation (3.5) [source label: eq:test]" in concise_tex, concise_tex)
+        _assert("Location detail: Lemma 5.2 [source label: lem:main]" in concise_tex, concise_tex)
+
+        full_markdown = build_final_report_markdown(session)
+        _assert("- Location: Equation (3.5) [source label: eq:test]" in full_markdown, full_markdown)
+        _assert("- Location: Lemma 5.2 [source label: lem:main]" in full_markdown, full_markdown)
+
+        report_json = build_concise_report_json(session)
+        _assert(report_json["source_ingestion_diagnostics"]["printed_label_recovery_available"], report_json)
+        location_details = [entry["location_detail"] for entry in report_json["high_issue_entries"]]
+        _assert("Equation (3.5) [source label: eq:test]" in location_details, location_details)
+        _assert("Lemma 5.2 [source label: lem:main]" in location_details, location_details)
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_old_reference_map_display_") as tmp:
+        root = Path(tmp)
+        workdir = root / "paper_audit"
+        session = _seed_state(workdir)
+        session["tex_path"] = str(root / "paper.tex")
+        paths = session_paths(workdir)
+        _write_json(paths["session"], session)
+        _write_json(
+            workdir / "state" / "reference_map.json",
+            {
+                "label_map": {
+                    "eq:old": {"number": "7.1", "kind": "equation", "display": "Equation (7.1)"}
+                },
+                "map_source": "cached",
+                "updated_at": OLD,
+            },
+        )
+        _write_json(
+            paths["manifest"],
+            {
+                "chunking_mode": "tex",
+                "chunks": [
+                    {
+                        "chunk_id": "chunk_001",
+                        "chunk_index": 1,
+                        "page_start": 1,
+                        "page_end": 1,
+                        "source_kind": "tex",
+                    }
+                ],
+            },
+        )
+        _write_json(
+            paths["issues"],
+            {
+                "issues": [
+                    {
+                        "issue_id": "I001",
+                        "chunk_id": "chunk_001",
+                        "severity": "high",
+                        "status": "open",
+                        "title": "Old cached label maps still display",
+                        "location": "eq:old",
+                        "description": "Old maps lack printed_label but have display.",
+                        "evidence": "Reports should not crash.",
+                        "proposed_fix": "Use the display field.",
+                        "tags": ["reference"],
+                    }
+                ],
+                "updated_at": NEW,
+            },
+        )
+        markdown = build_concise_report_markdown(session)
+        _assert("Equation (7.1) [source label: eq:old]" in markdown, markdown)
 
 
 def test_concise_report_notable_incorrect_reference_issues() -> None:
@@ -3623,6 +3801,7 @@ def main() -> int:
         ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
         ("issue severity summary in audit summary", test_issue_severity_summary_in_audit_summary),
         ("source ingestion diagnostics in reports", test_source_ingestion_diagnostics_in_reports),
+        ("AUX printed label display in reports", test_aux_printed_label_display_in_reports),
         ("concise report notable incorrect reference issues", test_concise_report_notable_incorrect_reference_issues),
         ("issue recheck overlay in reports", test_issue_recheck_overlay_in_reports),
         ("fresh rerun request metadata", test_fresh_rerun_request_metadata),

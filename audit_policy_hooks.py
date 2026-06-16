@@ -322,6 +322,10 @@ def _infer_kind_from_label(label: str) -> str:
         return "proposition"
     if lab.startswith(("cor:", "corollary:")):
         return "corollary"
+    if lab.startswith(("def:", "definition:")):
+        return "definition"
+    if lab.startswith(("rem:", "remark:")):
+        return "remark"
     if lab.startswith(("sec:", "section:")):
         return "section"
     if lab.startswith(("fig:", "figure:")):
@@ -337,8 +341,8 @@ def _display_for_kind(kind: str, num: str, label: str) -> str:
     if not n:
         return ""
     if k == "equation":
-        return f"equation ({n})"
-    if k in {"theorem", "lemma", "proposition", "corollary", "section", "figure", "table"}:
+        return f"Equation ({n})"
+    if k in {"theorem", "lemma", "proposition", "corollary", "definition", "remark", "section", "figure", "table"}:
         return f"{k.title()} {n}"
     return n
 
@@ -398,12 +402,29 @@ def _infer_kind_from_aux_anchor(anchor: str, label: str) -> str:
         "prop": "proposition",
         "corollary": "corollary",
         "cor": "corollary",
+        "definition": "definition",
+        "def": "definition",
+        "remark": "remark",
+        "rem": "remark",
         "figure": "figure",
         "fig": "figure",
         "table": "table",
         "tab": "table",
     }
     return aliases.get(prefix, _infer_kind_from_label(label))
+
+
+def _reference_display_with_source_label(label: str, info: Optional[dict[str, Any]] = None) -> str:
+    label = normalize_whitespace(str(label or ""))
+    info = info if isinstance(info, dict) else {}
+    display = normalize_whitespace(str(info.get("printed_label") or info.get("display") or ""))
+    number = normalize_whitespace(str(info.get("printed_number") or info.get("number") or ""))
+    kind = normalize_whitespace(str(info.get("kind") or _infer_kind_from_label(label)))
+    if not display and number:
+        display = _display_for_kind(kind, number, label)
+    if display:
+        return f"{display} [source label: {label}]"
+    return f"source label: {label}"
 
 
 def _load_aux_label_map(aux_path: str | Path) -> dict[str, dict[str, str]]:
@@ -446,10 +467,15 @@ def _load_aux_label_map(aux_path: str | Path) -> dict[str, dict[str, str]]:
         page = (groups[1] or "").strip() if len(groups) > 1 else ""
         anchor = (groups[3] or "").strip() if len(groups) > 3 else ""
         kind = _infer_kind_from_aux_anchor(anchor, label)
+        display = _display_for_kind(kind, number, label)
         entry = {
+            "label": label,
             "number": number,
+            "printed_number": number,
             "kind": kind,
-            "display": _display_for_kind(kind, number, label),
+            "display": display,
+            "printed_label": display,
+            "source": "aux",
         }
         if page:
             entry["page"] = page
@@ -457,6 +483,36 @@ def _load_aux_label_map(aux_path: str | Path) -> dict[str, dict[str, str]]:
             entry["anchor"] = anchor
         label_map[label] = entry
     return label_map
+
+
+def _candidate_aux_paths_for_session(session: dict[str, Any]) -> list[Path]:
+    tex_path_text = normalize_whitespace(str(session.get("tex_path") or ""))
+    if not tex_path_text:
+        return []
+    tex_path = Path(tex_path_text)
+    candidates: list[Path] = []
+    exact = tex_path.with_suffix(".aux")
+    if exact.exists():
+        candidates.append(exact)
+    try:
+        for path in sorted(tex_path.parent.glob("*.aux")):
+            if path.exists() and path not in candidates:
+                candidates.append(path)
+    except Exception:
+        pass
+    return candidates
+
+
+def _load_aux_label_maps(aux_paths: list[Path]) -> tuple[dict[str, dict[str, str]], list[str]]:
+    label_map: dict[str, dict[str, str]] = {}
+    errors: list[str] = []
+    for aux_path in aux_paths:
+        try:
+            for label, entry in _load_aux_label_map(aux_path).items():
+                label_map.setdefault(label, entry)
+        except Exception as exc:
+            errors.append(f"{aux_path.name}: {exc}")
+    return label_map, errors
 
 
 def _load_pdf_pages_for_reference_hints(pdf_path: str | Path) -> list[str]:
@@ -551,12 +607,12 @@ def _reference_number_rows(labels: list[str], label_map: dict[str, dict[str, str
     rows = []
     for lab in labels:
         info = label_map.get(lab) or {}
-        disp = (info.get("display") or "").strip()
+        disp = _reference_display_with_source_label(lab, info)
         kind = (info.get("kind") or _infer_kind_from_label(lab)).strip() or "item"
         num = (info.get("number") or "").strip()
-        if disp and num:
+        if disp != f"source label: {lab}" and num:
             rows.append(f"- {lab} -> {disp}")
-        elif disp:
+        elif disp != f"source label: {lab}":
             rows.append(f"- {lab} -> {disp} (compiled number unavailable; cite by label if needed)")
         else:
             rows.append(f"- {lab} -> compiled number unavailable; cite as 'the {kind} labeled {lab}'")
@@ -567,8 +623,9 @@ def ensure_reference_map(session: dict[str, Any]) -> dict[str, Any]:
     root = Path(session["workdir"])
     ref_path = root / "state" / "reference_map.json"
     tex_path = session.get("tex_path")
-    aux_path = Path(tex_path).with_suffix(".aux") if tex_path else None
-    aux_exists = bool(aux_path and aux_path.exists())
+    aux_paths = _candidate_aux_paths_for_session(session)
+    aux_path = aux_paths[0] if aux_paths else (Path(tex_path).with_suffix(".aux") if tex_path else None)
+    aux_exists = bool(aux_paths)
 
     cached: dict[str, Any] = {}
     if ref_path.exists():
@@ -580,38 +637,45 @@ def ensure_reference_map(session: dict[str, Any]) -> dict[str, Any]:
             cached = {"warning": f"Could not read cached reference_map.json: {e}"}
 
     if aux_exists and aux_path is not None:
-        try:
-            label_map = _load_aux_label_map(aux_path)
-            ref_state = {
-                "label_map": label_map,
-                "source_aux_path": str(aux_path),
-                "map_source": "aux" if label_map else "aux_empty",
-                "updated_at": utc_now(),
-            }
-            if not label_map:
-                ref_state["warning"] = f"AUX file {aux_path.name} was parsed but no labels were recovered."
-            save_json(ref_path, ref_state)
-            return ref_state
-        except Exception as e:
+        label_map, errors = _load_aux_label_maps(aux_paths)
+        ref_state = {
+            "label_map": label_map,
+            "source_aux_path": str(aux_path),
+            "source_aux_paths": [str(path) for path in aux_paths],
+            "aux_file_count": len(aux_paths),
+            "map_source": "aux" if label_map else ("aux_error" if errors else "aux_empty"),
+            "updated_at": utc_now(),
+        }
+        if errors:
+            ref_state["aux_parse_warnings"] = errors
+        if not label_map:
             cached_map = cached.get("label_map") if isinstance(cached.get("label_map"), dict) else {}
-            ref_state = {
-                "label_map": cached_map or {},
-                "source_aux_path": str(aux_path),
-                "map_source": "cached_after_aux_error" if cached_map else "aux_error",
-                "updated_at": utc_now(),
-                "warning": (
-                    f"Failed to parse AUX reference map from {aux_path.name}: {e}. "
-                    + ("Using cached reference map fallback." if cached_map else "No cached reference map fallback is available.")
-                ),
-            }
-            save_json(ref_path, ref_state)
-            return ref_state
+            if cached_map:
+                ref_state["label_map"] = cached_map
+                ref_state["map_source"] = "cached_after_aux_error" if errors else "cached_after_aux_empty"
+                ref_state["warning"] = (
+                    "No labels were recovered from available AUX files. Using cached reference map fallback."
+                )
+            elif errors:
+                ref_state["warning"] = (
+                    "Failed to parse labels from available AUX files: "
+                    + "; ".join(errors)
+                    + ". No cached reference map fallback is available."
+                )
+            else:
+                ref_state["warning"] = (
+                    f"{len(aux_paths)} AUX file(s) were parsed but no labels were recovered."
+                )
+        save_json(ref_path, ref_state)
+        return ref_state
 
     if isinstance(cached.get("label_map"), dict):
         cached.setdefault(
             "source_aux_path",
             str(aux_path) if aux_path and aux_path.exists() else cached.get("source_aux_path"),
         )
+        cached.setdefault("source_aux_paths", [str(path) for path in aux_paths] if aux_paths else [])
+        cached.setdefault("aux_file_count", len(aux_paths))
         cached.setdefault("map_source", "cached" if cached.get("label_map") else "none")
         cached["updated_at"] = utc_now()
         save_json(ref_path, cached)
@@ -620,6 +684,8 @@ def ensure_reference_map(session: dict[str, Any]) -> dict[str, Any]:
     ref_state = {
         "label_map": {},
         "source_aux_path": str(aux_path) if aux_path and aux_path.exists() else None,
+        "source_aux_paths": [],
+        "aux_file_count": 0,
         "map_source": "none",
         "updated_at": utc_now(),
     }
@@ -1466,6 +1532,26 @@ def _approx_page_location_text(
     return f"Approx. pages: {start}{sep}{end}{suffix}"
 
 
+def _augment_source_labels_in_text(text: str, ref_state: Optional[dict[str, Any]]) -> str:
+    text = str(text or "")
+    if not text or "source label:" in text.lower():
+        return text
+    label_map = ref_state.get("label_map", {}) if isinstance(ref_state, dict) else {}
+    if not isinstance(label_map, dict) or not label_map:
+        return text
+    out = text
+    for label, info in sorted(label_map.items(), key=lambda item: len(str(item[0])), reverse=True):
+        label_text = str(label or "").strip()
+        if not label_text:
+            continue
+        display = _reference_display_with_source_label(label_text, info if isinstance(info, dict) else {})
+        if display == f"source label: {label_text}":
+            continue
+        pattern = re.compile(rf"(?<![A-Za-z0-9_:\-]){re.escape(label_text)}(?![A-Za-z0-9_:\-])")
+        out = pattern.sub(display, out)
+    return out
+
+
 def _extract_searchable_phrases(issue: dict[str, Any], max_items: int = 2) -> list[str]:
     fragments = []
     for key in ["evidence", "description", "location"]:
@@ -1491,6 +1577,7 @@ def _extract_incorrect_text(issue: dict[str, Any]) -> str:
 def _collect_typographical_issue_entries(
     issues: list[dict[str, Any]],
     chunk_records: list[dict[str, Any]],
+    ref_state: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     chunk_map = _chunk_record_map(chunk_records)
     entries = []
@@ -1506,7 +1593,9 @@ def _collect_typographical_issue_entries(
                 "page_text_tex": _page_range_text(rec, markdown=False),
                 "location_text_md": _approx_page_location_text(rec, str(issue.get("chunk_id") or ""), markdown=True),
                 "location_text_tex": _approx_page_location_text(rec, str(issue.get("chunk_id") or ""), markdown=False),
-                "location_detail": normalize_whitespace(str(issue.get("location", "") or "")),
+                "location_detail": normalize_whitespace(
+                    _augment_source_labels_in_text(str(issue.get("location", "") or ""), ref_state)
+                ),
                 "searchable_phrases": _extract_searchable_phrases(issue),
                 "incorrect_text": _extract_incorrect_text(issue),
                 "page_start_sort": int(rec.get("page_start") or 10**9) if isinstance(rec, dict) else 10**9,
@@ -1523,6 +1612,7 @@ def _issue_report_entry(
     issue: dict[str, Any],
     chunk_map: dict[str, dict[str, Any]],
     issue_recheck_overlay: Optional[dict[str, Any]] = None,
+    ref_state: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     chunk_id = str(issue.get("chunk_id") or "").strip()
     rec = chunk_map.get(chunk_id)
@@ -1532,7 +1622,7 @@ def _issue_report_entry(
         "chunk_record": rec,
         "location_text_md": _approx_page_location_text(rec, chunk_id, markdown=True),
         "location_text_tex": _approx_page_location_text(rec, chunk_id, markdown=False),
-        "location_detail": normalize_whitespace(str(issue.get("location", "") or "")),
+        "location_detail": normalize_whitespace(_augment_source_labels_in_text(str(issue.get("location", "") or ""), ref_state)),
         "recheck": (issue_recheck_overlay or {}).get("issue_recommendations", {}).get(issue_id, {}),
     }
 
@@ -1792,6 +1882,7 @@ def _collect_notable_proof_reference_issue_entries(
     chunk_records: list[dict[str, Any]],
     excluded_issue_ids: Optional[set[str]] = None,
     issue_recheck_overlay: Optional[dict[str, Any]] = None,
+    ref_state: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     excluded_issue_ids = excluded_issue_ids or set()
     chunk_map = _chunk_record_map(chunk_records)
@@ -1807,7 +1898,7 @@ def _collect_notable_proof_reference_issue_entries(
         scored.append((_notable_proof_reference_score(issue), issue))
     scored.sort(key=lambda item: (-item[0], _concise_issue_sort_key(item[1], chunk_map)))
     return [
-        _issue_report_entry(issue, chunk_map, issue_recheck_overlay)
+        _issue_report_entry(issue, chunk_map, issue_recheck_overlay, ref_state=ref_state)
         for _score, issue in scored[:_NOTABLE_PROOF_REFERENCE_MAX_ISSUES]
     ]
 
@@ -2084,6 +2175,7 @@ def _build_final_report_markdown_base(session: dict[str, Any], report_title: Opt
     manifest = load_manifest(session)
     chunk_records = _read_chunk_records(session)
     issue_recheck_overlay = _build_issue_recheck_overlay(session)
+    ref_state = ensure_reference_map(session)
 
     title = report_title or f"Audit report — {Path(session['pdf_path']).stem}"
     lines = [
@@ -2109,7 +2201,7 @@ def _build_final_report_markdown_base(session: dict[str, Any], report_title: Opt
     ]
 
     open_issues = [x for x in issues_state["issues"] if x.get("status", "open") == "open"]
-    typo_entries = _collect_typographical_issue_entries(open_issues, chunk_records)
+    typo_entries = _collect_typographical_issue_entries(open_issues, chunk_records, ref_state=ref_state)
     main_open_issues = [x for x in open_issues if not _is_pure_typographical_issue(x)]
     if not main_open_issues:
         lines.append("- No open mathematical/correctness issues.")
@@ -2120,7 +2212,7 @@ def _build_final_report_markdown_base(session: dict[str, Any], report_title: Opt
                 [
                     f"### {issue['issue_id']} — {normalize_math_delimiters(issue['title'])} [{issue['severity']}]",
                     f"- Chunk: {issue['chunk_id']}",
-                    f"- Location: {normalize_math_delimiters(issue['location'])}",
+                    f"- Location: {normalize_math_delimiters(_augment_source_labels_in_text(issue['location'], ref_state))}",
                     f"- Description: {normalize_math_delimiters(issue['description'])}",
                     f"- Evidence: {normalize_math_delimiters(issue['evidence'])}",
                     f"- Proposed fix: {normalize_math_delimiters(issue['proposed_fix'])}",
@@ -2170,7 +2262,7 @@ def _build_final_report_markdown_base(session: dict[str, Any], report_title: Opt
                     lines.extend(
                         [
                             f"- {normalize_math_delimiters(issue.get('title','Untitled issue'))} [{issue.get('severity','low')}]",
-                            f"  - Location: {normalize_math_delimiters(issue.get('location',''))}",
+                            f"  - Location: {normalize_math_delimiters(_augment_source_labels_in_text(issue.get('location',''), ref_state))}",
                             f"  - Description: {normalize_math_delimiters(issue.get('description',''))}",
                             f"  - Proposed fix: {normalize_math_delimiters(issue.get('proposed_fix',''))}",
                         ]
@@ -2215,6 +2307,7 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
     manifest = load_manifest(session)
     chunk_records = _read_chunk_records(session)
     issue_recheck_overlay = _build_issue_recheck_overlay(session)
+    ref_state = ensure_reference_map(session)
 
     title = _report_latex_paragraph_local(report_title or f"Audit report -- {Path(session['pdf_path']).stem}")
     pdf_path_text = _report_latex_paragraph_local(session["pdf_path"])
@@ -2278,7 +2371,7 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
 
     parts.append(r"\section*{Open issues}" + "\n")
     open_issues = [x for x in issues_state["issues"] if x.get("status", "open") == "open"]
-    typo_entries = _collect_typographical_issue_entries(open_issues, chunk_records)
+    typo_entries = _collect_typographical_issue_entries(open_issues, chunk_records, ref_state=ref_state)
     main_open_issues = [x for x in open_issues if not _is_pure_typographical_issue(x)]
     if not main_open_issues:
         parts.append("No open mathematical/correctness issues.\n")
@@ -2289,7 +2382,11 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
             parts.append(r"\subsection*{" + title_line + "}" + "\n")
             parts.append(r"\begin{itemize}" + "\n")
             parts.append(r"\item Chunk: " + _report_latex_paragraph_local(issue["chunk_id"]) + "\n")
-            parts.append(r"\item Location: " + _report_latex_paragraph_local(issue.get("location", "")) + "\n")
+            parts.append(
+                r"\item Location: "
+                + _report_latex_paragraph_local(_augment_source_labels_in_text(issue.get("location", ""), ref_state))
+                + "\n"
+            )
             parts.append(r"\item Description: " + _report_latex_paragraph_local(issue.get("description", "")) + "\n")
             parts.append(r"\item Evidence: " + _report_latex_paragraph_local(issue.get("evidence", "")) + "\n")
             parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(issue.get("proposed_fix", "")) + "\n")
@@ -2353,7 +2450,11 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
                         + "\n"
                     )
                     parts.append(r"\begin{itemize}" + "\n")
-                    parts.append(r"\item Location: " + _report_latex_paragraph_local(issue.get("location", "")) + "\n")
+                    parts.append(
+                        r"\item Location: "
+                        + _report_latex_paragraph_local(_augment_source_labels_in_text(issue.get("location", ""), ref_state))
+                        + "\n"
+                    )
                     parts.append(r"\item Description: " + _report_latex_paragraph_local(issue.get("description", "")) + "\n")
                     parts.append(r"\item Evidence: " + _report_latex_paragraph_local(issue.get("evidence", "")) + "\n")
                     parts.append(r"\item Proposed fix: " + _report_latex_paragraph_local(issue.get("proposed_fix", "")) + "\n")
@@ -3046,6 +3147,7 @@ def source_ingestion_diagnostics(session: dict[str, Any]) -> dict[str, Any]:
         ref_state = load_json(reference_map_path)
     except Exception:
         ref_state = {}
+    aux_paths = _candidate_aux_paths_for_session(session)
     label_map = ref_state.get("label_map", {}) if isinstance(ref_state, dict) else {}
     label_map = label_map if isinstance(label_map, dict) else {}
     kind_counts = _label_kind_counts(label_map)
@@ -3063,6 +3165,8 @@ def source_ingestion_diagnostics(session: dict[str, Any]) -> dict[str, Any]:
     }
     theorem_like_labels = sum(count for kind, count in kind_counts.items() if kind in theorem_like_kinds)
     citation_labels = sum(count for kind, count in kind_counts.items() if kind in {"citation", "cite", "bibitem", "reference"})
+    map_source = str(ref_state.get("map_source") or "none") if isinstance(ref_state, dict) else "none"
+    printed_label_recovery_available = bool(label_map and map_source == "aux")
 
     warnings: list[str] = []
     if tex_supplied:
@@ -3075,6 +3179,11 @@ def source_ingestion_diagnostics(session: dict[str, Any]) -> dict[str, Any]:
             warnings.append(
                 "LaTeX source was supplied, but no labels were recovered in state/reference_map.json. "
                 "Reference tracking may be weak."
+            )
+        if not printed_label_recovery_available:
+            warnings.append(
+                "LaTeX source was supplied, but no compiled .aux label map was available. "
+                "Source label codes may be shown without printed equation/theorem numbers."
             )
         if warnings:
             status = "tex_partial_structural_recovery"
@@ -3099,9 +3208,13 @@ def source_ingestion_diagnostics(session: dict[str, Any]) -> dict[str, Any]:
         "direct_tex_chunk_percent": round(direct_tex_percent, 1),
         "fallback_gap_chunk_count": fallback_gap_chunks,
         "fallback_gap_chunk_percent": round(fallback_gap_percent, 1),
+        "aux_file_count": len(aux_paths),
+        "aux_paths": [str(path) for path in aux_paths],
         "reference_map_path": str(reference_map_path),
-        "reference_map_source": str(ref_state.get("map_source") or "none") if isinstance(ref_state, dict) else "none",
+        "reference_map_source": map_source,
         "recovered_label_count": len(label_map),
+        "aux_recovered_label_count": len(label_map) if map_source == "aux" else 0,
+        "printed_label_recovery_available": printed_label_recovery_available,
         "label_kind_counts": kind_counts,
         "recovered_equation_label_count": equation_labels,
         "recovered_theorem_like_label_count": theorem_like_labels,
@@ -3136,6 +3249,12 @@ def _source_ingestion_status_lines(session: dict[str, Any]) -> list[str]:
                     f"(equation: {diag.get('recovered_equation_label_count', 0)}, "
                     f"theorem-like: {diag.get('recovered_theorem_like_label_count', 0)}, "
                     f"citations: {diag.get('recovered_citation_label_count', 0)})."
+                ),
+                (
+                    "Compiled AUX label recovery: "
+                    f"{diag.get('aux_file_count', 0)} .aux file(s) found; "
+                    f"{diag.get('aux_recovered_label_count', 0)} printed label(s) recovered; "
+                    f"available: {bool(diag.get('printed_label_recovery_available'))}."
                 ),
             ]
         )
@@ -3251,9 +3370,10 @@ def _rewrite_reference_mentions_in_prose(text: str, session: dict[str, Any], sty
     if style == "compiled_pdf_numbers":
         items = sorted(label_map.items(), key=lambda item: len(item[0]), reverse=True)
         for label, info in items:
-            display = (info.get("display") or "").strip()
-            kind = (info.get("kind") or _infer_kind_from_label(label)).strip().lower() or "item"
-            if not display:
+            entry = info if isinstance(info, dict) else {}
+            display = _reference_display_with_source_label(label, entry)
+            kind = (entry.get("kind") or _infer_kind_from_label(label)).strip().lower() or "item"
+            if display == f"source label: {label}":
                 continue
             pattern = re.compile(
                 rf"(?<![\w:])((?:the\s+)?{re.escape(kind)}\s+labeled\s+{re.escape(label)})\b",
@@ -3360,6 +3480,14 @@ def build_final_report(
     tex_text = build_final_report_tex(session, report_title=report_title)
     issue_recheck_overlay = _build_issue_recheck_overlay(session)
     source_diagnostics = source_ingestion_diagnostics(session)
+    issues_state = load_issues(session)
+    chunk_records = _read_chunk_records(session)
+    chunk_map = _chunk_record_map(chunk_records)
+    ref_state = ensure_reference_map(session)
+    issue_report_entries = [
+        _issue_report_entry(issue, chunk_map, issue_recheck_overlay, ref_state=ref_state)
+        for issue in issues_state.get("issues", [])
+    ]
 
     reports_dir = root / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -3377,10 +3505,11 @@ def build_final_report(
         "status": load_status(session),
         "audit_summary": [{"label": label, "value": value} for label, value in _audit_summary_items(session)],
         "ledger": load_ledger(session),
-        "issues": load_issues(session),
+        "issues": issues_state,
         "usage": load_usage(session),
         "manifest": load_manifest(session),
-        "chunk_records": _read_chunk_records(session),
+        "chunk_records": chunk_records,
+        "issue_report_entries": issue_report_entries,
         "source_ingestion_diagnostics": source_diagnostics,
         "recheck_applied": bool(issue_recheck_overlay.get("recheck_applied")),
         "issue_recheck_summary": issue_recheck_overlay.get("issue_recheck_summary", {}),
@@ -3443,6 +3572,7 @@ def _collect_concise_report_data(
     chunk_records = _read_chunk_records(session)
     chunk_map = _chunk_record_map(chunk_records)
     issue_recheck_overlay = _build_issue_recheck_overlay(session)
+    ref_state = ensure_reference_map(session)
     source_diagnostics = source_ingestion_diagnostics(session)
 
     candidate_issues = list(issues_state.get("issues", []) or [])
@@ -3459,17 +3589,21 @@ def _collect_concise_report_data(
         and not _issue_recheck_is_downstream_covered(issue, issue_recheck_overlay)
     ]
     selected_issues.sort(key=lambda issue: _concise_issue_sort_key(issue, chunk_map))
-    selected_issue_entries = [_issue_report_entry(issue, chunk_map, issue_recheck_overlay) for issue in selected_issues]
+    selected_issue_entries = [
+        _issue_report_entry(issue, chunk_map, issue_recheck_overlay, ref_state=ref_state)
+        for issue in selected_issues
+    ]
     selected_issue_ids = {str(issue.get("issue_id") or "") for issue in selected_issues}
     notable_entries = _collect_notable_proof_reference_issue_entries(
         candidate_issues,
         chunk_records,
         excluded_issue_ids=selected_issue_ids,
         issue_recheck_overlay=issue_recheck_overlay,
+        ref_state=ref_state,
     )
     notable_issues = [entry["issue"] for entry in notable_entries]
     typographical_entries = (
-        _collect_typographical_issue_entries(candidate_issues, chunk_records)
+        _collect_typographical_issue_entries(candidate_issues, chunk_records, ref_state=ref_state)
         if normalized_options.get("include_typographical_issues", True)
         else []
     )
@@ -3868,7 +4002,9 @@ def build_concise_report_json(
         "chunk_records": data["chunk_records"],
         "source_ingestion_diagnostics": data["source_ingestion_diagnostics"],
         "main_issues": data["main_issues"],
+        "main_issue_entries": data["main_issue_entries"],
         "high_issues": data["main_issues"],
+        "high_issue_entries": data["main_issue_entries"],
         "notable_incorrect_or_circular_references": data["notable_proof_reference_issues"],
         "notable_incorrect_or_circular_reference_entries": data["notable_proof_reference_entries"],
         "notable_proof_reference_and_dependency_issues": data["notable_proof_reference_issues"],
