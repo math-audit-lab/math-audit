@@ -32,6 +32,7 @@ from audit_policy_hooks import (
     build_final_report_markdown,
     build_final_report_tex,
     build_user_message_for_chunk,
+    source_ingestion_diagnostics,
 )
 from audit_runtime import (
     AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL,
@@ -1644,6 +1645,126 @@ def test_issue_severity_summary_in_audit_summary() -> None:
         concise_tex = _audit_summary_tex(session, issue_summary_open_only=True)
         _assert(r"\item Open issue severity summary: open issues only" in concise_tex, concise_tex)
         _assert(r"\item Total open issues: 4" in concise_tex, concise_tex)
+
+
+def test_source_ingestion_diagnostics_in_reports() -> None:
+    def seed_source_case(
+        root: Path,
+        *,
+        tex_supplied: bool,
+        source_kinds: list[str],
+        label_map: dict[str, Any],
+    ) -> dict[str, Any]:
+        workdir = root / "paper_audit"
+        session = _seed_state(workdir)
+        if tex_supplied:
+            session["tex_path"] = str(root / "paper.tex")
+        paths = session_paths(workdir)
+        _write_json(paths["session"], session)
+        _write_json(
+            paths["status"],
+            {
+                "status": "completed",
+                "chunks_completed": len(source_kinds),
+                "chunks_total": len(source_kinds),
+                "estimated_pages_completed": len(source_kinds),
+                "estimated_pages_total": len(source_kinds),
+                "updated_at": NEW,
+            },
+        )
+        _write_json(
+            paths["manifest"],
+            {
+                "chunking_mode": "synthetic",
+                "chunks": [
+                    {
+                        "chunk_id": f"chunk_{idx:03d}",
+                        "chunk_index": idx,
+                        "page_start": idx,
+                        "page_end": idx,
+                        "source_kind": source_kind,
+                    }
+                    for idx, source_kind in enumerate(source_kinds, start=1)
+                ],
+                "updated_at": NEW,
+            },
+        )
+        _write_json(
+            workdir / "state" / "reference_map.json",
+            {
+                "label_map": label_map,
+                "source_aux_path": str(root / "paper.aux") if label_map else None,
+                "map_source": "aux" if label_map else "none",
+                "updated_at": NEW,
+            },
+        )
+        return session
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_source_diag_pdf_") as tmp:
+        session = seed_source_case(Path(tmp), tex_supplied=False, source_kinds=["pdf", "pdf"], label_map={})
+        diag = source_ingestion_diagnostics(session)
+        _assert(not diag["tex_supplied"], diag)
+        _assert(diag["status"] == "pdf_only", diag)
+        _assert(diag["warnings"] == [], diag)
+        markdown = build_concise_report_markdown(session)
+        _assert("## Source ingestion status" in markdown, markdown)
+        _assert("PDF-only audit; no LaTeX source was supplied." in markdown, markdown)
+        _assert("structural recovery was partial" not in markdown, markdown)
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_source_diag_healthy_") as tmp:
+        session = seed_source_case(
+            Path(tmp),
+            tex_supplied=True,
+            source_kinds=["tex", "tex", "tex", "tex-gap"],
+            label_map={
+                "eq:main": {"kind": "equation", "number": "1", "display": "equation (1)"},
+                "thm:main": {"kind": "theorem", "number": "1.1", "display": "Theorem 1.1"},
+            },
+        )
+        diag = source_ingestion_diagnostics(session)
+        _assert(diag["tex_supplied"], diag)
+        _assert(diag["status"] == "tex_structural_recovery_good", diag)
+        _assert(diag["recovered_label_count"] == 2, diag)
+        _assert(diag["warnings"] == [], diag)
+        report_json = build_concise_report_json(session)
+        _assert(report_json["source_ingestion_diagnostics"]["recovered_label_count"] == 2, report_json)
+        markdown = build_concise_report_markdown(session)
+        _assert("Recovered reference labels: 2" in markdown, markdown)
+        _assert("Warning:" not in markdown.split("## Source ingestion status", 1)[1].split("##", 1)[0], markdown)
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_source_diag_partial_") as tmp:
+        session = seed_source_case(
+            Path(tmp),
+            tex_supplied=True,
+            source_kinds=["tex", "tex-gap", "tex-gap", "tex-gap"],
+            label_map={},
+        )
+        diag = source_ingestion_diagnostics(session)
+        _assert(diag["status"] == "tex_partial_structural_recovery", diag)
+        _assert(diag["fallback_gap_chunk_count"] == 3, diag)
+        _assert(diag["label_map_empty_despite_tex"], diag)
+        _assert(len(diag["warnings"]) == 2, diag)
+        markdown = build_concise_report_markdown(session)
+        _assert("many chunks used fallback/gap source" in markdown, markdown)
+        _assert("no labels were recovered" in markdown, markdown)
+        tex = build_concise_report_tex(session)
+        _assert(r"\section*{Source ingestion status}" in tex, tex)
+        _assert("many chunks used fallback/gap source" in tex, tex)
+        full_markdown = build_final_report_markdown(session)
+        _assert("## Source ingestion status" in full_markdown, full_markdown)
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_source_diag_empty_labels_") as tmp:
+        session = seed_source_case(
+            Path(tmp),
+            tex_supplied=True,
+            source_kinds=["tex", "tex", "tex"],
+            label_map={},
+        )
+        diag = source_ingestion_diagnostics(session)
+        _assert(diag["fallback_gap_chunk_count"] == 0, diag)
+        _assert(diag["label_map_empty_despite_tex"], diag)
+        _assert(len(diag["warnings"]) == 1, diag)
+        _assert("no labels were recovered" in diag["warnings"][0], diag)
 
 
 def test_concise_report_notable_incorrect_reference_issues() -> None:
@@ -3501,6 +3622,7 @@ def main() -> int:
         ("discussion legacy thread and context DB safety", test_discussion_legacy_thread_and_context_db_safety),
         ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
         ("issue severity summary in audit summary", test_issue_severity_summary_in_audit_summary),
+        ("source ingestion diagnostics in reports", test_source_ingestion_diagnostics_in_reports),
         ("concise report notable incorrect reference issues", test_concise_report_notable_incorrect_reference_issues),
         ("issue recheck overlay in reports", test_issue_recheck_overlay_in_reports),
         ("fresh rerun request metadata", test_fresh_rerun_request_metadata),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 
@@ -2986,6 +2987,183 @@ def _reference_report_status(session: dict[str, Any], style: Optional[str] = Non
     }
 
 
+def _source_kind_counts_text(counts: dict[str, int]) -> str:
+    if not counts:
+        return "none"
+    preferred = ["tex", "tex-gap", "pdf"]
+    ordered = [(key, counts[key]) for key in preferred if key in counts]
+    ordered.extend((key, counts[key]) for key in sorted(counts) if key not in preferred)
+    return ", ".join(f"{key}={value}" for key, value in ordered)
+
+
+def _percent_text(value: float) -> str:
+    return f"{value:.1f}%"
+
+
+def _label_kind_counts(label_map: dict[str, Any]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for label, info in label_map.items():
+        if isinstance(info, dict):
+            kind = normalize_whitespace(str(info.get("kind") or ""))
+        else:
+            kind = ""
+        if not kind:
+            kind = _infer_kind_from_label(str(label))
+        counts[kind.lower() or "unknown"] += 1
+    return dict(sorted(counts.items()))
+
+
+def source_ingestion_diagnostics(session: dict[str, Any]) -> dict[str, Any]:
+    """Summarize how much structural source information an audit recovered."""
+    pdf_supplied = bool(normalize_whitespace(str(session.get("pdf_path") or "")))
+    tex_supplied = bool(normalize_whitespace(str(session.get("tex_path") or "")))
+    try:
+        manifest = load_manifest(session)
+    except Exception:
+        manifest = {}
+    chunks = manifest.get("chunks") if isinstance(manifest, dict) else []
+    chunks = chunks if isinstance(chunks, list) else []
+
+    source_kind_counts: Counter[str] = Counter()
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            source_kind_counts["unknown"] += 1
+            continue
+        kind = normalize_whitespace(str(chunk.get("source_kind") or "unknown")).lower() or "unknown"
+        source_kind_counts[kind] += 1
+    total_chunks = sum(source_kind_counts.values())
+    direct_tex_chunks = int(source_kind_counts.get("tex", 0))
+    fallback_gap_chunks = sum(
+        count
+        for kind, count in source_kind_counts.items()
+        if kind == "pdf" or "gap" in kind or kind.endswith("-fallback")
+    )
+    direct_tex_percent = (100.0 * direct_tex_chunks / total_chunks) if total_chunks else 0.0
+    fallback_gap_percent = (100.0 * fallback_gap_chunks / total_chunks) if total_chunks else 0.0
+
+    reference_map_path = Path(session.get("workdir", "")) / "state" / "reference_map.json"
+    try:
+        ref_state = load_json(reference_map_path)
+    except Exception:
+        ref_state = {}
+    label_map = ref_state.get("label_map", {}) if isinstance(ref_state, dict) else {}
+    label_map = label_map if isinstance(label_map, dict) else {}
+    kind_counts = _label_kind_counts(label_map)
+    equation_labels = sum(count for kind, count in kind_counts.items() if kind in {"equation", "eq"})
+    theorem_like_kinds = {
+        "theorem",
+        "lemma",
+        "proposition",
+        "corollary",
+        "definition",
+        "remark",
+        "section",
+        "figure",
+        "table",
+    }
+    theorem_like_labels = sum(count for kind, count in kind_counts.items() if kind in theorem_like_kinds)
+    citation_labels = sum(count for kind, count in kind_counts.items() if kind in {"citation", "cite", "bibitem", "reference"})
+
+    warnings: list[str] = []
+    if tex_supplied:
+        if total_chunks and fallback_gap_percent >= 50.0:
+            warnings.append(
+                "LaTeX source was supplied, but structural recovery was partial: many chunks used fallback/gap source. "
+                "Formula text may still be cleaner than PDF-only mode, but source-structure coverage may be weak."
+            )
+        if not label_map:
+            warnings.append(
+                "LaTeX source was supplied, but no labels were recovered in state/reference_map.json. "
+                "Reference tracking may be weak."
+            )
+        if warnings:
+            status = "tex_partial_structural_recovery"
+            summary = "TeX-aware audit with partial structural recovery."
+        else:
+            status = "tex_structural_recovery_good"
+            summary = "TeX-aware audit with recovered structural source information."
+    else:
+        status = "pdf_only"
+        summary = "PDF-only audit; no LaTeX source was supplied."
+
+    return {
+        "pdf_supplied": pdf_supplied,
+        "tex_supplied": tex_supplied,
+        "source_mode": "pdf_plus_tex" if tex_supplied else "pdf_only",
+        "status": status,
+        "summary": summary,
+        "total_chunks": total_chunks,
+        "source_kind_counts": dict(sorted(source_kind_counts.items())),
+        "source_kind_counts_text": _source_kind_counts_text(dict(source_kind_counts)),
+        "direct_tex_chunk_count": direct_tex_chunks,
+        "direct_tex_chunk_percent": round(direct_tex_percent, 1),
+        "fallback_gap_chunk_count": fallback_gap_chunks,
+        "fallback_gap_chunk_percent": round(fallback_gap_percent, 1),
+        "reference_map_path": str(reference_map_path),
+        "reference_map_source": str(ref_state.get("map_source") or "none") if isinstance(ref_state, dict) else "none",
+        "recovered_label_count": len(label_map),
+        "label_kind_counts": kind_counts,
+        "recovered_equation_label_count": equation_labels,
+        "recovered_theorem_like_label_count": theorem_like_labels,
+        "recovered_citation_label_count": citation_labels,
+        "label_map_empty_despite_tex": bool(tex_supplied and not label_map),
+        "warnings": warnings,
+    }
+
+
+def _source_ingestion_status_lines(session: dict[str, Any]) -> list[str]:
+    diag = source_ingestion_diagnostics(session)
+    lines = [
+        f"Source mode: {diag.get('summary')}",
+        f"Chunks by source kind: {diag.get('source_kind_counts_text', 'none')}.",
+    ]
+    if diag.get("tex_supplied"):
+        lines.extend(
+            [
+                (
+                    "Direct TeX chunks: "
+                    f"{diag.get('direct_tex_chunk_count', 0)} / {diag.get('total_chunks', 0)} "
+                    f"({_percent_text(float(diag.get('direct_tex_chunk_percent', 0.0) or 0.0))})."
+                ),
+                (
+                    "Fallback/gap chunks: "
+                    f"{diag.get('fallback_gap_chunk_count', 0)} / {diag.get('total_chunks', 0)} "
+                    f"({_percent_text(float(diag.get('fallback_gap_chunk_percent', 0.0) or 0.0))})."
+                ),
+                (
+                    "Recovered reference labels: "
+                    f"{diag.get('recovered_label_count', 0)} "
+                    f"(equation: {diag.get('recovered_equation_label_count', 0)}, "
+                    f"theorem-like: {diag.get('recovered_theorem_like_label_count', 0)}, "
+                    f"citations: {diag.get('recovered_citation_label_count', 0)})."
+                ),
+            ]
+        )
+    else:
+        lines.append("No LaTeX source was supplied; formula and reference quality depend on PDF text extraction.")
+    for warning in diag.get("warnings") or []:
+        lines.append(f"Warning: {warning}")
+    return lines
+
+
+def _source_ingestion_status_markdown(session: dict[str, Any]) -> str:
+    lines = _source_ingestion_status_lines(session)
+    if not lines:
+        return ""
+    return "## Source ingestion status\n\n" + "\n".join(f"- {line}" for line in lines) + "\n\n"
+
+
+def _source_ingestion_status_tex(session: dict[str, Any]) -> str:
+    lines = _source_ingestion_status_lines(session)
+    if not lines:
+        return ""
+    parts = [r"\section*{Source ingestion status}", r"\begin{itemize}"]
+    for line in lines:
+        parts.append(r"\item " + _report_latex_paragraph_local(line))
+    parts.append(r"\end{itemize}")
+    return "\n".join(parts) + "\n"
+
+
 def _reference_report_status_markdown(session: dict[str, Any], style: Optional[str] = None) -> str:
     lines = _reference_report_status(session, style=style).get("lines") or []
     if not lines:
@@ -3134,7 +3312,9 @@ def build_final_report_markdown(session: dict[str, Any], report_title: Optional[
     style = _effective_report_reference_style(session)
     text = _OLD_BUILD_FINAL_REPORT_MARKDOWN_WITH_REFERENCE_STYLE(session, report_title=report_title)
     text = _rewrite_markdown_report_references(text, session, style=style)
-    text = _inject_markdown_reference_status(text, _reference_report_status_markdown(session, style=style))
+    source_block = _source_ingestion_status_markdown(session)
+    reference_block = _reference_report_status_markdown(session, style=style)
+    text = _inject_markdown_reference_status(text, source_block + reference_block)
     return _insert_markdown_report_front_matter(text, session)
 
 
@@ -3142,7 +3322,9 @@ def build_final_report_tex(session: dict[str, Any], report_title: Optional[str] 
     style = _effective_report_reference_style(session)
     text = _OLD_BUILD_FINAL_REPORT_TEX_WITH_REFERENCE_STYLE(session, report_title=report_title)
     text = _rewrite_tex_report_references(text, session, style=style)
-    text = _inject_tex_reference_status(text, _reference_report_status_tex(session, style=style))
+    source_block = _source_ingestion_status_tex(session)
+    reference_block = _reference_report_status_tex(session, style=style)
+    text = _inject_tex_reference_status(text, source_block + reference_block)
     return _insert_tex_report_front_matter(text, session)
 
 
@@ -3177,6 +3359,7 @@ def build_final_report(
     md_text = build_final_report_markdown(session, report_title=report_title)
     tex_text = build_final_report_tex(session, report_title=report_title)
     issue_recheck_overlay = _build_issue_recheck_overlay(session)
+    source_diagnostics = source_ingestion_diagnostics(session)
 
     reports_dir = root / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -3198,6 +3381,7 @@ def build_final_report(
         "usage": load_usage(session),
         "manifest": load_manifest(session),
         "chunk_records": _read_chunk_records(session),
+        "source_ingestion_diagnostics": source_diagnostics,
         "recheck_applied": bool(issue_recheck_overlay.get("recheck_applied")),
         "issue_recheck_summary": issue_recheck_overlay.get("issue_recheck_summary", {}),
         "issue_recheck_overlay": issue_recheck_overlay,
@@ -3259,6 +3443,7 @@ def _collect_concise_report_data(
     chunk_records = _read_chunk_records(session)
     chunk_map = _chunk_record_map(chunk_records)
     issue_recheck_overlay = _build_issue_recheck_overlay(session)
+    source_diagnostics = source_ingestion_diagnostics(session)
 
     candidate_issues = list(issues_state.get("issues", []) or [])
     if normalized_options.get("only_open_issues", True):
@@ -3298,6 +3483,7 @@ def _collect_concise_report_data(
         "status": status,
         "manifest": manifest,
         "chunk_records": chunk_records,
+        "source_ingestion_diagnostics": source_diagnostics,
         "main_issues": selected_issues,
         "main_issue_entries": selected_issue_entries,
         "high_issues": selected_issues,
@@ -3565,7 +3751,9 @@ def build_concise_report_markdown(
     text = "\n".join(lines).strip() + "\n"
     style = _effective_report_reference_style(session)
     text = _rewrite_markdown_report_references(text, session, style=style)
-    text = _inject_markdown_reference_status(text, _reference_report_status_markdown(session, style=style))
+    source_block = _source_ingestion_status_markdown(session)
+    reference_block = _reference_report_status_markdown(session, style=style)
+    text = _inject_markdown_reference_status(text, source_block + reference_block)
     return _insert_markdown_report_front_matter(
         text,
         session,
@@ -3632,7 +3820,9 @@ def build_concise_report_tex(
     text = _strip_unsafe_control_chars("".join(parts))
     style = _effective_report_reference_style(session)
     text = _rewrite_tex_report_references(text, session, style=style)
-    text = _inject_tex_reference_status(text, _reference_report_status_tex(session, style=style))
+    source_block = _source_ingestion_status_tex(session)
+    reference_block = _reference_report_status_tex(session, style=style)
+    text = _inject_tex_reference_status(text, source_block + reference_block)
     return _insert_tex_report_front_matter(
         text,
         session,
@@ -3676,6 +3866,7 @@ def build_concise_report_json(
         "usage": data["usage"],
         "manifest": data["manifest"],
         "chunk_records": data["chunk_records"],
+        "source_ingestion_diagnostics": data["source_ingestion_diagnostics"],
         "main_issues": data["main_issues"],
         "high_issues": data["main_issues"],
         "notable_incorrect_or_circular_references": data["notable_proof_reference_issues"],
@@ -3745,4 +3936,5 @@ __all__ = [
     "concise_report_options_for_preset",
     "default_concise_report_options",
     "ensure_reference_map",
+    "source_ingestion_diagnostics",
 ]
