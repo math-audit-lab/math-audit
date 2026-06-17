@@ -59,7 +59,7 @@ AUDIT POLICY
   - purpose: a short title for the check
   - description: a self-contained explanation of the mathematical claim being tested, the test strategy, and any sample parameters or cases used
   - expected_outcome: what output or condition should be interpreted as success
-  - code: runnable local Python code
+  - code: standalone runnable local Python source only, with no Markdown fences, JSON separators, or surrounding list/object delimiters
 - Write each verification description so that it still makes sense in the GUI and generated reports even if the reader never inspects the code itself."""
 
 

@@ -4222,30 +4222,66 @@ def _python_source_parses(source: str) -> bool:
     return True
 
 
-def _repair_python_check_code_escapes(source: str) -> str:
-    """Repair model-returned code that double-escaped JSON newlines."""
-    source = "" if source is None else str(source)
-    if not any(marker in source for marker in (r"\n", r"\r", r"\t")):
-        return source
+_PYTHON_CHECK_TRAILING_JSON_ARTIFACTS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("trailing_json_separator_trim", re.compile(r"\s*\},\s*\{\s*$")),
+    ("trailing_json_separator_trim", re.compile(r"\s*\},\s*$")),
+    ("trailing_json_separator_trim", re.compile(r"\s*\}\]\s*$")),
+    ("trailing_json_separator_trim", re.compile(r"\s*\}\s*$")),
+    ("trailing_json_separator_trim", re.compile(r"\s*\]\s*$")),
+)
+
+
+def _trim_trailing_python_check_json_artifacts(source: str) -> tuple[str, str]:
+    """Trim obvious serialization suffixes only when doing so restores valid Python."""
     if _python_source_parses(source):
-        return source
+        return source, ""
+    for reason, pattern in _PYTHON_CHECK_TRAILING_JSON_ARTIFACTS:
+        candidate = pattern.sub("", source, count=1).rstrip()
+        if candidate != source.rstrip() and _python_source_parses(candidate):
+            return candidate, reason
+    return source, ""
 
-    candidate = (
-        source.replace(r"\r\n", "\n")
-        .replace(r"\n", "\n")
-        .replace(r"\r", "\n")
-        .replace(r"\t", "\t")
-    )
-    if candidate != source and _python_source_parses(candidate):
-        return candidate
 
-    try:
-        unicode_candidate = source.encode("utf-8").decode("unicode_escape")
-    except UnicodeDecodeError:
-        unicode_candidate = source
-    if unicode_candidate != source and _python_source_parses(unicode_candidate):
-        return unicode_candidate
-    return source
+def _normalize_python_check_code(source: str) -> tuple[str, str]:
+    """Repair narrow model-returned Python-check serialization artifacts."""
+    source = "" if source is None else str(source)
+    if _python_source_parses(source):
+        return source, ""
+
+    candidate = source
+    reason = ""
+    if any(marker in source for marker in (r"\n", r"\r", r"\t")):
+        escaped_candidate = (
+            source.replace(r"\r\n", "\n")
+            .replace(r"\n", "\n")
+            .replace(r"\r", "\n")
+            .replace(r"\t", "\t")
+        )
+        if escaped_candidate != source and _python_source_parses(escaped_candidate):
+            return escaped_candidate, "json_escape_repair"
+        if escaped_candidate != source:
+            trimmed_candidate, trim_reason = _trim_trailing_python_check_json_artifacts(escaped_candidate)
+            if trim_reason:
+                return trimmed_candidate, f"json_escape_repair+{trim_reason}"
+
+        try:
+            unicode_candidate = source.encode("utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            unicode_candidate = source
+        if unicode_candidate != source and _python_source_parses(unicode_candidate):
+            return unicode_candidate, "unicode_escape_repair"
+        if unicode_candidate != source:
+            trimmed_candidate, trim_reason = _trim_trailing_python_check_json_artifacts(unicode_candidate)
+            if trim_reason:
+                return trimmed_candidate, f"unicode_escape_repair+{trim_reason}"
+
+    candidate, reason = _trim_trailing_python_check_json_artifacts(source)
+    return candidate, reason
+
+
+def _repair_python_check_code_escapes(source: str) -> str:
+    """Repair model-returned code with narrow, parse-validated normalizations."""
+    return _normalize_python_check_code(source)[0]
 
 
 def _coerce_audit_payload(audit: Any) -> dict[str, Any]:
@@ -5649,14 +5685,17 @@ def _coerce_audit_payload(audit: Any) -> dict[str, Any]:
             purpose = _as_str(it.get("purpose", "")).strip() or "Python check"
             description = _as_str(it.get("description", "")).strip() or purpose
             expected_outcome = _as_str(it.get("expected_outcome", "")).strip()
-            code = _repair_python_check_code_escapes(_as_str(it.get("code", "")))
+            code, normalization_reason = _normalize_python_check_code(_as_str(it.get("code", "")))
             if purpose or description or expected_outcome or code:
-                out.append({
+                entry = {
                     "purpose": purpose,
                     "description": description,
                     "expected_outcome": expected_outcome,
                     "code": code,
-                })
+                }
+                if normalization_reason:
+                    entry["normalization_applied"] = normalization_reason
+                out.append(entry)
         return out
 
     ledger = audit.get("ledger_updates") if isinstance(audit.get("ledger_updates"), dict) else {}
@@ -5708,13 +5747,16 @@ def _normalize_python_check_entry(
             "The script should finish without exceptions or failed assertions, and any printed output "
             "should be consistent with the claim described above."
         )
-    code = _repair_python_check_code_escapes(str(chk.get("code", "") or ""))
-    return {
+    code, normalization_reason = _normalize_python_check_code(str(chk.get("code", "") or ""))
+    entry = {
         "purpose": purpose,
         "description": description,
         "expected_outcome": expected_outcome,
         "code": code,
     }
+    if normalization_reason:
+        entry["normalization_applied"] = normalization_reason
+    return entry
 
 
 def render_audit_markdown(audit: dict[str, Any]) -> str:

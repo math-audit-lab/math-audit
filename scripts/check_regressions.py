@@ -3838,6 +3838,52 @@ def test_python_check_literal_newline_escape_repair() -> None:
         compile(preserved_file, "chunk_001_check_02.py", "exec")
 
 
+def test_python_check_trailing_json_artifact_repair() -> None:
+    valid = "data = {'values': [1, {'x': 2}], 'marker': '},{'}\nprint(data)\n"
+    _assert(runtime._repair_python_check_code_escapes(valid) == valid, "valid Python was changed")
+    compile(runtime._repair_python_check_code_escapes(valid), "<valid_python_check>", "exec")
+
+    cases = [
+        ("print('ok')},{", "print('ok')"),
+        ("print('ok')},", "print('ok')"),
+        ("print('ok')}, {", "print('ok')"),
+        ("print('ok')}]", "print('ok')"),
+        (
+            "import math\nprint('1/log(2) =', 1 / math.log(2))},{",
+            "import math\nprint('1/log(2) =', 1 / math.log(2))",
+        ),
+    ]
+    for source, expected in cases:
+        repaired = runtime._repair_python_check_code_escapes(source)
+        _assert(repaired == expected, repr((source, repaired, expected)))
+        compile(repaired, "<repaired_trailing_json_artifact>", "exec")
+
+    malformed = "for x in range(3)\n    print(x)},"
+    repaired_malformed = runtime._repair_python_check_code_escapes(malformed)
+    try:
+        compile(repaired_malformed, "<still_malformed_python_check>", "exec")
+    except SyntaxError:
+        pass
+    else:
+        raise RegressionFailure("Nontrivial malformed Python became parseable unexpectedly")
+
+    audit = runtime._coerce_audit_payload(
+        {
+            "python_checks": [
+                {
+                    "purpose": "Synthetic trailing artifact",
+                    "description": "Synthetic check",
+                    "expected_outcome": "The generated file parses.",
+                    "code": "print('ok')},{",
+                }
+            ]
+        }
+    )
+    check = audit["python_checks"][0]
+    _assert(check["code"] == "print('ok')", repr(check))
+    _assert(check.get("normalization_applied") == "trailing_json_separator_trim", repr(check))
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -3886,6 +3932,7 @@ def main() -> int:
         ("issue family recheck dry-run script", test_run_issue_family_recheck_dry_run),
         ("issue family recheck import script", test_import_issue_family_recheck_script),
         ("python check literal newline escape repair", test_python_check_literal_newline_escape_repair),
+        ("python check trailing JSON artifact repair", test_python_check_trailing_json_artifact_repair),
     ]
     results = [_run_case(name, func) for name, func in cases]
 
