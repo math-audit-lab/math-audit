@@ -1431,13 +1431,47 @@ def test_report_latex_unicode_math_safety() -> None:
         _assert(r"\textbackslash{}wed" in rendered_jnt, rendered_jnt)
         _assert(r"\textbackslash{}bi" in rendered_jnt, rendered_jnt)
 
+        lmj_dangling_subscript = r"LMJ extracted notation produced $S^+_$ in a ledger item."
+        rendered_lmj_dangling = renderer(lmj_dangling_subscript)
+        _assert("$S^+_$" not in rendered_lmj_dangling, rendered_lmj_dangling)
+        _assert(r"\texttt{" in rendered_lmj_dangling, rendered_lmj_dangling)
+        _assert(r"\textasciicircum{}+\_" in rendered_lmj_dangling, rendered_lmj_dangling)
+
+        lmj_double_subscript = r"LMJ extracted notation produced $\sum_{p\mid N}_p(N)=\Omega(N)$."
+        rendered_lmj_double = renderer(lmj_double_subscript)
+        _assert(r"$\sum_{p\mid N}_p(N)" not in rendered_lmj_double, rendered_lmj_double)
+        _assert(r"\texttt{" in rendered_lmj_double, rendered_lmj_double)
+        _assert(r"\textbackslash{}sum" in rendered_lmj_double, rendered_lmj_double)
+
+        lmj_nested_double_subscript = (
+            r"LMJ extracted notation produced "
+            r"$\sum_{p\mid 2^{a+1}-1}_p(2^{a+1}-1)\le a-1$."
+        )
+        rendered_lmj_nested = renderer(lmj_nested_double_subscript)
+        _assert(r"$\sum_{p\mid 2^{a+1}-1}_p" not in rendered_lmj_nested, rendered_lmj_nested)
+        _assert(r"\texttt{" in rendered_lmj_nested, rendered_lmj_nested)
+        _assert(r"\textbackslash{}sum" in rendered_lmj_nested, rendered_lmj_nested)
+
         legitimate_math = (
             r"Legitimate math should stay live: "
             r"$\frac{\rho+\lambda}{\prod_{p\le n}p}\ge\sqrt{\delta+\alpha}$ "
-            r"and $\bm{\lambda}\le\mathbf{x}$."
+            r"and $\bm{\lambda}\le\mathbf{x}$, with $S^-_\sigma$ allowed "
+            r"and $a+1=2^u3^v l$ allowed."
         )
         rendered_legitimate = renderer(legitimate_math)
-        for token in (r"\frac", r"\rho", r"\lambda", r"\prod", r"\le", r"\ge", r"\sqrt", r"\delta", r"\bm{\lambda}"):
+        for token in (
+            r"\frac",
+            r"\rho",
+            r"\lambda",
+            r"\prod",
+            r"\le",
+            r"\ge",
+            r"\sqrt",
+            r"\delta",
+            r"\bm{\lambda}",
+            r"S^-_\sigma",
+            r"a+1=2^u3^v l",
+        ):
             _assert(token in rendered_legitimate, rendered_legitimate)
         _assert(r"\textbackslash{}frac" not in rendered_legitimate, rendered_legitimate)
 
@@ -1556,11 +1590,13 @@ def test_report_latex_unicode_math_safety() -> None:
             log_path,
             "./report.tex:12: Undefined control sequence.\n"
             r"l.12 $1\wed" + "\n"
-            "! Missing $ inserted.\n",
+            "! Missing $ inserted.\n"
+            "! Missing { inserted.\n"
+            "! Double subscript.\n",
         )
         health = report_latex_compile_health(tex_path)
         _assert(health.get("status") == "compile_errors", str(health))
-        _assert(health.get("serious_error_count") == 2, str(health))
+        _assert(health.get("serious_error_count") == 4, str(health))
         _assert("Undefined control sequence" in (health.get("serious_errors") or [{}])[0].get("text", ""), str(health))
         refreshed = refresh_report_latex_compile_health_sidecar(tex_path, json_path)
         _assert(refreshed.get("status") == "compile_errors", str(refreshed))

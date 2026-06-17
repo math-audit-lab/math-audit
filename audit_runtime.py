@@ -746,13 +746,27 @@ _REPORT_MATH_ALLOWED_COMMANDS = frozenset(
     }
 )
 _REPORT_MATH_SUSPICIOUS_COMMANDS = frozenset({"wed", "bi"})
+_REPORT_MATH_DANGLING_SCRIPT_RE = re.compile(r"(?<!\\)[_^]\s*$")
+_REPORT_MATH_REPEATED_SUBSCRIPT_RE = re.compile(r"(?<!\\)_\s*(?:\{[^{}]*\}|\\[A-Za-z]+|[A-Za-z0-9+\-]+)\s*(?<!\\)_")
+_REPORT_MATH_REPEATED_SUPERSCRIPT_RE = re.compile(r"(?<!\\)\^\s*(?:\{[^{}]*\}|\\[A-Za-z]+|[A-Za-z+\-]+)\s*(?<!\\)\^")
+_REPORT_MATH_AGGREGATE_DOUBLE_SCRIPT_RE = re.compile(
+    r"\\(?:sum|prod|iiint|iint|int|limsup|liminf|lim)(?![A-Za-z])\s*_"
+    r"(?:\{(?:[^{}]|\{[^{}]*\})*\}|\\[A-Za-z]+|[A-Za-z0-9+\-]+)\s*(?<!\\)_"
+)
 _SERIOUS_LATEX_LOG_PATTERNS = (
     "Undefined control sequence",
     "Missing $ inserted",
+    "Missing { inserted",
+    "Missing } inserted",
+    "Extra }, or forgotten $",
+    "Double subscript",
+    "Double superscript",
     "Emergency stop",
     "Fatal error",
     "! LaTeX Error:",
     "Runaway argument?",
+    "File ended while scanning",
+    "Paragraph ended before",
 )
 
 
@@ -778,6 +792,12 @@ def _report_escape_text(s: str) -> str:
 def _report_math_span_has_suspicious_command(text: str) -> bool:
     """Return True when a math span likely contains non-compiling PDF artifacts."""
     text = "" if text is None else str(text)
+    if _REPORT_MATH_DANGLING_SCRIPT_RE.search(text):
+        return True
+    if _REPORT_MATH_REPEATED_SUBSCRIPT_RE.search(text) or _REPORT_MATH_REPEATED_SUPERSCRIPT_RE.search(text):
+        return True
+    if _REPORT_MATH_AGGREGATE_DOUBLE_SCRIPT_RE.search(text):
+        return True
     for match in _REPORT_LATEX_COMMAND_RE.finditer(text):
         command = match.group(1)
         if command in _REPORT_MATH_SUSPICIOUS_COMMANDS:
