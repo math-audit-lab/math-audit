@@ -515,6 +515,112 @@ def _load_aux_label_maps(aux_paths: list[Path]) -> tuple[dict[str, dict[str, str
     return label_map, errors
 
 
+_RAW_TEX_LABEL_RE = re.compile(r"\\label\s*\{([^{}]+)\}")
+_RAW_TEX_BEGIN_ENV_RE = re.compile(r"\\begin\s*\{([^{}]+)\}")
+_RAW_TEX_ENV_KIND_ALIASES = {
+    "equation": "equation",
+    "equation*": "equation",
+    "align": "equation",
+    "align*": "equation",
+    "aligned": "equation",
+    "gather": "equation",
+    "gather*": "equation",
+    "multline": "equation",
+    "multline*": "equation",
+    "theorem": "theorem",
+    "thm": "theorem",
+    "lemma": "lemma",
+    "lem": "lemma",
+    "proposition": "proposition",
+    "prop": "proposition",
+    "corollary": "corollary",
+    "cor": "corollary",
+    "definition": "definition",
+    "def": "definition",
+    "defn": "definition",
+    "remark": "remark",
+    "rem": "remark",
+    "figure": "figure",
+    "figure*": "figure",
+    "table": "table",
+    "table*": "table",
+}
+
+
+def _guess_raw_tex_label_kind(label: str, context: str = "") -> str:
+    kind = _infer_kind_from_label(label)
+    if kind != "item":
+        return kind
+    env_matches = list(_RAW_TEX_BEGIN_ENV_RE.finditer(context or ""))
+    for match in reversed(env_matches):
+        env = match.group(1).strip().lower()
+        if env in _RAW_TEX_ENV_KIND_ALIASES:
+            return _RAW_TEX_ENV_KIND_ALIASES[env]
+    return kind
+
+
+def _load_raw_tex_label_map(tex_path: str | Path) -> dict[str, dict[str, Any]]:
+    """Recover source labels from TeX when compiled AUX numbering is unavailable."""
+    tex_path = Path(tex_path)
+    try:
+        text = tex_path.read_text(encoding="utf-8")
+    except Exception:
+        text = tex_path.read_text(encoding="latin-1")
+    text = strip_tex_comments(text)
+    lines = text.splitlines()
+    label_map: dict[str, dict[str, Any]] = {}
+    base_dir = tex_path.parent
+    try:
+        source_tex_path = str(tex_path.relative_to(base_dir))
+    except Exception:
+        source_tex_path = tex_path.name
+    for line_index, line in enumerate(lines, start=1):
+        for match in _RAW_TEX_LABEL_RE.finditer(line):
+            label = normalize_whitespace(match.group(1))
+            if not label or "@cref" in label.lower():
+                continue
+            context_start = max(0, line_index - 12)
+            context = "\n".join(lines[context_start:line_index])
+            kind = _guess_raw_tex_label_kind(label, context)
+            label_map.setdefault(
+                label,
+                {
+                    "label": label,
+                    "kind": kind,
+                    "source": "tex_raw_label",
+                    "source_tex_path": source_tex_path,
+                    "line": line_index,
+                },
+            )
+    return label_map
+
+
+def _raw_tex_label_map_for_session(session: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    tex_path_text = normalize_whitespace(str(session.get("tex_path") or ""))
+    if not tex_path_text:
+        return {}
+    tex_path = Path(tex_path_text)
+    if not tex_path.exists():
+        return {}
+    try:
+        return _load_raw_tex_label_map(tex_path)
+    except Exception:
+        return {}
+
+
+def _merge_raw_tex_labels(
+    label_map: dict[str, dict[str, Any]],
+    raw_label_map: dict[str, dict[str, Any]],
+) -> int:
+    added = 0
+    for label, entry in raw_label_map.items():
+        if label in label_map:
+            continue
+        label_map[label] = entry
+        added += 1
+    return added
+
+
 def _load_pdf_pages_for_reference_hints(pdf_path: str | Path) -> list[str]:
     key = str(Path(pdf_path).expanduser().resolve())
     pages = _PDF_REFERENCE_PAGE_CACHE.get(key)
@@ -638,19 +744,35 @@ def ensure_reference_map(session: dict[str, Any]) -> dict[str, Any]:
 
     if aux_exists and aux_path is not None:
         label_map, errors = _load_aux_label_maps(aux_paths)
+        aux_label_count = len(label_map)
+        raw_label_map = _raw_tex_label_map_for_session(session)
+        raw_added_count = _merge_raw_tex_labels(label_map, raw_label_map) if label_map else 0
         ref_state = {
             "label_map": label_map,
             "source_aux_path": str(aux_path),
             "source_aux_paths": [str(path) for path in aux_paths],
             "aux_file_count": len(aux_paths),
             "map_source": "aux" if label_map else ("aux_error" if errors else "aux_empty"),
+            "aux_recovered_label_count": aux_label_count,
+            "raw_tex_label_count": len(raw_label_map),
+            "raw_tex_fallback_label_count": raw_added_count,
             "updated_at": utc_now(),
         }
         if errors:
             ref_state["aux_parse_warnings"] = errors
         if not label_map:
+            raw_label_map = raw_label_map or _raw_tex_label_map_for_session(session)
             cached_map = cached.get("label_map") if isinstance(cached.get("label_map"), dict) else {}
-            if cached_map:
+            if raw_label_map:
+                ref_state["label_map"] = raw_label_map
+                ref_state["map_source"] = "tex_raw_label_after_aux_error" if errors else "tex_raw_label_after_aux_empty"
+                ref_state["raw_tex_label_count"] = len(raw_label_map)
+                ref_state["raw_tex_fallback_label_count"] = len(raw_label_map)
+                ref_state["warning"] = (
+                    "LaTeX source labels were found in the raw TeX source, but no usable AUX printed-label map "
+                    "was available. Printed equation/theorem numbers could not be recovered."
+                )
+            elif cached_map:
                 ref_state["label_map"] = cached_map
                 ref_state["map_source"] = "cached_after_aux_error" if errors else "cached_after_aux_empty"
                 ref_state["warning"] = (
@@ -680,6 +802,25 @@ def ensure_reference_map(session: dict[str, Any]) -> dict[str, Any]:
         cached["updated_at"] = utc_now()
         save_json(ref_path, cached)
         return cached
+
+    raw_label_map = _raw_tex_label_map_for_session(session)
+    if raw_label_map:
+        ref_state = {
+            "label_map": raw_label_map,
+            "source_aux_path": None,
+            "source_aux_paths": [],
+            "aux_file_count": 0,
+            "map_source": "tex_raw_label",
+            "raw_tex_label_count": len(raw_label_map),
+            "raw_tex_fallback_label_count": len(raw_label_map),
+            "warning": (
+                "LaTeX source labels were found in the raw TeX source, but no .aux file was available, "
+                "so printed equation/theorem numbers could not be recovered."
+            ),
+            "updated_at": utc_now(),
+        }
+        save_json(ref_path, ref_state)
+        return ref_state
 
     ref_state = {
         "label_map": {},
@@ -3275,6 +3416,14 @@ def source_ingestion_diagnostics(session: dict[str, Any]) -> dict[str, Any]:
     citation_labels = sum(count for kind, count in kind_counts.items() if kind in {"citation", "cite", "bibitem", "reference"})
     map_source = str(ref_state.get("map_source") or "none") if isinstance(ref_state, dict) else "none"
     printed_label_recovery_available = bool(label_map and map_source == "aux")
+    aux_recovered_label_count = int(ref_state.get("aux_recovered_label_count") or 0) if isinstance(ref_state, dict) else 0
+    raw_tex_label_count = int(ref_state.get("raw_tex_label_count") or 0) if isinstance(ref_state, dict) else 0
+    if not raw_tex_label_count:
+        raw_tex_label_count = sum(
+            1 for info in label_map.values() if isinstance(info, dict) and str(info.get("source") or "") == "tex_raw_label"
+        )
+    if not aux_recovered_label_count and map_source == "aux":
+        aux_recovered_label_count = max(0, len(label_map) - raw_tex_label_count)
 
     warnings: list[str] = []
     if tex_supplied:
@@ -3288,7 +3437,12 @@ def source_ingestion_diagnostics(session: dict[str, Any]) -> dict[str, Any]:
                 "LaTeX source was supplied, but no labels were recovered in state/reference_map.json. "
                 "Reference tracking may be weak."
             )
-        if not printed_label_recovery_available:
+        if raw_tex_label_count and not printed_label_recovery_available:
+            warnings.append(
+                "LaTeX source labels were found in the raw TeX source, but no .aux printed-label map was available. "
+                "Printed equation/theorem numbers could not be recovered."
+            )
+        elif not printed_label_recovery_available:
             warnings.append(
                 "LaTeX source was supplied, but no compiled .aux label map was available. "
                 "Source label codes may be shown without printed equation/theorem numbers."
@@ -3321,7 +3475,8 @@ def source_ingestion_diagnostics(session: dict[str, Any]) -> dict[str, Any]:
         "reference_map_path": str(reference_map_path),
         "reference_map_source": map_source,
         "recovered_label_count": len(label_map),
-        "aux_recovered_label_count": len(label_map) if map_source == "aux" else 0,
+        "aux_recovered_label_count": aux_recovered_label_count,
+        "raw_tex_recovered_label_count": raw_tex_label_count,
         "printed_label_recovery_available": printed_label_recovery_available,
         "label_kind_counts": kind_counts,
         "recovered_equation_label_count": equation_labels,
@@ -3363,6 +3518,11 @@ def _source_ingestion_status_lines(session: dict[str, Any]) -> list[str]:
                     f"{diag.get('aux_file_count', 0)} .aux file(s) found; "
                     f"{diag.get('aux_recovered_label_count', 0)} printed label(s) recovered; "
                     f"available: {bool(diag.get('printed_label_recovery_available'))}."
+                ),
+                (
+                    "Raw TeX source label recovery: "
+                    f"{diag.get('raw_tex_recovered_label_count', 0)} source label(s) recovered; "
+                    "printed numbers unavailable unless AUX recovery is available."
                 ),
             ]
         )

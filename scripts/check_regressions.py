@@ -26,6 +26,8 @@ from audit_policy_hooks import (
     _augment_source_labels_in_text,
     _build_running_audit_context_for_chunk,
     _load_aux_label_map,
+    _load_raw_tex_label_map,
+    _reference_map_has_valid_aux_numbers,
     _report_latex_paragraph_local,
     build_concise_report_json,
     build_concise_report_markdown,
@@ -35,6 +37,7 @@ from audit_policy_hooks import (
     build_final_report_tex,
     build_user_message_for_chunk,
     source_ingestion_diagnostics,
+    ensure_reference_map,
 )
 from audit_runtime import (
     AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL,
@@ -1805,6 +1808,106 @@ def test_source_ingestion_diagnostics_in_reports() -> None:
         _assert(len(diag["warnings"]) == 2, diag)
         _assert(any("no labels were recovered" in warning for warning in diag["warnings"]), diag)
         _assert(any("no compiled .aux label map" in warning for warning in diag["warnings"]), diag)
+
+
+def test_raw_tex_label_fallback_reference_map() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_raw_tex_labels_") as tmp:
+        root = Path(tmp)
+        tex_path = root / "paper.tex"
+        workdir = root / "paper_audit"
+        session = _seed_state(workdir)
+        session["tex_path"] = str(tex_path)
+        paths = session_paths(workdir)
+        _write_json(paths["session"], session)
+        _write_json(
+            paths["manifest"],
+            {
+                "chunking_mode": "tex-full-coverage",
+                "chunks": [
+                    {"chunk_id": "chunk_001", "chunk_index": 1, "page_start": 1, "page_end": 1, "source_kind": "tex"},
+                    {"chunk_id": "chunk_002", "chunk_index": 2, "page_start": 2, "page_end": 2, "source_kind": "tex"},
+                ],
+                "updated_at": NEW,
+            },
+        )
+        _write_text(
+            tex_path,
+            "\n".join(
+                [
+                    r"% \label{eq:not-real}",
+                    r"\section{Setup}\label{sec:intro}",
+                    r"\begin{equation}\label{eq:main}",
+                    r"a=b",
+                    r"\end{equation}",
+                    r"\begin{lemma}\label{lem:gauss-bound}",
+                    r"Bound statement.",
+                    r"\end{lemma}",
+                    r"\begin{theorem}\label{thm:main}",
+                    r"Main statement.",
+                    r"\end{theorem}",
+                    r"\label{bad { malformed",
+                ]
+            )
+            + "\n",
+        )
+
+        raw_map = _load_raw_tex_label_map(tex_path)
+        _assert("eq:not-real" not in raw_map, raw_map)
+        _assert(raw_map["eq:main"]["kind"] == "equation", raw_map)
+        _assert(raw_map["lem:gauss-bound"]["kind"] == "lemma", raw_map)
+        _assert(raw_map["thm:main"]["kind"] == "theorem", raw_map)
+        _assert(raw_map["sec:intro"]["kind"] == "section", raw_map)
+        _assert(raw_map["eq:main"]["source"] == "tex_raw_label", raw_map)
+        _assert(raw_map["eq:main"]["source_tex_path"] == "paper.tex", raw_map)
+        _assert(raw_map["eq:main"]["line"] == 3, raw_map)
+
+        ref_state = ensure_reference_map(session)
+        _assert(ref_state["map_source"] == "tex_raw_label", ref_state)
+        _assert(ref_state["aux_file_count"] == 0, ref_state)
+        _assert(ref_state["raw_tex_label_count"] == 4, ref_state)
+        _assert(ref_state["raw_tex_fallback_label_count"] == 4, ref_state)
+        _assert(ref_state["label_map"]["eq:main"].get("printed_number") is None, ref_state)
+        _assert(not _reference_map_has_valid_aux_numbers(ref_state), ref_state)
+
+        diag = source_ingestion_diagnostics(session)
+        _assert(diag["recovered_label_count"] == 4, diag)
+        _assert(diag["raw_tex_recovered_label_count"] == 4, diag)
+        _assert(diag["aux_recovered_label_count"] == 0, diag)
+        _assert(not diag["printed_label_recovery_available"], diag)
+        _assert(not diag["label_map_empty_despite_tex"], diag)
+        _assert(any("raw TeX source" in warning for warning in diag["warnings"]), diag)
+        markdown = build_concise_report_markdown(session)
+        _assert("Raw TeX source label recovery: 4 source label(s) recovered" in markdown, markdown)
+        _assert("printed equation/theorem numbers could not be recovered" in markdown, markdown)
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_aux_prefers_raw_") as tmp:
+        root = Path(tmp)
+        tex_path = root / "paper.tex"
+        workdir = root / "paper_audit"
+        session = _seed_state(workdir)
+        session["tex_path"] = str(tex_path)
+        _write_json(session_paths(workdir)["session"], session)
+        _write_text(
+            tex_path,
+            "\n".join(
+                [
+                    r"\begin{equation}\label{eq:main}a=b\end{equation}",
+                    r"\begin{lemma}\label{lem:raw-only}Raw-only lemma.\end{lemma}",
+                ]
+            )
+            + "\n",
+        )
+        _write_text(root / "paper.aux", r"\newlabel{eq:main}{{3.5}{8}{Main}{equation.3.5}{}}" + "\n")
+
+        ref_state = ensure_reference_map(session)
+        _assert(ref_state["map_source"] == "aux", ref_state)
+        _assert(ref_state["aux_recovered_label_count"] == 1, ref_state)
+        _assert(ref_state["raw_tex_label_count"] == 2, ref_state)
+        _assert(ref_state["raw_tex_fallback_label_count"] == 1, ref_state)
+        _assert(ref_state["label_map"]["eq:main"]["source"] == "aux", ref_state)
+        _assert(ref_state["label_map"]["eq:main"]["printed_label"] == "Equation (3.5)", ref_state)
+        _assert(ref_state["label_map"]["lem:raw-only"]["source"] == "tex_raw_label", ref_state)
+        _assert(_reference_map_has_valid_aux_numbers(ref_state), ref_state)
 
 
 def test_aux_printed_label_display_in_reports() -> None:
@@ -3952,6 +4055,7 @@ def main() -> int:
         ("report LaTeX unicode math safety", test_report_latex_unicode_math_safety),
         ("issue severity summary in audit summary", test_issue_severity_summary_in_audit_summary),
         ("source ingestion diagnostics in reports", test_source_ingestion_diagnostics_in_reports),
+        ("raw TeX label fallback reference map", test_raw_tex_label_fallback_reference_map),
         ("AUX printed label display in reports", test_aux_printed_label_display_in_reports),
         ("concise report notable incorrect reference issues", test_concise_report_notable_incorrect_reference_issues),
         ("issue recheck overlay in reports", test_issue_recheck_overlay_in_reports),
