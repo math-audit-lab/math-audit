@@ -2538,6 +2538,7 @@ def rerun_selected_chunks(
     )
     results = []
     report_paths: dict[str, str] = {}
+    context_supersession_event: Optional[dict[str, Any]] = None
     try:
         for chunk_id in selected_chunk_ids:
             session = _resolve_session(session["pdf_path"])
@@ -2611,6 +2612,15 @@ def rerun_selected_chunks(
             })
         save_status(session, restored_status)
 
+        context_supersession_event = _append_audit_context_supersession_event_for_rerun(
+            session,
+            selected_set,
+            rerun_id,
+            str(_rerun_kind or "selected_chunk"),
+            replacement_summary,
+            superseded_before=started_at,
+        )
+
         if rebuild_reports:
             report_paths = build_final_report(session)
 
@@ -2626,6 +2636,7 @@ def rerun_selected_chunks(
             "archived_state_paths": archived_state_paths,
             "archived_chunk_paths": archived_chunk_paths,
             "replacement_summary": replacement_summary,
+            "context_supersession": context_supersession_event,
             "report_paths": report_paths,
             "rerun_results": results,
         }
@@ -2660,6 +2671,7 @@ def rerun_selected_chunks(
         "archived_state_paths": archived_state_paths,
         "archived_chunk_paths": archived_chunk_paths,
         "replacement_summary": replacement_summary,
+        "context_supersession": context_supersession_event,
         "rerun_results": results,
         "report_paths": report_paths,
     }
@@ -6036,7 +6048,94 @@ def _append_audit_context_db_entries(
     return entries
 
 
-def _read_audit_context_db(session: dict[str, Any]) -> list[dict[str, Any]]:
+def _audit_context_db_event_kind(entry: dict[str, Any]) -> str:
+    return str(entry.get("kind") or entry.get("action") or "").strip()
+
+
+def _is_audit_context_supersession_event(entry: dict[str, Any]) -> bool:
+    return (
+        _audit_context_db_event_kind(entry) == "context_supersession"
+        or str(entry.get("action") or "").strip() == "supersede_chunk_context"
+    )
+
+
+def _audit_context_superseded_before(event: dict[str, Any]) -> Optional[datetime]:
+    for key in ("superseded_before", "rerun_started_at", "time"):
+        value = str(event.get(key) or "").strip()
+        if not value:
+            continue
+        parsed = _parse_freshness_datetime(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _context_entry_time(entry: dict[str, Any]) -> Optional[datetime]:
+    return _parse_freshness_datetime(str(entry.get("time") or "").strip())
+
+
+def _filter_superseded_audit_context_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    superseded_entry_ids: set[str] = set()
+    chunk_cutoffs: list[tuple[set[str], Optional[datetime]]] = []
+    superseded_issue_ids: set[str] = set()
+    for entry in entries:
+        if not _is_audit_context_supersession_event(entry):
+            continue
+        superseded_entry_ids.update(
+            str(item).strip()
+            for item in (entry.get("superseded_entry_ids") or [])
+            if str(item).strip()
+        )
+        superseded_issue_ids.update(
+            str(item).strip()
+            for item in (entry.get("superseded_issue_ids") or [])
+            if str(item).strip()
+        )
+        chunk_ids = {
+            str(item).strip()
+            for item in (
+                entry.get("superseded_chunk_ids")
+                or entry.get("source_chunk_ids")
+                or entry.get("chunk_ids")
+                or []
+            )
+            if str(item).strip()
+        }
+        if chunk_ids:
+            chunk_cutoffs.append((chunk_ids, _audit_context_superseded_before(entry)))
+
+    filtered: list[dict[str, Any]] = []
+    for entry in entries:
+        if _is_audit_context_supersession_event(entry):
+            continue
+        entry_id = str(entry.get("entry_id") or "").strip()
+        if entry_id and entry_id in superseded_entry_ids:
+            continue
+        issue_id = str(entry.get("issue_id") or "").strip()
+        if issue_id and issue_id in superseded_issue_ids:
+            continue
+        chunk_id = str(entry.get("source_chunk_id") or "").strip()
+        if chunk_id:
+            entry_time = _context_entry_time(entry)
+            is_superseded_by_chunk = False
+            for chunk_ids, cutoff in chunk_cutoffs:
+                if chunk_id not in chunk_ids:
+                    continue
+                if cutoff is None or entry_time is None or entry_time <= cutoff:
+                    is_superseded_by_chunk = True
+                    break
+            if is_superseded_by_chunk:
+                continue
+        filtered.append(entry)
+    return filtered
+
+
+def _read_audit_context_db(
+    session: dict[str, Any],
+    *,
+    include_superseded: bool = False,
+    include_events: bool = False,
+) -> list[dict[str, Any]]:
     path = _audit_context_db_path(session)
     if not path.exists():
         return []
@@ -6048,7 +6147,74 @@ def _read_audit_context_db(session: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         if isinstance(item, dict):
             entries.append(item)
-    return entries
+    if include_superseded:
+        if include_events:
+            return entries
+        return [entry for entry in entries if not _is_audit_context_supersession_event(entry)]
+    return _filter_superseded_audit_context_entries(entries)
+
+
+def _append_audit_context_supersession_event_for_rerun(
+    session: dict[str, Any],
+    chunk_ids: set[str],
+    rerun_id: str,
+    rerun_kind: str,
+    replacement_summary: dict[str, Any],
+    *,
+    superseded_before: str,
+) -> Optional[dict[str, Any]]:
+    normalized_chunk_ids = sorted(str(item).strip() for item in chunk_ids if str(item).strip())
+    if not normalized_chunk_ids:
+        return None
+    removed_issue_ids = [
+        str(item).strip()
+        for item in (replacement_summary.get("removed_issue_ids") or [])
+        if str(item).strip()
+    ]
+    removed_issue_id_set = set(removed_issue_ids)
+    superseded_before_dt = _parse_freshness_datetime(superseded_before)
+    chunk_id_set = set(normalized_chunk_ids)
+    existing_entries = _read_audit_context_db(session, include_superseded=True, include_events=False)
+    superseded_entries = [
+        entry
+        for entry in existing_entries
+        if (
+            str(entry.get("issue_id") or "").strip()
+            and str(entry.get("issue_id") or "").strip() in removed_issue_id_set
+        )
+        or (
+            str(entry.get("source_chunk_id") or "").strip() in chunk_id_set
+            and (
+                superseded_before_dt is None
+                or _context_entry_time(entry) is None
+                or _context_entry_time(entry) <= superseded_before_dt
+            )
+        )
+    ]
+    event = {
+        "entry_id": f"context_supersession:{rerun_id}:{_artifact_timestamp_token()}",
+        "time": utc_now(),
+        "kind": "context_supersession",
+        "action": "supersede_chunk_context",
+        "rerun_id": str(rerun_id or ""),
+        "rerun_kind": str(rerun_kind or "selected_chunk"),
+        "superseded_chunk_ids": normalized_chunk_ids,
+        "superseded_issue_ids": removed_issue_ids,
+        "superseded_entry_ids": [
+            str(entry.get("entry_id") or "").strip()
+            for entry in superseded_entries
+            if str(entry.get("entry_id") or "").strip()
+        ],
+        "superseded_entry_count": len(superseded_entries),
+        "superseded_before": str(superseded_before or ""),
+        "confidence": "system",
+        "text": (
+            "Supersedes prior audit context DB entries for chunks replaced by a successful rerun. "
+            "Canonical readers should ignore superseded entries unless historical provenance is requested."
+        ),
+    }
+    append_jsonl(_audit_context_db_path(session), event)
+    return event
 
 
 def _audit_context_db_counts_by_kind(entries: list[dict[str, Any]]) -> dict[str, int]:

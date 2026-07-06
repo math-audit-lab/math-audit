@@ -48,10 +48,12 @@ from audit_runtime import (
     FRESH_CONTEXT_TEXT_FIRST_NOTE,
     PDF_TEXT_ONLY_RETRY_NOTE,
     _append_audit_context_db_entries,
+    _append_audit_context_supersession_event_for_rerun,
     _audit_request_size_diagnostics,
     _existing_session_audit_context_mode,
     _file_download_timeout_auto_retry_decision,
     _file_download_timeout_retry_mode,
+    _read_audit_context_db,
     _retryable_response_failure_reason,
     _save_request_metadata,
     _should_reattach_pdf_for_chunk_retry,
@@ -1007,6 +1009,111 @@ def test_fresh_context_issue_retrieval_downweights_generic_terms() -> None:
         retrieved = build_fresh_audit_context_for_chunk(session, current_chunk)
         _assert("I100" in retrieved["block"], retrieved["block"])
         _assert("I999" not in retrieved["block"], retrieved["block"])
+
+
+def test_audit_context_db_supersedes_rerun_chunk_entries() -> None:
+    with tempfile.TemporaryDirectory(prefix="math_audit_context_supersession_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        context_path = session_paths(workdir)["audit_context_db"]
+        _append_jsonl(
+            context_path,
+            {
+                "entry_id": "chunk_058:issue:old",
+                "time": OLD,
+                "kind": "issue",
+                "text": "Old rerun issue should disappear from canonical context.",
+                "source_chunk_id": "chunk_058",
+                "source_chunk_index": 58,
+                "issue_id": "I166",
+                "severity": "low",
+                "status": "open",
+            },
+        )
+        _append_jsonl(
+            context_path,
+            {
+                "entry_id": "chunk_010:issue:kept",
+                "time": OLD,
+                "kind": "issue",
+                "text": "Unrelated chunk issue should remain visible.",
+                "source_chunk_id": "chunk_010",
+                "source_chunk_index": 10,
+                "issue_id": "I010",
+                "severity": "high",
+                "status": "open",
+            },
+        )
+        _append_jsonl(
+            context_path,
+            {
+                "entry_id": "chunk_058:issue:new",
+                "time": NEW,
+                "kind": "issue",
+                "text": "Replacement rerun issue should remain visible.",
+                "source_chunk_id": "chunk_058",
+                "source_chunk_index": 58,
+                "issue_id": "I177",
+                "severity": "medium",
+                "status": "open",
+            },
+        )
+
+        before = _read_audit_context_db(session)
+        _assert({entry.get("issue_id") for entry in before} == {"I010", "I166", "I177"}, before)
+
+        event = _append_audit_context_supersession_event_for_rerun(
+            session,
+            {"chunk_058"},
+            "rerun_test",
+            "failed_verification",
+            {"removed_issue_ids": ["I166", "I167", "I168"]},
+            superseded_before=MID,
+        )
+        _assert(event is not None, "supersession event was not written")
+        _assert(event.get("superseded_chunk_ids") == ["chunk_058"], event)
+        _assert(event.get("superseded_issue_ids") == ["I166", "I167", "I168"], event)
+        _assert(event.get("superseded_entry_ids") == ["chunk_058:issue:old"], event)
+
+        canonical = _read_audit_context_db(session)
+        canonical_issue_ids = {entry.get("issue_id") for entry in canonical}
+        _assert(canonical_issue_ids == {"I010", "I177"}, canonical)
+        _assert(all(entry.get("kind") != "context_supersession" for entry in canonical), canonical)
+
+        historical = _read_audit_context_db(session, include_superseded=True)
+        historical_issue_ids = {entry.get("issue_id") for entry in historical}
+        _assert(historical_issue_ids == {"I010", "I166", "I177"}, historical)
+
+        current_chunk = {
+            "chunk_id": "chunk_060",
+            "chunk_index": 60,
+            "label": "Later chunk",
+            "boundary": "pages 60-60",
+            "source_kind": "tex",
+            "page_start": 60,
+            "page_end": 60,
+            "chunk_text": "Later chunk depends on the replacement rerun issue.",
+        }
+        retrieved = build_fresh_audit_context_for_chunk(session, current_chunk)
+        _assert("I177" in retrieved["block"], retrieved["block"])
+        _assert("I166" not in retrieved["block"], retrieved["block"])
+        _assert("I010" in retrieved["block"], retrieved["block"])
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_context_old_format_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        context_path = session_paths(workdir)["audit_context_db"]
+        _append_jsonl(
+            context_path,
+            {
+                "kind": "issue",
+                "text": "Old-format row without entry_id should remain visible when no supersession exists.",
+                "source_chunk_id": "chunk_058",
+                "issue_id": "I166",
+            },
+        )
+        entries = _read_audit_context_db(session)
+        _assert(len(entries) == 1 and entries[0].get("issue_id") == "I166", entries)
 
 
 def test_context_mode_mixing_guardrails() -> None:
@@ -4044,6 +4151,7 @@ def main() -> int:
         ("request size diagnostics", test_request_size_diagnostics),
         ("fresh context mode scaffolding", test_fresh_context_mode_scaffolding),
         ("fresh context issue generic-term downweighting", test_fresh_context_issue_retrieval_downweights_generic_terms),
+        ("audit context DB supersedes rerun chunk entries", test_audit_context_db_supersedes_rerun_chunk_entries),
         ("context mode mixing guardrails", test_context_mode_mixing_guardrails),
         ("chunk completion log line formatting", test_chunk_completion_log_line_formatting),
         ("plain text scroll preservation helper", test_plain_text_scroll_preservation_helper),
