@@ -184,6 +184,184 @@ def _open_call_looks_dangerous(node: ast.Call) -> bool:
     return True
 
 
+def _is_string_literal_node(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def _is_int_literal_node(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool)
+
+
+class _VerificationSafetyVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.reason = ""
+        self._string_vars: list[set[str]] = [set()]
+
+    def fail(self, reason: str) -> None:
+        if not self.reason:
+            self.reason = reason
+
+    def visit(self, node: ast.AST) -> Any:
+        if self.reason:
+            return None
+        return super().visit(node)
+
+    @property
+    def known_string_vars(self) -> set[str]:
+        return self._string_vars[-1]
+
+    def _target_names(self, target: ast.AST) -> list[str]:
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            names: list[str] = []
+            for item in target.elts:
+                names.extend(self._target_names(item))
+            return names
+        return []
+
+    def _mark_assignment_targets(self, targets: list[ast.AST], is_known_string: bool) -> None:
+        for target in targets:
+            for name in self._target_names(target):
+                if is_known_string:
+                    self.known_string_vars.add(name)
+                else:
+                    self.known_string_vars.discard(name)
+
+    def _is_safe_string_receiver(self, node: ast.AST) -> bool:
+        if _is_string_literal_node(node):
+            return True
+        if isinstance(node, ast.Name):
+            return node.id in self.known_string_vars
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            # Common cosmetic formatter pattern: " + ".join(parts).replace("+ -", "- ").
+            return (
+                node.func.attr == "join"
+                and _is_string_literal_node(node.func.value)
+                and len(node.args) == 1
+                and not node.keywords
+            )
+        return False
+
+    def _is_safe_string_replace_call(self, node: ast.Call) -> bool:
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "replace":
+            return False
+        if node.keywords:
+            return False
+        if len(node.args) not in {2, 3}:
+            return False
+        if not self._is_safe_string_receiver(node.func.value):
+            return False
+        if not all(_is_string_literal_node(arg) for arg in node.args[:2]):
+            return False
+        if len(node.args) == 3 and not _is_int_literal_node(node.args[2]):
+            return False
+        return True
+
+    def _is_known_string_expression(self, node: ast.AST) -> bool:
+        return self._is_safe_string_receiver(node) or (
+            isinstance(node, ast.Call) and self._is_safe_string_replace_call(node)
+        )
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            root_name = (alias.name or "").split(".", 1)[0]
+            if root_name in _DANGEROUS_VERIFICATION_IMPORTS:
+                self.fail(f"import of {root_name} is not allowed in safe_only mode")
+                return
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        root_name = ((node.module or "").split(".", 1)[0])
+        if root_name in _DANGEROUS_VERIFICATION_IMPORTS:
+            self.fail(f"import of {root_name} is not allowed in safe_only mode")
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        if self.reason:
+            return
+        self._mark_assignment_targets(list(node.targets), self._is_known_string_expression(node.value))
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is not None:
+            self.visit(node.value)
+            if self.reason:
+                return
+        self._mark_assignment_targets([node.target], bool(node.value is not None and self._is_known_string_expression(node.value)))
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.visit(node.value)
+        self._mark_assignment_targets([node.target], False)
+
+    def visit_For(self, node: ast.For) -> None:
+        self.visit(node.iter)
+        self._mark_assignment_targets([node.target], False)
+        for item in node.body:
+            self.visit(item)
+        for item in node.orelse:
+            self.visit(item)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._string_vars.append(set())
+        try:
+            for item in node.decorator_list:
+                self.visit(item)
+            for item in list(node.args.defaults) + [kw for kw in node.args.kw_defaults if kw is not None]:
+                self.visit(item)
+            if node.returns is not None:
+                self.visit(node.returns)
+            for item in node.body:
+                self.visit(item)
+        finally:
+            self._string_vars.pop()
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.visit_FunctionDef(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._string_vars.append(set())
+        try:
+            for item in list(node.args.defaults) + [kw for kw in node.args.kw_defaults if kw is not None]:
+                self.visit(item)
+            self.visit(node.body)
+        finally:
+            self._string_vars.pop()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for item in node.decorator_list:
+            self.visit(item)
+        for item in node.bases:
+            self.visit(item)
+        for item in node.keywords:
+            self.visit(item)
+        self._string_vars.append(set())
+        try:
+            for item in node.body:
+                self.visit(item)
+        finally:
+            self._string_vars.pop()
+
+    def visit_Call(self, node: ast.Call) -> None:
+        call_name = _ast_call_name(node.func)
+        attr_name = node.func.attr if isinstance(node.func, ast.Attribute) else ""
+        if call_name in {"open", "builtins.open"} and _open_call_looks_dangerous(node):
+            self.fail("write-capable open() call is not allowed in safe_only mode")
+            return
+        if call_name in _DANGEROUS_VERIFICATION_SIMPLE_CALLS:
+            self.fail(f"call to {call_name} is not allowed in safe_only mode")
+            return
+        if call_name in _DANGEROUS_VERIFICATION_FULL_CALLS:
+            self.fail(f"call to {call_name} is not allowed in safe_only mode")
+            return
+        if attr_name in _DANGEROUS_VERIFICATION_ATTR_NAMES:
+            if not (attr_name == "replace" and self._is_safe_string_replace_call(node)):
+                self.fail(f"call to {attr_name}() is not allowed in safe_only mode")
+                return
+        if call_name.startswith("socket.") or call_name.startswith("subprocess."):
+            self.fail(f"call to {call_name} is not allowed in safe_only mode")
+            return
+        self.generic_visit(node)
+
+
 def _check_verification_script_safety(script_path: Path) -> tuple[bool, str]:
     try:
         source = script_path.read_text(encoding="utf-8")
@@ -193,29 +371,10 @@ def _check_verification_script_safety(script_path: Path) -> tuple[bool, str]:
         tree = ast.parse(source, filename=str(script_path))
     except Exception as e:
         return False, f"could not parse script: {e}"
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                root_name = (alias.name or "").split(".", 1)[0]
-                if root_name in _DANGEROUS_VERIFICATION_IMPORTS:
-                    return False, f"import of {root_name} is not allowed in safe_only mode"
-        elif isinstance(node, ast.ImportFrom):
-            root_name = ((node.module or "").split(".", 1)[0])
-            if root_name in _DANGEROUS_VERIFICATION_IMPORTS:
-                return False, f"import of {root_name} is not allowed in safe_only mode"
-        elif isinstance(node, ast.Call):
-            call_name = _ast_call_name(node.func)
-            attr_name = node.func.attr if isinstance(node.func, ast.Attribute) else ""
-            if call_name in {"open", "builtins.open"} and _open_call_looks_dangerous(node):
-                return False, "write-capable open() call is not allowed in safe_only mode"
-            if call_name in _DANGEROUS_VERIFICATION_SIMPLE_CALLS:
-                return False, f"call to {call_name} is not allowed in safe_only mode"
-            if call_name in _DANGEROUS_VERIFICATION_FULL_CALLS:
-                return False, f"call to {call_name} is not allowed in safe_only mode"
-            if attr_name in _DANGEROUS_VERIFICATION_ATTR_NAMES:
-                return False, f"call to {attr_name}() is not allowed in safe_only mode"
-            if call_name.startswith("socket.") or call_name.startswith("subprocess."):
-                return False, f"call to {call_name} is not allowed in safe_only mode"
+    visitor = _VerificationSafetyVisitor()
+    visitor.visit(tree)
+    if visitor.reason:
+        return False, visitor.reason
     return True, ""
 
 

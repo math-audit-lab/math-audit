@@ -66,6 +66,7 @@ from audit_runtime import (
     report_latex_compile_health,
 )
 from audit_state import save_json, session_paths, usage_cache_diagnostics
+from audit_verification import _check_verification_script_safety
 from gui_controller import (
     format_chunk_completion_log_line,
     format_running_chunk_started_log_line,
@@ -4130,6 +4131,47 @@ def test_python_check_trailing_json_artifact_repair() -> None:
     _assert(check.get("normalization_applied") == "trailing_json_separator_trim", repr(check))
 
 
+def test_verification_safety_allows_narrow_string_replace() -> None:
+    def check(source: str) -> tuple[bool, str]:
+        with tempfile.TemporaryDirectory(prefix="math_audit_replace_safety_") as tmp:
+            path = Path(tmp) / "check.py"
+            _write_text(path, source)
+            return _check_verification_script_safety(path)
+
+    allowed_cases = [
+        '"a + -b".replace("+ -", "- ")\n',
+        's = "a + -b"\ns = s.replace("+ -", "- ")\n',
+        'msg = "a+-b"\nmsg = msg.replace("+-", "-")\nmsg = msg.replace("--", "+")\n',
+        's = "banana"\ns = s.replace("a", "o", 1)\n',
+        'parts = ["a", "-b"]\nformatted = " + ".join(parts).replace("+ -", "- ")\n',
+        (
+            "def format_poly(parts):\n"
+            "    return \" + \".join(parts).replace(\"+ -\", \"- \")\n"
+            "print(format_poly(['a', '-b']))\n"
+        ),
+    ]
+    for source in allowed_cases:
+        allowed, reason = check(source)
+        _assert(allowed, f"expected allowed but got {reason!r} for {source!r}")
+
+    rejected_cases = [
+        's = unknown\ns.replace("a", "b")\n',
+        'obj.replace("a", "b")\n',
+        'something.attr.replace("a", "b")\n',
+        'values[0].replace("a", "b")\n',
+        'get_string().replace("a", "b")\n',
+        's = "a"\nold = "a"\ns.replace(old, "b")\n',
+        's = "a"\ns.replace("a", dangerous())\n',
+        's = "a"\nn = 1\ns.replace("a", "b", n)\n',
+        's = "a"\ns.replace(old="a", new="b")\n',
+        'from pathlib import Path\nPath("x").replace("a", "b")\n',
+    ]
+    for source in rejected_cases:
+        allowed, reason = check(source)
+        _assert(not allowed, f"expected rejected for {source!r}")
+        _assert("not allowed in safe_only mode" in reason, reason)
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -4181,6 +4223,7 @@ def main() -> int:
         ("issue family recheck import script", test_import_issue_family_recheck_script),
         ("python check literal newline escape repair", test_python_check_literal_newline_escape_repair),
         ("python check trailing JSON artifact repair", test_python_check_trailing_json_artifact_repair),
+        ("verification safety allows narrow string replace", test_verification_safety_allows_narrow_string_replace),
     ]
     results = [_run_case(name, func) for name, func in cases]
 
