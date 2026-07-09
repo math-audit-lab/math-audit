@@ -70,6 +70,12 @@ AUDIT_CONTEXT_MODE_LABELS = {
     "Experimental fresh-context per chunk": "fresh_context_experimental",
 }
 AUDIT_CONTEXT_MODE_CHOICES = list(AUDIT_CONTEXT_MODE_LABELS)
+REVIEW_TAB_ENV_VAR = "MATH_AUDIT_ENABLE_REVIEW_TAB"
+
+
+def review_summary_polling_enabled(environ: Optional[dict[str, str]] = None) -> bool:
+    env = os.environ if environ is None else environ
+    return str(env.get(REVIEW_TAB_ENV_VAR) or "") == "1"
 
 
 def _format_duration_for_log(seconds: float) -> str:
@@ -1398,12 +1404,18 @@ class GuiController(QObject):
                 "inventory_warning": {"has_invalidated_obligations": False},
                 "error": f"{type(exc).__name__}: {exc}",
             }
-        try:
-            info["review_summary"] = load_post_audit_review_summary(self.pdf_path)
-        except Exception as exc:
+        if review_summary_polling_enabled():
+            try:
+                info["review_summary"] = load_post_audit_review_summary(self.pdf_path)
+            except Exception as exc:
+                info["review_summary"] = {
+                    "available": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+        else:
             info["review_summary"] = {
                 "available": False,
-                "error": f"{type(exc).__name__}: {exc}",
+                "message": "Experimental Review tab polling is disabled.",
             }
         return self._normalize_status_payload(info)
 

@@ -72,6 +72,7 @@ from gui_controller import (
     format_running_chunk_started_log_line,
     fresh_start_context_mode_mismatch_info,
     persistent_audit_log_preview,
+    review_summary_polling_enabled,
 )
 from scripts.prepare_context_mode_comparison import prepare_context_mode_comparison
 from scripts.prepare_issue_recheck_candidates import prepare_issue_recheck_candidates
@@ -1217,7 +1218,12 @@ def test_chunk_completion_log_line_formatting() -> None:
 
 
 def test_plain_text_scroll_preservation_helper() -> None:
-    from gui_main_window import _set_plain_text_preserving_scroll
+    from gui_main_window import (
+        _set_plain_text_preserving_scroll,
+        _set_stylesheet_if_changed,
+        _set_text_if_changed,
+        _set_tooltip_if_changed,
+    )
 
     class FakeScrollBar:
         def __init__(self, value: int, maximum: int) -> None:
@@ -1266,6 +1272,58 @@ def test_plain_text_scroll_preservation_helper() -> None:
     bottom.next_maximum = 180
     _assert(_set_plain_text_preserving_scroll(bottom, "new longer text"), "bottom text was not written")
     _assert(bottom.scrollbar.value() == 180, "bottom scroll position did not stay at bottom")
+
+    class FakeTextWidget:
+        def __init__(self, text: str = "", tooltip: str = "", style: str = "") -> None:
+            self._text = text
+            self._tooltip = tooltip
+            self._style = style
+            self.text_set_count = 0
+            self.tooltip_set_count = 0
+            self.style_set_count = 0
+
+        def text(self) -> str:
+            return self._text
+
+        def setText(self, text: str) -> None:
+            self.text_set_count += 1
+            self._text = text
+
+        def toolTip(self) -> str:
+            return self._tooltip
+
+        def setToolTip(self, text: str) -> None:
+            self.tooltip_set_count += 1
+            self._tooltip = text
+
+        def styleSheet(self) -> str:
+            return self._style
+
+        def setStyleSheet(self, style: str) -> None:
+            self.style_set_count += 1
+            self._style = style
+
+    fake = FakeTextWidget(text="same", tooltip="tip", style="style")
+    _assert(not _set_text_if_changed(fake, "same"), "unchanged label text was rewritten")
+    _assert(fake.text_set_count == 0, "unchanged label text called setText")
+    _assert(_set_text_if_changed(fake, "different"), "changed label text was not written")
+    _assert(fake.text_set_count == 1 and fake.text() == "different", "changed label text state is wrong")
+    _assert(not _set_tooltip_if_changed(fake, "tip"), "unchanged tooltip was rewritten")
+    _assert(_set_tooltip_if_changed(fake, "new tip"), "changed tooltip was not written")
+    _assert(not _set_stylesheet_if_changed(fake, "style"), "unchanged style was rewritten")
+    _assert(_set_stylesheet_if_changed(fake, "new style"), "changed style was not written")
+
+
+def test_review_summary_polling_feature_flag() -> None:
+    _assert(not review_summary_polling_enabled({}), "Review summary polling should be disabled by default")
+    _assert(
+        not review_summary_polling_enabled({"MATH_AUDIT_ENABLE_REVIEW_TAB": "0"}),
+        "Only exact value 1 should enable review summary polling",
+    )
+    _assert(
+        review_summary_polling_enabled({"MATH_AUDIT_ENABLE_REVIEW_TAB": "1"}),
+        "Review summary polling did not follow enabled Review tab flag",
+    )
 
 
 def test_review_tab_feature_flag() -> None:
@@ -4197,6 +4255,7 @@ def main() -> int:
         ("context mode mixing guardrails", test_context_mode_mixing_guardrails),
         ("chunk completion log line formatting", test_chunk_completion_log_line_formatting),
         ("plain text scroll preservation helper", test_plain_text_scroll_preservation_helper),
+        ("review summary polling feature flag", test_review_summary_polling_feature_flag),
         ("review tab feature flag", test_review_tab_feature_flag),
         ("completed status reconciliation", test_completed_status_reconciles_from_chunk_records),
         ("persistent audit log preview", test_persistent_audit_log_preview),

@@ -48,6 +48,30 @@ def review_tab_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
     return str(env.get("MATH_AUDIT_ENABLE_REVIEW_TAB") or "") == "1"
 
 
+def _set_text_if_changed(widget: Any, text: str) -> bool:
+    clean = str(text or "")
+    if getattr(widget, "text")() == clean:
+        return False
+    widget.setText(clean)
+    return True
+
+
+def _set_tooltip_if_changed(widget: Any, text: str) -> bool:
+    clean = str(text or "")
+    if widget.toolTip() == clean:
+        return False
+    widget.setToolTip(clean)
+    return True
+
+
+def _set_stylesheet_if_changed(widget: Any, style: str) -> bool:
+    clean = str(style or "")
+    if widget.styleSheet() == clean:
+        return False
+    widget.setStyleSheet(clean)
+    return True
+
+
 def _set_plain_text_preserving_scroll(widget: QPlainTextEdit, text: str) -> bool:
     clean = str(text or "")
     if widget.toPlainText() == clean:
@@ -1302,29 +1326,30 @@ class MainWindow(QMainWindow):
             if totals_cost > display_cost:
                 display_cost = totals_cost
 
-        self.status_value.setText(self._display_status_text(payload, status, pause))
-        self.current_chunk_value.setText(str(status.get("current_chunk_id") or "-"))
+        _set_text_if_changed(self.status_value, self._display_status_text(payload, status, pause))
+        _set_text_if_changed(self.current_chunk_value, str(status.get("current_chunk_id") or "-"))
         self.progress_bar.setValue(int(round(float(status.get("progress_pct", 0.0) or 0.0))))
-        self.chunk_progress_value.setText(f"{status.get('chunks_completed', 0)} / {status.get('chunks_total', 0)}")
-        self.page_progress_value.setText(
+        _set_text_if_changed(self.chunk_progress_value, f"{status.get('chunks_completed', 0)} / {status.get('chunks_total', 0)}")
+        _set_text_if_changed(
+            self.page_progress_value,
             f"{status.get('estimated_pages_completed', 0)} / {status.get('estimated_pages_total', 0)}"
         )
-        self.cost_value.setText(f"${display_cost:.4f}")
-        self.tokens_value.setText(str(int(totals.get("total_tokens", 0) or 0)))
-        self.elapsed_value.setText(self._format_duration(float(totals.get("audit_seconds", 0.0) or 0.0)))
+        _set_text_if_changed(self.cost_value, f"${display_cost:.4f}")
+        _set_text_if_changed(self.tokens_value, str(int(totals.get("total_tokens", 0) or 0)))
+        _set_text_if_changed(self.elapsed_value, self._format_duration(float(totals.get("audit_seconds", 0.0) or 0.0)))
         self._update_cache_reuse_status(status.get("last_chunk_usage_diagnostics") or {})
-        self.discussion_cost_value.setText(f"Cost: ${float(discussion_usage.get('cost_usd', 0.0) or 0.0):.4f}")
-        self.discussion_tokens_value.setText(f"Tokens: {int(discussion_usage.get('total_tokens', 0) or 0)}")
-        self.discussion_turns_value.setText(f"Turns: {int(discussion_usage.get('turns', 0) or 0)}")
+        _set_text_if_changed(self.discussion_cost_value, f"Cost: ${float(discussion_usage.get('cost_usd', 0.0) or 0.0):.4f}")
+        _set_text_if_changed(self.discussion_tokens_value, f"Tokens: {int(discussion_usage.get('total_tokens', 0) or 0)}")
+        _set_text_if_changed(self.discussion_turns_value, f"Turns: {int(discussion_usage.get('turns', 0) or 0)}")
 
         if pause.get("requested"):
             requested_at = str(pause.get("requested_at") or "").strip()
-            self.pause_state_value.setText(f"Requested{f' at {requested_at}' if requested_at else ''}")
+            _set_text_if_changed(self.pause_state_value, f"Requested{f' at {requested_at}' if requested_at else ''}")
         elif str(status.get("status")) == "paused":
             reason = str(status.get("pause_reason") or "paused").strip()
-            self.pause_state_value.setText(f"Paused ({reason})")
+            _set_text_if_changed(self.pause_state_value, f"Paused ({reason})")
         else:
-            self.pause_state_value.setText("Not requested")
+            _set_text_if_changed(self.pause_state_value, "Not requested")
 
         failed_summary = failed_verification.get("summary") or {}
         failed_count = int(failed_summary.get("failed_chunk_count", 0) or 0)
@@ -1346,10 +1371,11 @@ class MainWindow(QMainWindow):
         self._set_failed_verification_rerun_compact(failed_count)
 
         scripts_total = int(verification_suite.get("scripts_total", 0) or 0)
-        self.verification_scripts_available_value.setText(f"Currently active verification scripts: {scripts_total}")
+        _set_text_if_changed(self.verification_scripts_available_value, f"Currently active verification scripts: {scripts_total}")
         last_run = verification_suite.get("last_run")
         if isinstance(last_run, dict) and last_run:
-            self.verification_last_run_value.setText(
+            _set_text_if_changed(
+                self.verification_last_run_value,
                 "Last run (active scripts): "
                 f"passed {int(last_run.get('passed', 0) or 0)}, "
                 f"failed {int(last_run.get('failed', 0) or 0)}, "
@@ -1357,7 +1383,7 @@ class MainWindow(QMainWindow):
                 f"skipped {int(last_run.get('skipped', 0) or 0)}"
             )
         else:
-            self.verification_last_run_value.setText("Last run: none")
+            _set_text_if_changed(self.verification_last_run_value, "Last run: none")
         inventory_warning = verification_suite.get("inventory_warning") or {}
         if inventory_warning.get("has_invalidated_obligations"):
             affected_chunks = inventory_warning.get("affected_chunks") or []
@@ -1370,9 +1396,9 @@ class MainWindow(QMainWindow):
                 "verification script(s) are not represented in the currently active verification suite. "
                 f"Affected chunks: {preview or 'unknown'}."
             )
-            self.verification_inventory_warning_value.setText("Warning: " + (message or fallback))
+            _set_text_if_changed(self.verification_inventory_warning_value, "Warning: " + (message or fallback))
         else:
-            self.verification_inventory_warning_value.setText("")
+            _set_text_if_changed(self.verification_inventory_warning_value, "")
 
         self._update_report_freshness_labels(payload.get("report_freshness") or {})
         self._update_review_summary(payload.get("review_summary") or {})
@@ -1380,15 +1406,15 @@ class MainWindow(QMainWindow):
 
     def _update_cache_reuse_status(self, diagnostics: dict[str, Any]) -> None:
         if not isinstance(diagnostics, dict) or not diagnostics:
-            self.cache_reuse_value.setText("-")
-            self.cache_reuse_value.setToolTip("")
-            self.cache_reuse_value.setStyleSheet("")
+            _set_text_if_changed(self.cache_reuse_value, "-")
+            _set_tooltip_if_changed(self.cache_reuse_value, "")
+            _set_stylesheet_if_changed(self.cache_reuse_value, "")
             return
         input_tokens = int(diagnostics.get("input_tokens", 0) or 0)
         if input_tokens <= 0:
-            self.cache_reuse_value.setText("n/a")
-            self.cache_reuse_value.setToolTip("")
-            self.cache_reuse_value.setStyleSheet("")
+            _set_text_if_changed(self.cache_reuse_value, "n/a")
+            _set_tooltip_if_changed(self.cache_reuse_value, "")
+            _set_stylesheet_if_changed(self.cache_reuse_value, "")
             return
         cached_tokens = int(diagnostics.get("cached_input_tokens", 0) or 0)
         percent = diagnostics.get("cached_input_percent")
@@ -1397,19 +1423,22 @@ class MainWindow(QMainWindow):
         chunk_id = str(diagnostics.get("chunk_id") or "last chunk")
         warning = str(diagnostics.get("warning") or "").strip()
         if warning:
-            self.cache_reuse_value.setText(
+            _set_text_if_changed(
+                self.cache_reuse_value,
                 f"{chunk_id}: {float(percent):.1f}% cached - cost may be higher"
             )
-            self.cache_reuse_value.setToolTip(
+            _set_tooltip_if_changed(
+                self.cache_reuse_value,
                 f"{warning}\nInput tokens: {input_tokens:,}\nCached input tokens: {cached_tokens:,}"
             )
-            self.cache_reuse_value.setStyleSheet("color: #b06000; font-weight: 600;")
+            _set_stylesheet_if_changed(self.cache_reuse_value, "color: #b06000; font-weight: 600;")
         else:
-            self.cache_reuse_value.setText(
+            _set_text_if_changed(
+                self.cache_reuse_value,
                 f"{chunk_id}: {float(percent):.1f}% cached ({cached_tokens:,}/{input_tokens:,})"
             )
-            self.cache_reuse_value.setToolTip("")
-            self.cache_reuse_value.setStyleSheet("")
+            _set_tooltip_if_changed(self.cache_reuse_value, "")
+            _set_stylesheet_if_changed(self.cache_reuse_value, "")
 
     def _update_report_freshness_labels(self, freshness: dict[str, Any]) -> None:
         reports = freshness.get("reports") if isinstance(freshness, dict) else {}
@@ -1439,7 +1468,7 @@ class MainWindow(QMainWindow):
             self._last_status_payload["review_summary"] = summary
         if not isinstance(summary, dict) or not summary.get("available"):
             message = str((summary or {}).get("message") or (summary or {}).get("error") or "No audit review state available.")
-            self.review_status_value.setText(message)
+            _set_text_if_changed(self.review_status_value, message)
             _set_plain_text_preserving_scroll(
                 self.review_accepted_rechecks_value,
                 "No accepted issue-family rechecks found.",
@@ -1473,7 +1502,7 @@ class MainWindow(QMainWindow):
         warnings = summary.get("warnings") or []
         if warnings:
             status_lines.append("Warnings: " + "; ".join(str(item) for item in warnings[:3]))
-        self.review_status_value.setText(" | ".join(status_lines))
+        _set_text_if_changed(self.review_status_value, " | ".join(status_lines))
         _set_plain_text_preserving_scroll(
             self.review_accepted_rechecks_value,
             self._format_review_rechecks(accepted),
@@ -1691,8 +1720,8 @@ class MainWindow(QMainWindow):
         else:
             text = f"{report_label}: freshness unknown"
             style = "color: #666;"
-        label.setText(text)
-        label.setStyleSheet(style)
+        _set_text_if_changed(label, text)
+        _set_stylesheet_if_changed(label, style)
 
     def _on_verification_progress(self, payload: dict[str, Any]) -> None:
         event = str((payload or {}).get("event") or "").strip()
@@ -1701,12 +1730,12 @@ class MainWindow(QMainWindow):
         script_name = str((payload or {}).get("script_name") or "").strip()
         if event == "suite_started":
             message = f"Verification scripts available: {total}"
-            self.verification_live_progress_value.setText(f"Running verification 0 / {total}")
+            _set_text_if_changed(self.verification_live_progress_value, f"Running verification 0 / {total}")
             self._append_report_output(message)
             return
         if event == "script_started":
             message = f"Running verification {index}/{total}: {script_name}"
-            self.verification_live_progress_value.setText(message)
+            _set_text_if_changed(self.verification_live_progress_value, message)
             self._append_report_output(message)
             return
         if event == "script_finished":
@@ -1718,7 +1747,7 @@ class MainWindow(QMainWindow):
                 "skipped": "SKIPPED",
             }.get(status, status.upper() or "UNKNOWN")
             message = f"{label}: {script_name}"
-            self.verification_live_progress_value.setText(f"Verification {index} / {total}: {label} {script_name}")
+            _set_text_if_changed(self.verification_live_progress_value, f"Verification {index} / {total}: {label} {script_name}")
             self._append_report_output(message)
 
     def _on_task_running_changed(self, running: bool) -> None:
@@ -1752,7 +1781,7 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(pdf_selected and not self._task_running and not running_status)
         self.resume_button.setEnabled(session_available and not self._task_running and status_name in resumable_statuses)
         self.pause_button.setEnabled(running_status and not pause_requested)
-        self.pause_button.setText("Pause Requested" if pause_requested and running_status else "Pause Audit")
+        _set_text_if_changed(self.pause_button, "Pause Requested" if pause_requested and running_status else "Pause Audit")
         self.cancel_current_button.setEnabled(
             session_available
             and pending_response
@@ -2197,7 +2226,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_raw_discussion_output(self, scroll_to_turn_index: Optional[int] = None) -> None:
         transcript = self._discussion_transcript_text()
-        self.answer_raw_output.setPlainText(transcript)
+        _set_plain_text_preserving_scroll(self.answer_raw_output, transcript)
         if scroll_to_turn_index is None:
             return
         turn_index = max(0, min(int(scroll_to_turn_index), len(self._discussion_transcript_parts) - 1))
@@ -2270,6 +2299,14 @@ class MainWindow(QMainWindow):
 
     def _refresh_rendered_discussion_output(self, scroll_to_bottom: bool = False) -> None:
         transcript = self._discussion_transcript_text()
+        rendered_html = self._render_discussion_markdown_html(transcript)
+        base_url = QUrl.fromLocalFile(str(Path(__file__).resolve().parent) + "/")
+        html_unchanged = getattr(self, "_last_rendered_discussion_html", None) == rendered_html
+        base_url_unchanged = getattr(self, "_last_rendered_discussion_base_url", None) == base_url.toString()
+        if html_unchanged and base_url_unchanged:
+            if scroll_to_bottom:
+                QTimer.singleShot(0, self._scroll_rendered_discussion_to_bottom)
+            return
         if scroll_to_bottom:
             def scroll_after_load(_ok: bool = False) -> None:
                 try:
@@ -2280,10 +2317,9 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(900, self._scroll_rendered_discussion_to_bottom)
 
             self.answer_rendered_output.loadFinished.connect(scroll_after_load)
-        self.answer_rendered_output.setHtml(
-            self._render_discussion_markdown_html(transcript),
-            QUrl.fromLocalFile(str(Path(__file__).resolve().parent) + "/"),
-        )
+        self._last_rendered_discussion_html = rendered_html
+        self._last_rendered_discussion_base_url = base_url.toString()
+        self.answer_rendered_output.setHtml(rendered_html, base_url)
 
     def _scroll_rendered_discussion_to_bottom(self) -> None:
         self.answer_rendered_output.page().runJavaScript(
