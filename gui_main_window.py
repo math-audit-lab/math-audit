@@ -1334,11 +1334,15 @@ class MainWindow(QMainWindow):
             preview = ", ".join(str(chunk_id) for chunk_id in failed_chunk_ids[:6])
             if failed_count > 6:
                 preview += ", ..."
-            self.failed_verification_summary_value.setPlainText(
+            _set_plain_text_preserving_scroll(
+                self.failed_verification_summary_value,
                 f"{failed_count} chunk(s), {failed_result_count} result(s): {preview}"
             )
         else:
-            self.failed_verification_summary_value.setPlainText("No failed verification results")
+            _set_plain_text_preserving_scroll(
+                self.failed_verification_summary_value,
+                "No failed verification results",
+            )
         self._set_failed_verification_rerun_compact(failed_count)
 
         scripts_total = int(verification_suite.get("scripts_total", 0) or 0)
