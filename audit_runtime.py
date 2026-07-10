@@ -753,6 +753,11 @@ _REPORT_MATH_AGGREGATE_DOUBLE_SCRIPT_RE = re.compile(
     r"\\(?:sum|prod|iiint|iint|int|limsup|liminf|lim)(?![A-Za-z])\s*_"
     r"(?:\{(?:[^{}]|\{[^{}]*\})*\}|\\[A-Za-z]+|[A-Za-z0-9+\-]+)\s*(?<!\\)_"
 )
+_REPORT_MATH_SERIALIZATION_ARTIFACT_RE = re.compile(
+    r"(?:\"\];\s*\}|"
+    r"\}\s*\[0\]\s*if\s+False\s+else\s+\[\]|"
+    r"\[0m)"
+)
 _SERIOUS_LATEX_LOG_PATTERNS = (
     "Undefined control sequence",
     "Missing $ inserted",
@@ -797,6 +802,8 @@ def _report_math_span_has_suspicious_command(text: str) -> bool:
     if _REPORT_MATH_REPEATED_SUBSCRIPT_RE.search(text) or _REPORT_MATH_REPEATED_SUPERSCRIPT_RE.search(text):
         return True
     if _REPORT_MATH_AGGREGATE_DOUBLE_SCRIPT_RE.search(text):
+        return True
+    if _REPORT_MATH_SERIALIZATION_ARTIFACT_RE.search(text):
         return True
     for match in _REPORT_LATEX_COMMAND_RE.finditer(text):
         command = match.group(1)

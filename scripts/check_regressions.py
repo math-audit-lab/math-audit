@@ -1600,6 +1600,19 @@ def test_report_latex_unicode_math_safety() -> None:
         _assert(r"\textbackslash{}wed" in rendered_jnt, rendered_jnt)
         _assert(r"\textbackslash{}bi" in rendered_jnt, rendered_jnt)
 
+        lmj_serialization_artifacts = (
+            r"The report contains $r\"]; }[0] if False else [] <=q-1$, "
+            r"$a\"]; }[0] if False else [] >=210$, "
+            r"$a\"]; }[0] if False else []>=3$, and "
+            r"$q_1,[0m\ldots,q_r$."
+        )
+        rendered_lmj_serialization = renderer(lmj_serialization_artifacts)
+        _assert(r"\texttt{" in rendered_lmj_serialization, rendered_lmj_serialization)
+        _assert(r"$r\"];" not in rendered_lmj_serialization, rendered_lmj_serialization)
+        _assert(r"$a\"];" not in rendered_lmj_serialization, rendered_lmj_serialization)
+        _assert(r"$q_1,[0m\ldots,q_r$" not in rendered_lmj_serialization, rendered_lmj_serialization)
+        _assert(r"\textbackslash{}ldots" in rendered_lmj_serialization, rendered_lmj_serialization)
+
         lmj_dangling_subscript = r"LMJ extracted notation produced $S^+_$ in a ledger item."
         rendered_lmj_dangling = renderer(lmj_dangling_subscript)
         _assert("$S^+_$" not in rendered_lmj_dangling, rendered_lmj_dangling)
