@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import re
 import subprocess
@@ -9,10 +10,43 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from audit_state import load_json, load_session_from_pdf, save_json, session_paths, utc_now
+from audit_state import append_jsonl, load_issues, load_json, load_session_from_pdf, save_json, session_paths, utc_now
 
 
 _VERIFICATION_SCRIPT_RE = re.compile(r"^(chunk_\d+)_check_\d+\.py$")
+VERIFICATION_RESULT_SENTINEL = "MATH_AUDIT_VERIFICATION_RESULT_JSON="
+VERIFICATION_RESULT_SCHEMA_VERSION = 1
+VERIFICATION_EXECUTION_STATUSES = {
+    "completed",
+    "runtime_error",
+    "timeout",
+    "parse_error",
+    "unsafe",
+    "skipped",
+    "not_run",
+}
+VERIFICATION_MATHEMATICAL_OUTCOMES = {
+    "counterexample_found",
+    "claim_failed",
+    "no_counterexample_found",
+    "check_satisfied",
+    "diagnostic_only",
+    "inconclusive",
+    "not_reported",
+}
+NEGATIVE_VERIFICATION_OUTCOMES = {"counterexample_found", "claim_failed"}
+TECHNICAL_VERIFICATION_FAILURE_STATUSES = {"runtime_error", "timeout", "parse_error"}
+_LEGACY_FAILURE_LIST_RE = re.compile(
+    r"^\s*(?P<label>[^:\n]{0,160}?\b(?:counterexamples|(?:finite\s+)?failures|failed\s+cases))\s*:\s*(?P<value>\[.*\])\s*$",
+    flags=re.IGNORECASE,
+)
+_TARGET_REFERENCE_RE = re.compile(
+    r"\b(?P<kind>Theorem|Lemma|Proposition|Corollary|Equation|Identity|Claim)\s+(?P<label>[A-Za-z0-9.()_-]+)",
+    flags=re.IGNORECASE,
+)
+_TESTED_RANGE_RE = re.compile(
+    r"(?P<minimum>-?\d+)\s*(?:<=|≤|\\leq?|\\le)\s*(?P<variable>[A-Za-z][A-Za-z0-9_]*)\s*(?:<=|≤|\\leq?|\\le)\s*(?P<maximum>-?\d+)"
+)
 _DANGEROUS_VERIFICATION_IMPORTS = {"subprocess", "socket", "requests", "urllib", "http", "ftplib", "telnetlib"}
 _DANGEROUS_VERIFICATION_SIMPLE_CALLS = {"eval", "exec", "compile", "__import__"}
 _DANGEROUS_VERIFICATION_FULL_CALLS = {
@@ -112,7 +146,19 @@ def _collect_verification_scripts(session: dict[str, Any], only_script_names: Op
     for rec in _read_chunk_records_for_verification(session):
         chunk_id = str(rec.get("chunk_id") or "")
         chunk_index = int(rec.get("chunk_index") or _chunk_index_from_chunk_id(chunk_id))
-        for raw_path in rec.get("python_paths", []) or []:
+        checks: list[dict[str, Any]] = []
+        structured_path = rec.get("structured_response_path")
+        if structured_path:
+            try:
+                structured = load_json(structured_path)
+                audit_payload = structured.get("audit") if isinstance(structured, dict) else None
+                if not isinstance(audit_payload, dict) and isinstance(structured, dict):
+                    audit_payload = structured
+                raw_checks = audit_payload.get("python_checks", []) if isinstance(audit_payload, dict) else []
+                checks = [item for item in raw_checks if isinstance(item, dict)]
+            except Exception:
+                checks = []
+        for check_index, raw_path in enumerate(rec.get("python_paths", []) or []):
             script_name = Path(str(raw_path)).name
             if only_script_names and script_name not in only_script_names:
                 continue
@@ -125,6 +171,11 @@ def _collect_verification_scripts(session: dict[str, Any], only_script_names: Op
             resolved = _resolve_verification_script_path(session, raw_path)
             if resolved is not None:
                 entry["script_path"] = str(resolved)
+            if check_index < len(checks):
+                check = checks[check_index]
+                entry["purpose"] = str(check.get("purpose") or "").strip()
+                entry["description"] = str(check.get("description") or "").strip()
+                entry["expected_outcome"] = str(check.get("expected_outcome") or "").strip()
             scripts[script_name] = entry
     current_dir = root / "python_checks"
     if current_dir.exists():
@@ -393,7 +444,296 @@ def _truncate_text(text: str, limit: int = 600) -> str:
     return text[:limit].rstrip() + "\n..."
 
 
+def _target_from_text(*values: Any) -> dict[str, str]:
+    for value in values:
+        match = _TARGET_REFERENCE_RE.search(str(value or ""))
+        if match:
+            kind = match.group("kind").title()
+            label = match.group("label")
+            return {"kind": kind.lower(), "label": f"{kind} {label}"}
+    return {}
+
+
+def _tested_range_from_text(*values: Any) -> Optional[dict[str, Any]]:
+    for value in values:
+        match = _TESTED_RANGE_RE.search(str(value or ""))
+        if match:
+            return {
+                "variable": match.group("variable"),
+                "minimum": int(match.group("minimum")),
+                "maximum": int(match.group("maximum")),
+                "source": "text_inference",
+            }
+    return None
+
+
+def _verification_metadata_from_entry(entry: Optional[dict[str, Any]]) -> dict[str, Any]:
+    entry = entry if isinstance(entry, dict) else {}
+    target = _target_from_text(entry.get("purpose"), entry.get("description"), entry.get("expected_outcome"))
+    return {
+        "purpose": str(entry.get("purpose") or "").strip(),
+        "description": str(entry.get("description") or "").strip(),
+        "expected_outcome": str(entry.get("expected_outcome") or "").strip(),
+        "target": target,
+    }
+
+
+def _validate_structured_verification_payload(payload: Any) -> tuple[Optional[dict[str, Any]], str]:
+    if not isinstance(payload, dict):
+        return None, "verification result sentinel must contain a JSON object"
+    required = {"schema_version", "check_kind", "outcome", "summary"}
+    missing = sorted(required - set(payload))
+    if missing:
+        return None, "verification result is missing required field(s): " + ", ".join(missing)
+    if payload.get("schema_version") != VERIFICATION_RESULT_SCHEMA_VERSION:
+        return None, f"unsupported verification result schema_version: {payload.get('schema_version')!r}"
+    check_kind = str(payload.get("check_kind") or "").strip()
+    if not check_kind:
+        return None, "verification result check_kind must be nonempty"
+    outcome = str(payload.get("outcome") or "").strip().lower()
+    if outcome not in VERIFICATION_MATHEMATICAL_OUTCOMES:
+        return None, f"unsupported mathematical outcome: {outcome or '(empty)'}"
+    if not isinstance(payload.get("summary"), str):
+        return None, "verification result summary must be a string"
+    for list_key in ("counterexamples", "failed_cases", "linked_issue_ids"):
+        if list_key in payload and not isinstance(payload.get(list_key), list):
+            return None, f"verification result {list_key} must be a list"
+    if outcome in NEGATIVE_VERIFICATION_OUTCOMES:
+        cases = list(payload.get("counterexamples") or []) + list(payload.get("failed_cases") or [])
+        if not cases:
+            return None, f"{outcome} requires a nonempty counterexamples or failed_cases list"
+    normalized = dict(payload)
+    normalized["check_kind"] = check_kind
+    normalized["outcome"] = outcome
+    normalized["summary"] = payload.get("summary", "").strip()
+    normalized.setdefault("counterexamples", [])
+    normalized.setdefault("failed_cases", [])
+    normalized.setdefault("linked_issue_ids", [])
+    normalized.setdefault("tested_range", payload.get("tested_scope"))
+    normalized.setdefault("target", {})
+    return normalized, ""
+
+
+def _parse_verification_result_sentinel(stdout: str) -> tuple[Optional[dict[str, Any]], str, int]:
+    sentinel_values = [
+        line.split(VERIFICATION_RESULT_SENTINEL, 1)[1].strip()
+        for line in (stdout or "").splitlines()
+        if line.startswith(VERIFICATION_RESULT_SENTINEL)
+    ]
+    if not sentinel_values:
+        return None, "", 0
+    if len(sentinel_values) != 1:
+        return None, f"expected exactly one verification result sentinel, found {len(sentinel_values)}", len(sentinel_values)
+    try:
+        payload = json.loads(sentinel_values[0])
+    except Exception as exc:
+        return None, f"could not parse verification result sentinel JSON: {type(exc).__name__}: {exc}", 1
+    payload, error = _validate_structured_verification_payload(payload)
+    return payload, error, 1
+
+
+def _json_safe_legacy_case(value: Any) -> Any:
+    if isinstance(value, tuple):
+        return [_json_safe_legacy_case(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe_legacy_case(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe_legacy_case(item) for key, item in value.items()}
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _normalize_legacy_counterexample(value: Any, label: str) -> Any:
+    safe = _json_safe_legacy_case(value)
+    if (
+        "theorem 3" in label.lower()
+        and isinstance(safe, list)
+        and len(safe) >= 2
+        and isinstance(safe[0], int)
+        and isinstance(safe[1], int)
+    ):
+        item: dict[str, Any] = {
+            "a": safe[0],
+            "omega_sigma": safe[1],
+            "omega_input": safe[0],
+            "legacy_values": safe,
+        }
+        if len(safe) >= 3 and isinstance(safe[2], dict):
+            item["factorization"] = safe[2]
+        return item
+    return {"legacy_values": safe}
+
+
+def _parse_legacy_verification_stdout(stdout: str) -> Optional[dict[str, Any]]:
+    parsed_records: list[dict[str, Any]] = []
+    for line in (stdout or "").splitlines():
+        match = _LEGACY_FAILURE_LIST_RE.match(line)
+        if not match:
+            continue
+        try:
+            value = ast.literal_eval(match.group("value"))
+        except (SyntaxError, ValueError):
+            continue
+        if not isinstance(value, (list, tuple)):
+            continue
+        label = match.group("label").strip()
+        parsed_records.append({"label": label, "cases": list(value)})
+    if not parsed_records:
+        return None
+    nonempty = [record for record in parsed_records if record["cases"]]
+    if nonempty:
+        counterexamples = [
+            _normalize_legacy_counterexample(case, record["label"])
+            for record in nonempty
+            for case in record["cases"]
+        ]
+        labels = "; ".join(record["label"] for record in nonempty)
+        target = _target_from_text(*(record["label"] for record in nonempty))
+        return {
+            "schema_version": 0,
+            "check_kind": "legacy_failure_list",
+            "outcome": "counterexample_found",
+            "summary": f"Legacy verification output reported nonempty failure data: {labels}.",
+            "counterexamples": counterexamples,
+            "failed_cases": [],
+            "target": target,
+            "tested_range": None,
+            "linked_issue_ids": [],
+            "legacy_records": [
+                {"label": record["label"], "cases": _json_safe_legacy_case(record["cases"])}
+                for record in parsed_records
+            ],
+        }
+    labels = "; ".join(record["label"] for record in parsed_records)
+    return {
+        "schema_version": 0,
+        "check_kind": "legacy_failure_list",
+        "outcome": "no_counterexample_found",
+        "summary": f"Legacy verification output reported empty failure lists: {labels}. This is limited to the tested scope.",
+        "counterexamples": [],
+        "failed_cases": [],
+        "target": _target_from_text(*(record["label"] for record in parsed_records)),
+        "tested_range": None,
+        "linked_issue_ids": [],
+        "legacy_records": [
+            {"label": record["label"], "cases": []}
+            for record in parsed_records
+        ],
+    }
+
+
+def _legacy_execution_status(status: Any, skip_reason: str = "") -> str:
+    status = str(status or "").strip().lower()
+    if status in VERIFICATION_EXECUTION_STATUSES:
+        return status
+    if status == "passed":
+        return "completed"
+    if status == "failed":
+        return "runtime_error"
+    if status == "timeout":
+        return "timeout"
+    if status == "skipped":
+        return "unsafe" if skip_reason else "skipped"
+    return "not_run"
+
+
+def _normalize_verification_result(
+    raw_result: dict[str, Any],
+    script_entry: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    result = dict(raw_result or {})
+    metadata = _verification_metadata_from_entry(script_entry)
+    for key, value in metadata.items():
+        if value and not result.get(key):
+            result[key] = value
+    execution_status = str(result.get("execution_status") or "").strip().lower()
+    if execution_status not in VERIFICATION_EXECUTION_STATUSES:
+        execution_status = _legacy_execution_status(result.get("status"), str(result.get("skip_reason") or ""))
+        if execution_status == "not_run" and result.get("returncode") is not None:
+            try:
+                execution_status = "completed" if int(result.get("returncode")) == 0 else "runtime_error"
+            except (TypeError, ValueError):
+                execution_status = "not_run"
+    result["execution_status"] = execution_status
+
+    existing_outcome = str(result.get("mathematical_outcome") or "").strip().lower()
+    if existing_outcome in VERIFICATION_MATHEMATICAL_OUTCOMES:
+        result.setdefault("outcome_source", "structured_result" if result.get("structured_result") else "saved_result")
+        return result
+
+    if execution_status == "completed":
+        payload, parse_error, sentinel_count = _parse_verification_result_sentinel(str(result.get("stdout") or ""))
+        result["sentinel_count"] = sentinel_count
+        if parse_error:
+            result["execution_status"] = "parse_error"
+            result["mathematical_outcome"] = "not_reported"
+            result["outcome_source"] = "malformed_structured_result"
+            result["outcome_parse_error"] = parse_error
+        elif payload is not None:
+            result["structured_result"] = payload
+            result["mathematical_outcome"] = payload["outcome"]
+            result["outcome_source"] = "structured_sentinel"
+            result["counterexamples"] = list(payload.get("counterexamples") or [])
+            result["failed_cases"] = list(payload.get("failed_cases") or [])
+            result["tested_range"] = payload.get("tested_range")
+            result["target"] = payload.get("target") or result.get("target") or {}
+            result["linked_issue_ids"] = list(payload.get("linked_issue_ids") or [])
+            if payload.get("summary"):
+                result["conclusion"] = payload["summary"]
+        else:
+            legacy = _parse_legacy_verification_stdout(str(result.get("stdout") or ""))
+            if legacy is not None:
+                result["structured_result"] = legacy
+                result["mathematical_outcome"] = legacy["outcome"]
+                result["outcome_source"] = "legacy_stdout_inference"
+                result["counterexamples"] = list(legacy.get("counterexamples") or [])
+                result["failed_cases"] = list(legacy.get("failed_cases") or [])
+                result["target"] = legacy.get("target") or result.get("target") or {}
+                result["linked_issue_ids"] = list(legacy.get("linked_issue_ids") or [])
+                if legacy.get("summary"):
+                    result["conclusion"] = legacy["summary"]
+            else:
+                result["mathematical_outcome"] = "not_reported"
+                result["outcome_source"] = "no_structured_result"
+    elif execution_status in {"runtime_error", "timeout", "parse_error"}:
+        result["mathematical_outcome"] = "inconclusive"
+        result["outcome_source"] = "execution_incomplete"
+    else:
+        result["mathematical_outcome"] = "not_reported"
+        result["outcome_source"] = "not_executed"
+
+    result.setdefault("counterexamples", [])
+    result.setdefault("failed_cases", [])
+    result.setdefault("linked_issue_ids", [])
+    result.setdefault("target", metadata.get("target") or {})
+    if not result.get("tested_range"):
+        result["tested_range"] = _tested_range_from_text(
+            result.get("stdout"),
+            result.get("description"),
+            result.get("expected_outcome"),
+        )
+    return result
+
+
+def _legacy_status_for_execution(execution_status: str) -> str:
+    if execution_status == "completed":
+        return "passed"
+    if execution_status == "timeout":
+        return "timeout"
+    if execution_status in {"runtime_error", "parse_error"}:
+        return "failed"
+    return "skipped"
+
+
 def _infer_verification_conclusion(result: dict[str, Any]) -> str:
+    result = _normalize_verification_result(result)
+    outcome = result.get("mathematical_outcome")
+    structured = result.get("structured_result") if isinstance(result.get("structured_result"), dict) else {}
+    if structured.get("summary"):
+        return str(structured["summary"])
+    if result.get("outcome_parse_error"):
+        return str(result.get("outcome_parse_error"))
     status = result.get("status")
     stdout_line = _first_nonempty_line(result.get("stdout", ""))
     stderr_line = _first_nonempty_line(result.get("stderr", ""))
@@ -408,14 +748,283 @@ def _infer_verification_conclusion(result: dict[str, Any]) -> str:
     return stdout_line or stderr_line or "No conclusion available."
 
 
-def _verification_summary_counts(results: list[dict[str, Any]]) -> dict[str, int]:
-    counts = {"scripts_total": len(results), "passed": 0, "failed": 0, "timeout": 0, "skipped": 0}
-    for result in results:
-        status = str(result.get("status") or "skipped")
-        if status not in counts:
-            counts[status] = 0
-        counts[status] += 1
+def _verification_summary_counts(results: list[dict[str, Any]]) -> dict[str, Any]:
+    execution = {key: 0 for key in sorted(VERIFICATION_EXECUTION_STATUSES)}
+    outcomes = {key: 0 for key in sorted(VERIFICATION_MATHEMATICAL_OUTCOMES)}
+    for raw_result in results:
+        result = _normalize_verification_result(raw_result)
+        execution[result["execution_status"]] += 1
+        outcomes[result["mathematical_outcome"]] += 1
+    counts: dict[str, Any] = {
+        "scripts_total": len(results),
+        "execution_summary": execution,
+        "mathematical_outcome_summary": outcomes,
+        "negative_mathematical_findings": sum(outcomes[key] for key in NEGATIVE_VERIFICATION_OUTCOMES),
+        "mathematically_unresolved": outcomes["diagnostic_only"] + outcomes["inconclusive"] + outcomes["not_reported"],
+        "all_mathematical_checks_satisfied": bool(results)
+        and not sum(outcomes[key] for key in NEGATIVE_VERIFICATION_OUTCOMES)
+        and not (outcomes["diagnostic_only"] + outcomes["inconclusive"] + outcomes["not_reported"]),
+        # Backward-compatible execution aliases. User-facing output must not call these mathematical pass/fail counts.
+        "passed": execution["completed"],
+        "failed": execution["runtime_error"] + execution["parse_error"],
+        "timeout": execution["timeout"],
+        "skipped": execution["skipped"] + execution["unsafe"] + execution["not_run"],
+    }
+    for key, value in execution.items():
+        counts[f"execution_{key}"] = value
+    for key, value in outcomes.items():
+        counts[f"outcome_{key}"] = value
     return counts
+
+
+def _verification_findings_path(session: dict[str, Any]) -> Path:
+    return session_paths(session["workdir"])["verification_findings"]
+
+
+def _verification_target_label(result: dict[str, Any]) -> str:
+    target = result.get("target")
+    if isinstance(target, dict):
+        return str(target.get("label") or target.get("name") or "").strip()
+    return str(target or "").strip()
+
+
+def _matching_issue_ids_for_verification(session: dict[str, Any], result: dict[str, Any]) -> list[str]:
+    explicit = [str(item).strip() for item in (result.get("linked_issue_ids") or []) if str(item).strip()]
+    try:
+        issues = [item for item in (load_issues(session).get("issues") or []) if isinstance(item, dict)]
+    except Exception:
+        return explicit
+    valid_ids = {str(item.get("issue_id") or "").strip() for item in issues}
+    explicit = [item for item in explicit if item in valid_ids]
+    if explicit:
+        return explicit
+
+    target = _verification_target_label(result).lower()
+    purpose = str(result.get("purpose") or "").lower()
+    chunk_id = str(result.get("chunk_id") or "").strip()
+    scored: list[tuple[int, str]] = []
+    for issue in issues:
+        issue_id = str(issue.get("issue_id") or "").strip()
+        if not issue_id:
+            continue
+        title = str(issue.get("title") or "").lower()
+        location = str(issue.get("location") or "").lower()
+        description = str(issue.get("description") or "").lower()
+        score = 0
+        if target:
+            score += 4 if target in title else 0
+            score += 3 if target in location else 0
+            score += 1 if target in description else 0
+        if chunk_id and str(issue.get("chunk_id") or "").strip() == chunk_id:
+            score += 1
+        for word in ("finite", "counterexample", "computation", "check"):
+            if word in purpose and word in title:
+                score += 2
+        if score >= 5:
+            scored.append((score, issue_id))
+    if not scored:
+        return []
+    best = max(score for score, _ in scored)
+    return sorted(issue_id for score, issue_id in scored if score == best)
+
+
+def _verification_finding_from_result(session: dict[str, Any], raw_result: dict[str, Any]) -> Optional[dict[str, Any]]:
+    result = _normalize_verification_result(raw_result)
+    outcome = str(result.get("mathematical_outcome") or "")
+    if outcome not in NEGATIVE_VERIFICATION_OUTCOMES:
+        return None
+    script_name = str(result.get("script_name") or "verification script").strip()
+    chunk_id = str(result.get("chunk_id") or "").strip()
+    target_label = _verification_target_label(result)
+    counterexamples = list(result.get("counterexamples") or [])
+    failed_cases = list(result.get("failed_cases") or [])
+    identity_material = json.dumps(
+        {
+            "script_name": script_name,
+            "chunk_id": chunk_id,
+            "outcome": outcome,
+            "target": target_label,
+            "counterexamples": counterexamples,
+            "failed_cases": failed_cases,
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+    )
+    finding_id = "VF-" + hashlib.sha256(identity_material.encode("utf-8")).hexdigest()[:12].upper()
+    title_target = target_label or "a checked claim"
+    title = (
+        f"Counterexample found for {title_target}"
+        if outcome == "counterexample_found"
+        else f"Verification check reports failure of {title_target}"
+    )
+    summary = str(result.get("conclusion") or "").strip()
+    evidence_parts = [
+        f"{script_name} executed with status {result.get('execution_status')} and reported outcome {outcome}.",
+    ]
+    if summary:
+        evidence_parts.append(summary)
+    if counterexamples:
+        preview = counterexamples[:5]
+        suffix = f" (showing 5 of {len(counterexamples)})" if len(counterexamples) > 5 else ""
+        evidence_parts.append(
+            "Structured counterexamples"
+            + suffix
+            + ": "
+            + json.dumps(preview, ensure_ascii=False, sort_keys=True)
+        )
+    if failed_cases:
+        preview = failed_cases[:5]
+        suffix = f" (showing 5 of {len(failed_cases)})" if len(failed_cases) > 5 else ""
+        evidence_parts.append(
+            "Structured failed cases"
+            + suffix
+            + ": "
+            + json.dumps(preview, ensure_ascii=False, sort_keys=True)
+        )
+    matched_issue_ids = _matching_issue_ids_for_verification(session, result)
+    return {
+        "finding_id": finding_id,
+        "source": "verification",
+        "verification_derived": True,
+        "provisional": True,
+        "active": True,
+        "severity": "high",
+        "title": title,
+        "description": (
+            f"A local verification check produced a negative mathematical outcome for {title_target}. "
+            "The result requires human mathematical review and must not be treated as a mere execution failure."
+        ),
+        "evidence": " ".join(evidence_parts),
+        "recommended_action": "Check the script and mathematical claim independently; if confirmed, correct the claim and all dependent arguments.",
+        "script_name": script_name,
+        "script_path": str(result.get("script_path") or ""),
+        "result_path": str(result.get("result_path") or ""),
+        "chunk_id": chunk_id,
+        "target": result.get("target") or {},
+        "location": target_label or chunk_id or "verification output",
+        "execution_status": result.get("execution_status"),
+        "mathematical_outcome": outcome,
+        "outcome_source": result.get("outcome_source"),
+        "check_kind": (result.get("structured_result") or {}).get("check_kind") if isinstance(result.get("structured_result"), dict) else "",
+        "summary": summary,
+        "counterexamples": counterexamples,
+        "failed_cases": failed_cases,
+        "tested_range": result.get("tested_range"),
+        "linked_issue_ids": list(result.get("linked_issue_ids") or []),
+        "matched_issue_ids": matched_issue_ids,
+    }
+
+
+def verification_findings_for_session(
+    session: dict[str, Any],
+    results: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    active_results = _load_verification_results(session) if results is None else results
+    findings = [
+        finding
+        for result in active_results
+        for finding in [_verification_finding_from_result(session, result)]
+        if finding is not None
+    ]
+    findings.sort(key=lambda item: (_chunk_index_from_chunk_id(str(item.get("chunk_id") or "")), str(item.get("script_name") or "")))
+    return findings
+
+
+def _persist_verification_findings(
+    session: dict[str, Any],
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    path = _verification_findings_path(session)
+    previous: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = load_json(path)
+            previous = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            previous = {}
+    previous_findings = {
+        str(item.get("finding_id") or ""): item
+        for item in (previous.get("findings") or [])
+        if isinstance(item, dict) and item.get("finding_id")
+    }
+    findings = verification_findings_for_session(session, results=results)
+    current_findings = {str(item.get("finding_id")): item for item in findings}
+    history_path = Path(session["workdir"]) / "logs" / "verification_finding_events.jsonl"
+    for finding_id in sorted(current_findings.keys() - previous_findings.keys()):
+        append_jsonl(
+            history_path,
+            {
+                "time": utc_now(),
+                "action": "verification_finding_activated",
+                "finding_id": finding_id,
+                "script_name": current_findings[finding_id].get("script_name"),
+                "chunk_id": current_findings[finding_id].get("chunk_id"),
+                "mathematical_outcome": current_findings[finding_id].get("mathematical_outcome"),
+            },
+        )
+    for finding_id in sorted(previous_findings.keys() - current_findings.keys()):
+        append_jsonl(
+            history_path,
+            {
+                "time": utc_now(),
+                "action": "verification_finding_superseded",
+                "finding_id": finding_id,
+                "script_name": previous_findings[finding_id].get("script_name"),
+                "chunk_id": previous_findings[finding_id].get("chunk_id"),
+                "reason": "latest canonical verification results no longer contain this negative outcome",
+            },
+        )
+    sidecar = {
+        "schema_version": 1,
+        "updated_at": utc_now(),
+        "findings": findings,
+        "active_finding_count": len(findings),
+    }
+    save_json(path, sidecar)
+    return sidecar
+
+
+def supersede_verification_findings_for_chunks(session: dict[str, Any], chunk_ids: set[str]) -> dict[str, Any]:
+    path = _verification_findings_path(session)
+    if not path.exists():
+        return {"superseded_finding_count": 0, "superseded_finding_ids": []}
+    try:
+        sidecar = load_json(path)
+    except Exception:
+        return {"superseded_finding_count": 0, "superseded_finding_ids": []}
+    if not isinstance(sidecar, dict):
+        return {"superseded_finding_count": 0, "superseded_finding_ids": []}
+    findings = [item for item in (sidecar.get("findings") or []) if isinstance(item, dict)]
+    removed = [item for item in findings if str(item.get("chunk_id") or "") in chunk_ids]
+    if not removed:
+        return {"superseded_finding_count": 0, "superseded_finding_ids": []}
+    kept = [item for item in findings if str(item.get("chunk_id") or "") not in chunk_ids]
+    sidecar["findings"] = kept
+    sidecar["active_finding_count"] = len(kept)
+    sidecar["updated_at"] = utc_now()
+    save_json(path, sidecar)
+    history_path = Path(session["workdir"]) / "logs" / "verification_finding_events.jsonl"
+    for finding in removed:
+        append_jsonl(
+            history_path,
+            {
+                "time": utc_now(),
+                "action": "verification_finding_superseded",
+                "finding_id": finding.get("finding_id"),
+                "script_name": finding.get("script_name"),
+                "chunk_id": finding.get("chunk_id"),
+                "reason": "source chunk selected for rerun",
+            },
+        )
+    return {
+        "superseded_finding_count": len(removed),
+        "superseded_finding_ids": [str(item.get("finding_id") or "") for item in removed],
+    }
+
+
+def verification_result_needs_technical_retry(result: dict[str, Any]) -> bool:
+    normalized = _normalize_verification_result(result)
+    return str(normalized.get("execution_status") or "") in TECHNICAL_VERIFICATION_FAILURE_STATUSES
 
 
 def _load_verification_results(session: dict[str, Any], state: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
@@ -423,8 +1032,11 @@ def _load_verification_results(session: dict[str, Any], state: Optional[dict[str
     results = []
     seen = set()
     for item in state.get("results", []) or []:
+        if not isinstance(item, dict):
+            continue
         result_path = item.get("result_path")
         if not result_path:
+            results.append(dict(item))
             continue
         path = Path(result_path)
         if not path.exists():
@@ -445,8 +1057,24 @@ def _load_verification_results(session: dict[str, Any], state: Optional[dict[str
             data = load_json(path)
             if isinstance(data, dict):
                 results.append(data)
-    results.sort(key=lambda item: (int(item.get("chunk_index") or _chunk_index_from_chunk_id(item.get("chunk_id", ""))), item.get("script_name", "")))
-    return results
+    script_entries = {
+        str(item.get("script_name") or ""): item
+        for item in _collect_verification_scripts(session)
+        if str(item.get("script_name") or "")
+    }
+    normalized_results = [
+        _normalize_verification_result(item, script_entries.get(str(item.get("script_name") or "")))
+        for item in results
+    ]
+    canonical_by_key: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(normalized_results):
+        script_name = str(item.get("script_name") or "").strip()
+        chunk_id = str(item.get("chunk_id") or "").strip()
+        key = f"{chunk_id}:{script_name}" if script_name else str(item.get("result_path") or f"inline:{index}")
+        canonical_by_key[key] = item
+    canonical_results = list(canonical_by_key.values())
+    canonical_results.sort(key=lambda item: (int(item.get("chunk_index") or _chunk_index_from_chunk_id(item.get("chunk_id", ""))), item.get("script_name", "")))
+    return canonical_results
 
 
 def _run_verification_scripts(
@@ -455,6 +1083,7 @@ def _run_verification_scripts(
     timeout: int = 120,
     safe_only: bool = True,
     progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    replace_all_results: bool = True,
 ) -> dict[str, Any]:
     root = Path(session["workdir"])
     started_at = utc_now()
@@ -489,8 +1118,15 @@ def _run_verification_scripts(
             "stderr": "",
             "elapsed_seconds": 0.0,
             "status": "skipped",
+            "execution_status": "not_run",
+            "mathematical_outcome": "",
+            "outcome_source": "",
             "skip_reason": "",
             "conclusion": "",
+            "purpose": str(entry.get("purpose") or "").strip(),
+            "description": str(entry.get("description") or "").strip(),
+            "expected_outcome": str(entry.get("expected_outcome") or "").strip(),
+            "target": _verification_metadata_from_entry(entry).get("target") or {},
         }
         start = time.time()
         if script_path is None or not script_path.exists():
@@ -512,20 +1148,42 @@ def _run_verification_scripts(
                     result["returncode"] = int(completed.returncode)
                     result["stdout"] = completed.stdout or ""
                     result["stderr"] = completed.stderr or ""
-                    result["status"] = "passed" if completed.returncode == 0 else "failed"
+                    result["execution_status"] = "completed" if completed.returncode == 0 else "runtime_error"
                 except subprocess.TimeoutExpired as e:
                     result["stdout"] = e.stdout or ""
                     result["stderr"] = e.stderr or ""
-                    result["status"] = "timeout"
+                    result["execution_status"] = "timeout"
                 except Exception as e:
                     result["stderr"] = repr(e)
-                    result["status"] = "failed"
+                    result["execution_status"] = "runtime_error"
         result["elapsed_seconds"] = max(0.0, time.time() - start)
         if result["skip_reason"]:
-            result["status"] = "skipped"
+            result["execution_status"] = "unsafe" if safe_only and script_path is not None else "skipped"
+        result = _normalize_verification_result(result, entry)
+        result["status"] = _legacy_status_for_execution(str(result.get("execution_status") or ""))
+        result["status_semantics"] = "deprecated_legacy_execution_alias"
         result["conclusion"] = _infer_verification_conclusion(result)
         result_path = _verification_result_path(session, script_name or f"script_{len(results)+1:03d}.py")
         result["result_path"] = str(result_path)
+        if result_path.exists():
+            try:
+                previous_result = _normalize_verification_result(load_json(result_path), entry)
+            except Exception:
+                previous_result = None
+            if isinstance(previous_result, dict):
+                append_jsonl(
+                    Path(session["workdir"]) / "logs" / "verification_result_events.jsonl",
+                    {
+                        "time": utc_now(),
+                        "action": "verification_result_superseded",
+                        "script_name": previous_result.get("script_name"),
+                        "chunk_id": previous_result.get("chunk_id"),
+                        "execution_status": previous_result.get("execution_status"),
+                        "mathematical_outcome": previous_result.get("mathematical_outcome"),
+                        "outcome_source": previous_result.get("outcome_source"),
+                        "result_path": str(result_path),
+                    },
+                )
         save_json(result_path, result)
         results.append(result)
         _emit_verification_progress(
@@ -536,10 +1194,29 @@ def _run_verification_scripts(
             script_name=script_name,
             chunk_id=chunk_id,
             status=result.get("status"),
+            execution_status=result.get("execution_status"),
+            mathematical_outcome=result.get("mathematical_outcome"),
             conclusion=result.get("conclusion"),
         )
-    summary = _verification_summary_counts(results)
     state = load_verification_state(session)
+    canonical_results = list(results)
+    if not replace_all_results:
+        existing_results = _load_verification_results(session, state=state)
+        replacements = {str(item.get("script_name") or ""): item for item in results}
+        canonical_by_name = {
+            str(item.get("script_name") or ""): item
+            for item in existing_results
+            if str(item.get("script_name") or "") not in replacements
+        }
+        canonical_by_name.update(replacements)
+        canonical_results = sorted(
+            canonical_by_name.values(),
+            key=lambda item: (
+                int(item.get("chunk_index") or _chunk_index_from_chunk_id(str(item.get("chunk_id") or ""))),
+                str(item.get("script_name") or ""),
+            ),
+        )
+    summary = _verification_summary_counts(canonical_results)
     state["last_run"] = {
         "started_at": started_at,
         "finished_at": utc_now(),
@@ -556,14 +1233,31 @@ def _run_verification_scripts(
             "script_path": result.get("script_path"),
             "result_path": result.get("result_path"),
             "status": result.get("status"),
+            "status_semantics": result.get("status_semantics"),
+            "execution_status": result.get("execution_status"),
+            "mathematical_outcome": result.get("mathematical_outcome"),
+            "outcome_source": result.get("outcome_source"),
+            "counterexamples": result.get("counterexamples") or [],
+            "failed_cases": result.get("failed_cases") or [],
+            "tested_range": result.get("tested_range"),
+            "target": result.get("target") or {},
+            "linked_issue_ids": result.get("linked_issue_ids") or [],
             "returncode": result.get("returncode"),
             "elapsed_seconds": result.get("elapsed_seconds"),
             "conclusion": result.get("conclusion"),
         }
-        for result in results
+        for result in canonical_results
     ]
     save_verification_state(session, state)
-    return {"session": session, "results": results, "summary": summary, "state": state}
+    findings_state = _persist_verification_findings(session, canonical_results)
+    return {
+        "session": session,
+        "results": canonical_results,
+        "executed_results": results,
+        "summary": summary,
+        "state": state,
+        "verification_findings": findings_state.get("findings", []),
+    }
 
 
 def run_verification_suite(
@@ -593,14 +1287,20 @@ def rerun_failed_verification_scripts(pdf_path: str | Path, timeout: int = 120, 
     failed_names = {
         Path(str(item.get("script_name") or item.get("script_path") or "")).name
         for item in state.get("results", []) or []
-        if item.get("status") in {"failed", "timeout"}
+        if verification_result_needs_technical_retry(item)
     }
     failed_names.discard("")
     if not failed_names:
         results = _load_verification_results(session, state=state)
         return {"session": session, "results": results, "summary": _verification_summary_counts(results), "state": state}
     scripts = _collect_verification_scripts(session, only_script_names=failed_names)
-    return _run_verification_scripts(session, scripts, timeout=int(timeout), safe_only=bool(safe_only))
+    return _run_verification_scripts(
+        session,
+        scripts,
+        timeout=int(timeout),
+        safe_only=bool(safe_only),
+        replace_all_results=False,
+    )
 
 
 def show_verification_status(pdf_path: str | Path) -> dict[str, Any]:
@@ -614,14 +1314,22 @@ def show_verification_status(pdf_path: str | Path) -> dict[str, Any]:
         print("No verification run found.")
         return {"session": session, "state": state, "results": results}
     print(f"Verification scripts: {last_run.get('scripts_total', len(results))}")
-    print(f"Passed: {last_run.get('passed', 0)}")
-    print(f"Failed: {last_run.get('failed', 0)}")
-    print(f"Timed out: {last_run.get('timeout', 0)}")
-    print(f"Skipped: {last_run.get('skipped', 0)}")
+    summary = _verification_summary_counts(results)
+    execution = summary.get("execution_summary") or {}
+    outcomes = summary.get("mathematical_outcome_summary") or {}
+    print(f"Execution completed: {execution.get('completed', 0)}")
+    print(f"Runtime errors: {execution.get('runtime_error', 0)}")
+    print(f"Timed out: {execution.get('timeout', 0)}")
+    print(f"Skipped/unsafe: {execution.get('skipped', 0) + execution.get('unsafe', 0)}")
+    print(f"Counterexamples found: {outcomes.get('counterexample_found', 0)}")
+    print(f"Claims failed: {outcomes.get('claim_failed', 0)}")
+    print(f"No counterexample found in tested scope: {outcomes.get('no_counterexample_found', 0)}")
+    print(f"Checks satisfied: {outcomes.get('check_satisfied', 0)}")
+    print(f"Inconclusive/not reported: {outcomes.get('inconclusive', 0) + outcomes.get('not_reported', 0)}")
     print(f"Timeout per script: {last_run.get('timeout_seconds', 0)}s")
     if last_run.get("finished_at"):
         print(f"Last run finished: {last_run.get('finished_at')}")
-    failing = [item for item in results if item.get("status") in {"failed", "timeout"}]
+    failing = [item for item in results if verification_result_needs_technical_retry(item)]
     if failing:
         print("Failing scripts:")
         for item in failing:
@@ -630,6 +1338,12 @@ def show_verification_status(pdf_path: str | Path) -> dict[str, Any]:
 
 
 __all__ = [
+    "VERIFICATION_RESULT_SENTINEL",
+    "VERIFICATION_RESULT_SCHEMA_VERSION",
+    "VERIFICATION_EXECUTION_STATUSES",
+    "VERIFICATION_MATHEMATICAL_OUTCOMES",
+    "NEGATIVE_VERIFICATION_OUTCOMES",
+    "TECHNICAL_VERIFICATION_FAILURE_STATUSES",
     "load_verification_state",
     "save_verification_state",
     "_verification_results_path",
@@ -645,7 +1359,13 @@ __all__ = [
     "_first_nonempty_line",
     "_truncate_text",
     "_infer_verification_conclusion",
+    "_parse_verification_result_sentinel",
+    "_parse_legacy_verification_stdout",
+    "_normalize_verification_result",
     "_verification_summary_counts",
+    "verification_findings_for_session",
+    "supersede_verification_findings_for_chunks",
+    "verification_result_needs_technical_retry",
     "_load_verification_results",
     "_run_verification_scripts",
     "run_verification_suite",

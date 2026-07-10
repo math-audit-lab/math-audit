@@ -25,6 +25,7 @@ from audit_verification import (
     _truncate_text,
     _verification_summary_counts,
     load_verification_state,
+    verification_findings_for_session,
 )
 from audit_runtime import (
     AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL,
@@ -43,6 +44,8 @@ from audit_runtime import (
     _report_math_span_has_suspicious_command,
     _strip_unsafe_control_chars,
     _verification_inventory_warning,
+    _verification_findings_markdown,
+    _verification_findings_tex,
     build_fresh_audit_context_for_chunk,
     build_verification_report as runtime_build_verification_report,
     format_list_for_markdown,
@@ -1424,6 +1427,10 @@ If you include python_checks, every item must contain:
 - expected_outcome: what output or condition would count as success
 - code: runnable local Python code
 Write the description so it can stand on its own in the final report before the script body.
+Every script must emit exactly one final line using this contract (after importing json):
+result = {{"schema_version":1,"check_kind":"counterexample_search","outcome":"counterexample_found" if failures else "no_counterexample_found","summary":"...","counterexamples":failures,"failed_cases":[],"tested_range":{{}},"target":{{}},"linked_issue_ids":[]}}
+print("MATH_AUDIT_VERIFICATION_RESULT_JSON=" + json.dumps(result, sort_keys=True))
+Use outcome counterexample_found or claim_failed when the check finds a mathematical failure. Use no_counterexample_found only for a bounded search with no found case, and state the tested scope; do not call that a proof of an unrestricted claim. Return code 0 means execution completed and may accompany a counterexample.
 
 Reference numbering status for this run:
 {ref_status_note}
@@ -2416,6 +2423,7 @@ def _build_final_report_markdown_base(session: dict[str, Any], report_title: Opt
     manifest = load_manifest(session)
     chunk_records = _read_chunk_records(session)
     issue_recheck_overlay = _build_issue_recheck_overlay(session)
+    verification_findings = verification_findings_for_session(session)
     ref_state = ensure_reference_map(session)
 
     title = report_title or f"Audit report — {Path(session['pdf_path']).stem}"
@@ -2438,8 +2446,10 @@ def _build_final_report_markdown_base(session: dict[str, Any], report_title: Opt
         "## Ledger notes",
         format_list_for_markdown(ledger.get("notes", [])),
         "",
-        "## Open issues",
     ]
+    if verification_findings:
+        lines.extend([_verification_findings_markdown(verification_findings).rstrip(), ""])
+    lines.append("## Open issues")
 
     open_issues = [x for x in issues_state["issues"] if x.get("status", "open") == "open"]
     typo_entries = _collect_typographical_issue_entries(open_issues, chunk_records, ref_state=ref_state)
@@ -2551,6 +2561,7 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
     manifest = load_manifest(session)
     chunk_records = _read_chunk_records(session)
     issue_recheck_overlay = _build_issue_recheck_overlay(session)
+    verification_findings = verification_findings_for_session(session)
     ref_state = ensure_reference_map(session)
 
     title = _report_latex_paragraph_local(report_title or f"Audit report -- {Path(session['pdf_path']).stem}")
@@ -2612,6 +2623,9 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
 
     parts.append(r"\section*{Ledger notes}" + "\n")
     parts.append(report_latex_itemize(ledger.get("notes", [])) + "\n")
+
+    if verification_findings:
+        parts.append(_verification_findings_tex(verification_findings) + "\n")
 
     parts.append(r"\section*{Open issues}" + "\n")
     open_issues = [x for x in issues_state["issues"] if x.get("status", "open") == "open"]
@@ -2797,32 +2811,76 @@ def _timing_summary_tex(session: dict[str, Any]) -> str:
     return "\n".join(parts) + "\n"
 
 
+def _verification_summary_from_state(
+    last_run: dict[str, Any],
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if results:
+        return _verification_summary_counts(results)
+    scripts_total = int(last_run.get("scripts_total", 0) or 0)
+    completed = int(last_run.get("execution_completed", last_run.get("passed", 0)) or 0)
+    runtime_errors = int(last_run.get("execution_runtime_error", last_run.get("failed", 0)) or 0)
+    timed_out = int(last_run.get("execution_timeout", last_run.get("timeout", 0)) or 0)
+    skipped = int(last_run.get("execution_skipped", last_run.get("skipped", 0)) or 0)
+    execution = {
+        "completed": completed,
+        "runtime_error": runtime_errors,
+        "parse_error": int(last_run.get("execution_parse_error", 0) or 0),
+        "timeout": timed_out,
+        "skipped": skipped,
+        "unsafe": int(last_run.get("execution_unsafe", 0) or 0),
+        "not_run": int(last_run.get("execution_not_run", 0) or 0),
+    }
+    saved_outcomes = last_run.get("mathematical_outcome_summary")
+    if isinstance(saved_outcomes, dict):
+        outcomes = {key: int(saved_outcomes.get(key, 0) or 0) for key in (
+            "counterexample_found", "claim_failed", "no_counterexample_found", "check_satisfied",
+            "diagnostic_only", "inconclusive", "not_reported",
+        )}
+    else:
+        outcomes = {
+            "counterexample_found": 0,
+            "claim_failed": 0,
+            "no_counterexample_found": 0,
+            "check_satisfied": 0,
+            "diagnostic_only": 0,
+            "inconclusive": runtime_errors + timed_out,
+            "not_reported": completed + skipped,
+        }
+    return {
+        "scripts_total": scripts_total,
+        "execution_summary": execution,
+        "mathematical_outcome_summary": outcomes,
+    }
+
+
 def _compact_verification_summary_markdown(session: dict[str, Any]) -> str:
     state = load_verification_state(session)
     last_run = state.get("last_run") or {}
     results = _load_verification_results(session, state=state)
     if not last_run and not results:
         return ""
-    counts = _verification_summary_counts(results) if results else {
-        "scripts_total": int(last_run.get("scripts_total", 0) or 0),
-        "passed": int(last_run.get("passed", 0) or 0),
-        "failed": int(last_run.get("failed", 0) or 0),
-        "timeout": int(last_run.get("timeout", 0) or 0),
-        "skipped": int(last_run.get("skipped", 0) or 0),
-    }
+    counts = _verification_summary_from_state(last_run, results)
+    execution = counts.get("execution_summary") or {}
+    outcomes = counts.get("mathematical_outcome_summary") or {}
     lines = [
         "## Verification summary",
         "",
         f"- Currently active verification scripts run: {counts['scripts_total']}",
-        f"- Passed: {counts['passed']}",
-        f"- Failed: {counts['failed']}",
-        f"- Timed out: {counts['timeout']}",
-        f"- Skipped: {counts['skipped']}",
+        f"- Execution completed: {execution.get('completed', 0)}",
+        f"- Runtime/parse errors: {execution.get('runtime_error', 0) + execution.get('parse_error', 0)}",
+        f"- Timed out: {execution.get('timeout', 0)}",
+        f"- Skipped/unsafe/not run: {execution.get('skipped', 0) + execution.get('unsafe', 0) + execution.get('not_run', 0)}",
+        f"- Counterexamples found: {outcomes.get('counterexample_found', 0)}",
+        f"- Claims failed: {outcomes.get('claim_failed', 0)}",
+        f"- No counterexample found in tested scope: {outcomes.get('no_counterexample_found', 0)}",
+        f"- Checks satisfied: {outcomes.get('check_satisfied', 0)}",
+        f"- Diagnostic/inconclusive/not reported: {outcomes.get('diagnostic_only', 0) + outcomes.get('inconclusive', 0) + outcomes.get('not_reported', 0)}",
     ]
-    failing = [item.get("script_name") for item in results if item.get("status") in {"failed", "timeout"}]
+    failing = [item.get("script_name") for item in results if item.get("execution_status") in {"runtime_error", "parse_error", "timeout"}]
     if failing:
         lines.append(f"- Failing scripts: {', '.join(failing[:10])}")
-    skipped = [item.get("script_name") for item in results if item.get("status") == "skipped"]
+    skipped = [item.get("script_name") for item in results if item.get("execution_status") in {"skipped", "unsafe", "not_run"}]
     if skipped:
         lines.append(f"- Skipped scripts: {', '.join(skipped[:10])}")
     warning = _verification_inventory_warning(session)
@@ -2838,26 +2896,27 @@ def _compact_verification_summary_tex(session: dict[str, Any]) -> str:
     results = _load_verification_results(session, state=state)
     if not last_run and not results:
         return ""
-    counts = _verification_summary_counts(results) if results else {
-        "scripts_total": int(last_run.get("scripts_total", 0) or 0),
-        "passed": int(last_run.get("passed", 0) or 0),
-        "failed": int(last_run.get("failed", 0) or 0),
-        "timeout": int(last_run.get("timeout", 0) or 0),
-        "skipped": int(last_run.get("skipped", 0) or 0),
-    }
+    counts = _verification_summary_from_state(last_run, results)
+    execution = counts.get("execution_summary") or {}
+    outcomes = counts.get("mathematical_outcome_summary") or {}
     parts = [
         r"\section*{Verification summary}",
         r"\begin{itemize}",
         r"\item Currently active verification scripts run: " + str(counts["scripts_total"]),
-        r"\item Passed: " + str(counts["passed"]),
-        r"\item Failed: " + str(counts["failed"]),
-        r"\item Timed out: " + str(counts["timeout"]),
-        r"\item Skipped: " + str(counts["skipped"]),
+        r"\item Execution completed: " + str(execution.get("completed", 0)),
+        r"\item Runtime/parse errors: " + str(execution.get("runtime_error", 0) + execution.get("parse_error", 0)),
+        r"\item Timed out: " + str(execution.get("timeout", 0)),
+        r"\item Skipped/unsafe/not run: " + str(execution.get("skipped", 0) + execution.get("unsafe", 0) + execution.get("not_run", 0)),
+        r"\item Counterexamples found: " + str(outcomes.get("counterexample_found", 0)),
+        r"\item Claims failed: " + str(outcomes.get("claim_failed", 0)),
+        r"\item No counterexample found in tested scope: " + str(outcomes.get("no_counterexample_found", 0)),
+        r"\item Checks satisfied: " + str(outcomes.get("check_satisfied", 0)),
+        r"\item Diagnostic/inconclusive/not reported: " + str(outcomes.get("diagnostic_only", 0) + outcomes.get("inconclusive", 0) + outcomes.get("not_reported", 0)),
     ]
-    failing = [item.get("script_name") for item in results if item.get("status") in {"failed", "timeout"}]
+    failing = [item.get("script_name") for item in results if item.get("execution_status") in {"runtime_error", "parse_error", "timeout"}]
     if failing:
         parts.append(r"\item Failing scripts: " + _report_latex_paragraph_local(", ".join(failing[:10])))
-    skipped = [item.get("script_name") for item in results if item.get("status") == "skipped"]
+    skipped = [item.get("script_name") for item in results if item.get("execution_status") in {"skipped", "unsafe", "not_run"}]
     if skipped:
         parts.append(r"\item Skipped scripts: " + _report_latex_paragraph_local(", ".join(skipped[:10])))
     warning = _verification_inventory_warning(session)
@@ -2879,15 +2938,7 @@ def _verification_counts_for_summary(session: dict[str, Any]) -> Optional[dict[s
         return None
     if not last_run and not results:
         return None
-    if results:
-        return _verification_summary_counts(results)
-    return {
-        "scripts_total": int(last_run.get("scripts_total", 0) or 0),
-        "passed": int(last_run.get("passed", 0) or 0),
-        "failed": int(last_run.get("failed", 0) or 0),
-        "timeout": int(last_run.get("timeout", 0) or 0),
-        "skipped": int(last_run.get("skipped", 0) or 0),
-    }
+    return _verification_summary_from_state(last_run, results)
 
 
 _ISSUE_SEVERITY_SUMMARY_ORDER = ("critical", "high", "medium", "low")
@@ -3003,15 +3054,25 @@ def _audit_summary_items(
 
     verification_counts = _verification_counts_for_summary(session) if include_verification_summary else None
     if verification_counts:
+        execution = verification_counts.get("execution_summary") or {}
+        outcomes = verification_counts.get("mathematical_outcome_summary") or {}
         items.extend(
             [
                 ("Currently active verification scripts total", str(verification_counts.get("scripts_total", 0))),
-                ("Verification passed", str(verification_counts.get("passed", 0))),
-                ("Verification failed", str(verification_counts.get("failed", 0))),
-                ("Verification timed out", str(verification_counts.get("timeout", 0))),
-                ("Verification skipped", str(verification_counts.get("skipped", 0))),
+                ("Verification execution completed", str(execution.get("completed", 0))),
+                ("Verification runtime/parse errors", str(execution.get("runtime_error", 0) + execution.get("parse_error", 0))),
+                ("Verification timed out", str(execution.get("timeout", 0))),
+                ("Verification skipped/unsafe/not run", str(execution.get("skipped", 0) + execution.get("unsafe", 0) + execution.get("not_run", 0))),
+                ("Verification counterexamples found", str(outcomes.get("counterexample_found", 0))),
+                ("Verification claims failed", str(outcomes.get("claim_failed", 0))),
+                ("Verification no counterexample found in tested scope", str(outcomes.get("no_counterexample_found", 0))),
+                ("Verification checks satisfied", str(outcomes.get("check_satisfied", 0))),
+                ("Verification diagnostic/inconclusive/not reported", str(outcomes.get("diagnostic_only", 0) + outcomes.get("inconclusive", 0) + outcomes.get("not_reported", 0))),
             ]
         )
+        findings = verification_findings_for_session(session)
+        if findings:
+            items.append(("High-priority provisional verification findings", str(len(findings))))
         verification_warning = _verification_inventory_warning(session)
         if verification_warning.get("has_invalidated_obligations"):
             items.append(("Verification inventory warning", str(verification_warning.get("message") or "")))
@@ -3748,6 +3809,9 @@ def build_final_report(
     tex_text = build_final_report_tex(session, report_title=report_title)
     issue_recheck_overlay = _build_issue_recheck_overlay(session)
     source_diagnostics = source_ingestion_diagnostics(session)
+    verification_results = _load_verification_results(session, state=load_verification_state(session))
+    verification_summary = _verification_summary_counts(verification_results)
+    verification_findings = verification_findings_for_session(session, results=verification_results)
     issues_state = load_issues(session)
     chunk_records = _read_chunk_records(session)
     chunk_map = _chunk_record_map(chunk_records)
@@ -3756,7 +3820,6 @@ def build_final_report(
         _issue_report_entry(issue, chunk_map, issue_recheck_overlay, ref_state=ref_state)
         for issue in issues_state.get("issues", [])
     ]
-
     reports_dir = root / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3778,6 +3841,14 @@ def build_final_report(
         "manifest": load_manifest(session),
         "chunk_records": chunk_records,
         "issue_report_entries": issue_report_entries,
+        "verification_execution_summary": verification_summary.get("execution_summary", {}),
+        "verification_mathematical_outcome_summary": verification_summary.get("mathematical_outcome_summary", {}),
+        "verification_findings": verification_findings,
+        "verification_findings_summary": {
+            "active_count": len(verification_findings),
+            "counterexample_found": sum(1 for item in verification_findings if item.get("mathematical_outcome") == "counterexample_found"),
+            "claim_failed": sum(1 for item in verification_findings if item.get("mathematical_outcome") == "claim_failed"),
+        },
         "source_ingestion_diagnostics": source_diagnostics,
         "recheck_applied": bool(issue_recheck_overlay.get("recheck_applied")),
         "issue_recheck_summary": issue_recheck_overlay.get("issue_recheck_summary", {}),
@@ -3842,6 +3913,9 @@ def _collect_concise_report_data(
     issue_recheck_overlay = _build_issue_recheck_overlay(session)
     ref_state = ensure_reference_map(session)
     source_diagnostics = source_ingestion_diagnostics(session)
+    verification_results = _load_verification_results(session, state=load_verification_state(session))
+    verification_summary = _verification_summary_counts(verification_results)
+    verification_findings = verification_findings_for_session(session, results=verification_results)
 
     candidate_issues = list(issues_state.get("issues", []) or [])
     if normalized_options.get("only_open_issues", True):
@@ -3894,6 +3968,9 @@ def _collect_concise_report_data(
         "notable_proof_reference_entries": notable_entries,
         "typographical_entries": typographical_entries,
         "issue_recheck_overlay": issue_recheck_overlay,
+        "verification_execution_summary": verification_summary.get("execution_summary", {}),
+        "verification_mathematical_outcome_summary": verification_summary.get("mathematical_outcome_summary", {}),
+        "verification_findings": verification_findings,
     }
 
 
@@ -4136,6 +4213,8 @@ def build_concise_report_markdown(
     lines = [f"# {title}", ""]
     for label, value in _concise_metadata_items(data):
         lines.append(f"- {label}: {normalize_math_delimiters(value)}")
+    if data["verification_findings"]:
+        lines.extend(["", _verification_findings_markdown(data["verification_findings"]).rstrip()])
     lines.extend(
         [
             "",
@@ -4208,6 +4287,8 @@ def build_concise_report_tex(
     for label, value in _concise_metadata_items(data):
         parts.append(r"\item " + _report_latex_paragraph_local(f"{label}: {value}") + "\n")
     parts.append(r"\end{itemize}" + "\n")
+    if data["verification_findings"]:
+        parts.append(_verification_findings_tex(data["verification_findings"]) + "\n")
     parts.append(_high_priority_issues_tex(data["main_issue_entries"], normalized_options) + "\n")
     notable_tex = _notable_proof_reference_issues_tex(data["notable_proof_reference_entries"])
     if notable_tex:
@@ -4278,6 +4359,14 @@ def build_concise_report_json(
         "notable_proof_reference_and_dependency_issues": data["notable_proof_reference_issues"],
         "notable_proof_reference_and_dependency_entries": data["notable_proof_reference_entries"],
         "typographical_errors": data["typographical_entries"],
+        "verification_execution_summary": data["verification_execution_summary"],
+        "verification_mathematical_outcome_summary": data["verification_mathematical_outcome_summary"],
+        "verification_findings": data["verification_findings"],
+        "verification_findings_summary": {
+            "active_count": len(data["verification_findings"]),
+            "counterexample_found": sum(1 for item in data["verification_findings"] if item.get("mathematical_outcome") == "counterexample_found"),
+            "claim_failed": sum(1 for item in data["verification_findings"] if item.get("mathematical_outcome") == "claim_failed"),
+        },
         "reference_status": _reference_report_status(session),
         "recheck_applied": bool(data["issue_recheck_overlay"].get("recheck_applied")),
         "issue_recheck_summary": data["issue_recheck_overlay"].get("issue_recheck_summary", {}),

@@ -66,7 +66,17 @@ from audit_runtime import (
     report_latex_compile_health,
 )
 from audit_state import compute_usage_cost, pricing_for_model, save_json, session_paths, usage_cache_diagnostics
-from audit_verification import _check_verification_script_safety
+from audit_verification import (
+    VERIFICATION_RESULT_SENTINEL,
+    _check_verification_script_safety,
+    _load_verification_results,
+    _normalize_verification_result,
+    _run_verification_scripts,
+    _verification_summary_counts,
+    supersede_verification_findings_for_chunks,
+    verification_findings_for_session,
+    verification_result_needs_technical_retry,
+)
 from gui_controller import (
     format_chunk_completion_log_line,
     format_running_chunk_started_log_line,
@@ -4288,6 +4298,216 @@ def test_verification_safety_allows_narrow_string_replace() -> None:
         _assert("not allowed in safe_only mode" in reason, reason)
 
 
+def test_verification_execution_and_mathematical_outcomes() -> None:
+    def normalized(stdout: str, status: str = "passed", returncode: int | None = 0) -> dict[str, Any]:
+        return _normalize_verification_result(
+            {
+                "script_name": "synthetic.py",
+                "chunk_id": "chunk_008",
+                "status": status,
+                "returncode": returncode,
+                "stdout": stdout,
+                "stderr": "",
+            }
+        )
+
+    counterexample_payload = {
+        "schema_version": 1,
+        "check_kind": "counterexample_search",
+        "outcome": "counterexample_found",
+        "summary": "A counterexample was found at a=11.",
+        "counterexamples": [{"a": 11, "omega_sigma": 11, "omega_input": 11}],
+        "failed_cases": [],
+        "tested_range": {"a_min": 8, "a_max": 20},
+        "target": {"kind": "theorem", "label": "Theorem 3"},
+        "linked_issue_ids": [],
+    }
+    structured_counterexample = normalized(VERIFICATION_RESULT_SENTINEL + json.dumps(counterexample_payload))
+    _assert(structured_counterexample["execution_status"] == "completed", str(structured_counterexample))
+    _assert(structured_counterexample["mathematical_outcome"] == "counterexample_found", str(structured_counterexample))
+    _assert(structured_counterexample["counterexamples"][0]["a"] == 11, str(structured_counterexample))
+
+    no_counter_payload = {
+        **counterexample_payload,
+        "outcome": "no_counterexample_found",
+        "summary": "No counterexample found for 8 <= a <= 20.",
+        "counterexamples": [],
+    }
+    no_counter = normalized(VERIFICATION_RESULT_SENTINEL + json.dumps(no_counter_payload))
+    _assert(no_counter["execution_status"] == "completed", str(no_counter))
+    _assert(no_counter["mathematical_outcome"] == "no_counterexample_found", str(no_counter))
+    _assert("8 <= a <= 20" in no_counter["conclusion"], str(no_counter))
+
+    identity_payload = {
+        **no_counter_payload,
+        "check_kind": "exact_identity_check",
+        "outcome": "check_satisfied",
+        "summary": "The exact finite identity was checked.",
+        "tested_range": None,
+    }
+    identity = normalized(VERIFICATION_RESULT_SENTINEL + json.dumps(identity_payload))
+    _assert(identity["mathematical_outcome"] == "check_satisfied", str(identity))
+
+    no_sentinel = normalized("ordinary diagnostic output\n")
+    _assert(no_sentinel["execution_status"] == "completed", str(no_sentinel))
+    _assert(no_sentinel["mathematical_outcome"] == "not_reported", str(no_sentinel))
+
+    runtime_error = normalized("", status="failed", returncode=1)
+    _assert(runtime_error["execution_status"] == "runtime_error", str(runtime_error))
+    _assert(runtime_error["mathematical_outcome"] == "inconclusive", str(runtime_error))
+    _assert(verification_result_needs_technical_retry(runtime_error), str(runtime_error))
+
+    timed_out = normalized("", status="timeout", returncode=None)
+    _assert(timed_out["execution_status"] == "timeout", str(timed_out))
+    _assert(timed_out["mathematical_outcome"] == "inconclusive", str(timed_out))
+
+    malformed = normalized(VERIFICATION_RESULT_SENTINEL + "{not json}")
+    _assert(malformed["execution_status"] == "parse_error", str(malformed))
+    _assert(malformed["mathematical_outcome"] == "not_reported", str(malformed))
+    _assert(verification_result_needs_technical_retry(malformed), str(malformed))
+    duplicate_sentinel = normalized(
+        VERIFICATION_RESULT_SENTINEL + json.dumps(no_counter_payload) + "\n"
+        + VERIFICATION_RESULT_SENTINEL + json.dumps(no_counter_payload)
+    )
+    _assert(duplicate_sentinel["execution_status"] == "parse_error", str(duplicate_sentinel))
+    _assert(duplicate_sentinel["mathematical_outcome"] == "not_reported", str(duplicate_sentinel))
+
+    legacy_nonempty = normalized(
+        "Theorem 3 finite failures: [(11, 11, {2: 4, 3: 1, 5: 2, 13: 1, 19: 1, 43: 1, 181: 1})]\n"
+    )
+    _assert(legacy_nonempty["mathematical_outcome"] == "counterexample_found", str(legacy_nonempty))
+    _assert(legacy_nonempty["counterexamples"][0]["a"] == 11, str(legacy_nonempty))
+    _assert(legacy_nonempty["counterexamples"][0]["omega_sigma"] == 11, str(legacy_nonempty))
+    _assert(not verification_result_needs_technical_retry(legacy_nonempty), str(legacy_nonempty))
+
+    legacy_empty = normalized("Theorem 3 finite failures: []\n")
+    _assert(legacy_empty["mathematical_outcome"] == "no_counterexample_found", str(legacy_empty))
+    ambiguous = normalized("A failure may exist, but this is diagnostic prose.\n")
+    _assert(ambiguous["mathematical_outcome"] == "not_reported", str(ambiguous))
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_verification_outcome_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        _write_json(
+            session_paths(workdir)["verification_state"],
+            {
+                "updated_at": OLD,
+                "last_run": {"scripts_total": 1, "passed": 1, "failed": 0, "timeout": 0, "skipped": 0},
+                "results": [{"script_name": "legacy_inline.py", "status": "passed", "stdout": "ordinary output"}],
+            },
+        )
+        legacy_inline = _load_verification_results(session)
+        _assert(len(legacy_inline) == 1, str(legacy_inline))
+        _assert(legacy_inline[0]["execution_status"] == "completed", str(legacy_inline))
+        _assert(legacy_inline[0]["mathematical_outcome"] == "not_reported", str(legacy_inline))
+        _write_json(
+            session_paths(workdir)["issues"],
+            {
+                "next_issue_id": 91,
+                "updated_at": OLD,
+                "issues": [
+                    {
+                        "issue_id": "I090",
+                        "chunk_id": "chunk_008",
+                        "severity": "low",
+                        "status": "open",
+                        "title": "Finite checks in Theorem 3 are undocumented",
+                        "location": "Theorem 3 proof",
+                        "description": "The finite computation is not supplied.",
+                        "evidence": "The proof cites a computation.",
+                        "proposed_fix": "Supply reproducible data.",
+                        "tags": ["verification"],
+                    }
+                ],
+            },
+        )
+        script_path = workdir / "python_checks" / "chunk_008_check_01.py"
+        _write_text(
+            script_path,
+            "print('Theorem 3 finite failures: [(11, 11, {2: 4, 3: 1, 5: 2, 13: 1, 19: 1, 43: 1, 181: 1})]')\n",
+        )
+        run = _run_verification_scripts(
+            session,
+            [
+                {
+                    "chunk_id": "chunk_008",
+                    "chunk_index": 8,
+                    "script_name": script_path.name,
+                    "script_path": str(script_path),
+                    "purpose": "Finite verification for Theorem 3",
+                    "description": "Search for a counterexample to Theorem 3 in the stated finite range.",
+                    "expected_outcome": "The failure list should be empty.",
+                }
+            ],
+            timeout=10,
+            safe_only=True,
+        )
+        result = run["results"][0]
+        _assert(result["returncode"] == 0, str(result))
+        _assert(result["execution_status"] == "completed", str(result))
+        _assert(result["mathematical_outcome"] == "counterexample_found", str(result))
+        _assert(result["counterexamples"][0]["a"] == 11, str(result))
+        summary = run["summary"]
+        _assert(summary["execution_completed"] == 1, str(summary))
+        _assert(summary["outcome_counterexample_found"] == 1, str(summary))
+        _assert(summary["all_mathematical_checks_satisfied"] is False, str(summary))
+        _assert(not verification_result_needs_technical_retry(result), str(result))
+        _assert(not runtime.get_failed_verification_chunks(session)["chunk_ids"], "counterexample routed to technical rerun")
+
+        findings = verification_findings_for_session(session, results=run["results"])
+        _assert(len(findings) == 1, str(findings))
+        _assert(findings[0]["counterexamples"][0]["a"] == 11, str(findings))
+        _assert(findings[0]["matched_issue_ids"] == ["I090"], str(findings))
+        finding_sidecar = json.loads(session_paths(workdir)["verification_findings"].read_text(encoding="utf-8"))
+        _assert(len(finding_sidecar["findings"]) == 1, str(finding_sidecar))
+
+        old_hook = runtime._FINAL_REPORT_BUILDER_HOOK
+        try:
+            runtime.set_final_report_builder(policy_build_final_report)
+            workflow_result = runtime.run_verification_suite_and_build_report(session, timeout=10, safe_only=True)
+        finally:
+            runtime._FINAL_REPORT_BUILDER_HOOK = old_hook
+        _assert(workflow_result.get("full_report_paths"), str(workflow_result))
+        _assert(workflow_result.get("concise_report_paths"), str(workflow_result))
+        _assert(not workflow_result.get("report_generation_warnings"), str(workflow_result))
+        _assert(len(workflow_result.get("verification_findings") or []) == 1, str(workflow_result))
+
+        verification_paths = runtime.build_verification_report(session)
+        verification_md = Path(verification_paths["markdown"]).read_text(encoding="utf-8")
+        _assert("COUNTEREXAMPLE FOUND" in verification_md, verification_md)
+        _assert("Execution: completed" in verification_md, verification_md)
+        _assert("Passed:" not in verification_md, verification_md)
+
+        full_md = build_final_report_markdown(session)
+        concise_md = build_concise_report_markdown(session)
+        concise_json = build_concise_report_json(session)
+        _assert("Verification findings requiring attention" in full_md, full_md)
+        _assert("Verification findings requiring attention" in concise_md, concise_md)
+        _assert("Theorem 3" in concise_md, concise_md)
+        _assert(len(concise_json["verification_findings"]) == 1, str(concise_json))
+
+        first_paths = policy_build_final_report(session, write_separate_verification_report=False)
+        second_paths = policy_build_final_report(session, write_separate_verification_report=False)
+        first_json = json.loads(Path(first_paths["json"]).read_text(encoding="utf-8"))
+        second_json = json.loads(Path(second_paths["json"]).read_text(encoding="utf-8"))
+        _assert(len(first_json["verification_findings"]) == 1, str(first_json["verification_findings"]))
+        _assert(len(second_json["verification_findings"]) == 1, str(second_json["verification_findings"]))
+
+        superseded = supersede_verification_findings_for_chunks(session, {"chunk_008"})
+        _assert(superseded["superseded_finding_count"] == 1, str(superseded))
+        updated_sidecar = json.loads(session_paths(workdir)["verification_findings"].read_text(encoding="utf-8"))
+        _assert(updated_sidecar["findings"] == [], str(updated_sidecar))
+        result_artifact = workdir / "verification_results" / "chunk_008_check_01.result.json"
+        result_artifact.unlink()
+        verification_state = json.loads(session_paths(workdir)["verification_state"].read_text(encoding="utf-8"))
+        verification_state["results"] = []
+        _write_json(session_paths(workdir)["verification_state"], verification_state)
+        _assert(verification_findings_for_session(session) == [], "superseded finding remained canonical")
+        history = (workdir / "logs" / "verification_finding_events.jsonl").read_text(encoding="utf-8")
+        _assert("verification_finding_activated" in history, history)
+        _assert("verification_finding_superseded" in history, history)
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -4342,6 +4562,7 @@ def main() -> int:
         ("python check literal newline escape repair", test_python_check_literal_newline_escape_repair),
         ("python check trailing JSON artifact repair", test_python_check_trailing_json_artifact_repair),
         ("verification safety allows narrow string replace", test_verification_safety_allows_narrow_string_replace),
+        ("verification execution and mathematical outcomes", test_verification_execution_and_mathematical_outcomes),
     ]
     results = [_run_case(name, func) for name, func in cases]
 

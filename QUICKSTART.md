@@ -129,9 +129,9 @@ The GUI can open the generated TeX report files and the reports folder. To compi
 
 ## Verification
 
-The audit can generate local Python verification scripts. The GUI shows how many scripts exist, which script is running, and PASS/FAIL/TIMEOUT/SKIPPED outcomes.
+The audit can generate local Python verification scripts. The GUI distinguishes execution status (completed, runtime error, timeout, skipped) from mathematical outcome (for example, counterexample found, no counterexample found in the tested range, check satisfied, or inconclusive).
 
-Verification scripts are heuristic support evidence. They are not a substitute for mathematical judgment.
+Successful Python execution does not mean the paper's claim succeeded: a completed script may find a counterexample. Likewise, a finite search with no counterexample does not prove an unrestricted theorem. Verification-derived findings are provisional supporting evidence, are surfaced in the main reports, and still require mathematical judgment.
 
 ## Experimental Context Modes
 

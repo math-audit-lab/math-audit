@@ -60,6 +60,10 @@ AUDIT POLICY
   - description: a self-contained explanation of the mathematical claim being tested, the test strategy, and any sample parameters or cases used
   - expected_outcome: what output or condition should be interpreted as success
   - code: standalone runnable local Python source only, with no Markdown fences, JSON separators, or surrounding list/object delimiters
+- Every verification script must print exactly one final machine-readable line beginning with MATH_AUDIT_VERIFICATION_RESULT_JSON= followed by a JSON object with schema_version=1, check_kind, outcome, summary, counterexamples, failed_cases, tested_range, target, and linked_issue_ids.
+- Allowed outcome values are counterexample_found, claim_failed, no_counterexample_found, check_satisfied, diagnostic_only, inconclusive, and not_reported.
+- A finite search with no failures must use no_counterexample_found and describe the tested scope; it must not claim to prove an unrestricted theorem.
+- A script may exit with return code 0 after finding a counterexample because return code 0 means only that Python execution completed. Report the negative mathematical outcome in the sentinel.
 - Write each verification description so that it still makes sense in the GUI and generated reports even if the reader never inspects the code itself."""
 
 

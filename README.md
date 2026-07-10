@@ -28,6 +28,7 @@ Use it cautiously. The app is not an automatic referee, proof assistant, or theo
 - Generate full, concise, and verification reports in Markdown, TeX, and JSON.
 - Track report freshness so stale reports are visible after audit state changes.
 - Run generated local Python verification scripts and view progress/results.
+- Distinguish Python execution status from mathematical outcome; reported counterexamples are promoted as provisional findings in the full and concise reports.
 - Rerun selected chunks or chunks with failed/timed-out verification results.
 - Ask post-audit questions in the Discussion pane, with saved thread history and rendered Markdown/math output.
 - Export a one-way ChatGPT context pack for continuing discussion in the regular ChatGPT app without making further API calls through the app.
@@ -108,7 +109,7 @@ Do not commit audit outputs, paper PDFs/TeX sources, request/response logs, gene
 
 ## Limitations
 
-- The app can find real issues, but generated audits and verification checks can be incomplete or mistaken.
+- The app can find real issues, but generated audits and verification checks can be incomplete or mistaken. A completed script may find a counterexample, and a finite search with no counterexample is not a proof of an unrestricted claim.
 - The `fresh_context_experimental` context mode is still experimental. It can help with long audits or context/file-service robustness, while continuous mode may be cheaper for short PDF-only audits with good cache reuse.
 - PDF-only chunking depends on text extraction quality; scanned/image-only PDFs are not recommended because the app does not perform OCR.
 - TeX-aware chunking is preferred when a companion `.tex` file is available and covers the paper reliably.

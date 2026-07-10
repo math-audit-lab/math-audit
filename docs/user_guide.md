@@ -204,7 +204,7 @@ A chunk completion line may include:
 
 ## 8. Reports
 
-After a successful audit, the app automatically generates the full audit report and the concise audit report. The verification report is generated after you run the verification suite.
+After a successful audit, the app automatically generates the full audit report and the concise audit report. The verification report is generated after you run the verification suite; the app also refreshes the full and concise reports so newly reported counterexamples or claim failures are visible in the main conclusions.
 
 The **concise report** is usually the first report to read. It emphasizes the main actionable findings and is better for deciding what matters. It is easier to read than the full report, but it is not automatically complete or authoritative; use the full report when you need detailed checking or audit provenance.
 
@@ -237,15 +237,15 @@ Use freshness warnings as a prompt to rebuild reports after reruns or verificati
 
 ## 10. Verification Suite
 
-Some chunk audits generate local Python verification scripts. These are small Python programs for checking certain identities, inequalities, or numerical examples. The GUI can discover and run these scripts, then show PASS, FAIL, TIMEOUT, or SKIPPED outcomes.
+Some chunk audits generate local Python verification scripts. These are small Python programs for checking certain identities, inequalities, numerical examples, or bounded counterexample searches. The GUI reports two separate facts: whether Python execution completed, and what mathematical outcome the script reported.
 
-Verification scripts are supporting evidence only, not formal proof. A PASS can mean different things depending on what the script was designed to test, including successfully finding a counterexample to a suspected claim. Always inspect the script purpose and output before drawing mathematical conclusions. Scripts can fail because of programming issues rather than underlying mathematical problems.
+Successful execution does not mean that the paper's claim passed. A script may execute normally and find a counterexample. Conversely, finding no counterexample in a finite tested range does not prove an unrestricted claim. Verification-derived findings are provisional supporting evidence and require human review. Counterexamples and reported claim failures are surfaced as prominent findings in the verification, full, and concise reports; scripts can still be wrong, so inspect the script, scope, and output before drawing conclusions.
 
 ![Verification controls](screenshots/07_verification.png)
 
 ## 11. Rerunning Failed Verification Chunks
 
-If a verification script fails or times out, the GUI can help rerun chunks associated with failed verification scripts. Use this selectively. A failed script may indicate:
+If a verification script has a technical execution failure or times out, the GUI can help rerun chunks associated with those scripts. A script that executes successfully and finds a counterexample is not a technical rerun failure. Use reruns selectively. A technical failure may indicate:
 
 - The script is wrong.
 - The paper claim is wrong.

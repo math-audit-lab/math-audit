@@ -1243,14 +1243,27 @@ class GuiController(QObject):
             return
         summary = result.get("summary") or {}
         total = int(summary.get("scripts_total", 0) or 0)
-        passed = int(summary.get("passed", 0) or 0)
-        failed = int(summary.get("failed", 0) or 0)
-        timed_out = int(summary.get("timeout", 0) or 0)
-        skipped = int(summary.get("skipped", 0) or 0)
+        execution = summary.get("execution_summary") or {}
+        outcomes = summary.get("mathematical_outcome_summary") or {}
+        completed = int(execution.get("completed", 0) or 0)
+        technical_errors = int(execution.get("runtime_error", 0) or 0) + int(execution.get("parse_error", 0) or 0)
+        timed_out = int(execution.get("timeout", 0) or 0)
+        skipped = sum(int(execution.get(key, 0) or 0) for key in ("skipped", "unsafe", "not_run"))
+        counterexamples = int(outcomes.get("counterexample_found", 0) or 0)
+        claim_failures = int(outcomes.get("claim_failed", 0) or 0)
+        unresolved = sum(int(outcomes.get(key, 0) or 0) for key in ("diagnostic_only", "inconclusive", "not_reported"))
         self.log_message.emit(
-            "Verification suite finished for currently active scripts: "
-            f"{total} scripts, {passed} passed, {failed} failed, {timed_out} timed out, {skipped} skipped."
+            "Verification suite finished for currently active scripts. "
+            f"Execution: {total} scripts, {completed} completed, {technical_errors} technical errors, "
+            f"{timed_out} timed out, {skipped} skipped/unsafe. "
+            f"Mathematical outcomes: {counterexamples} counterexamples, {claim_failures} failed claims, "
+            f"{unresolved} diagnostic/inconclusive/not reported."
         )
+        findings = result.get("verification_findings") or []
+        if findings:
+            self.log_message.emit(
+                f"Verification findings requiring attention: {len(findings)} provisional high-priority finding(s)."
+            )
         inventory_warning = result.get("inventory_warning") or {}
         if inventory_warning.get("has_invalidated_obligations"):
             warning_text = str(inventory_warning.get("message") or "").strip()
@@ -1268,6 +1281,14 @@ class GuiController(QObject):
         else:
             self.report_output.emit("Verification suite finished, but no verification report was produced.")
             self._emit_current_status()
+        full_report_paths = result.get("full_report_paths") or {}
+        concise_report_paths = result.get("concise_report_paths") or {}
+        if full_report_paths:
+            self.log_message.emit("Full audit report rebuilt with the latest verification outcomes.")
+        if concise_report_paths:
+            self.log_message.emit("Concise audit report rebuilt with the latest verification outcomes.")
+        for warning in result.get("report_generation_warnings") or []:
+            self.log_message.emit("Report rebuild warning: " + str(warning))
 
     def _handle_chatgpt_context_pack_result(self, result: Any) -> None:
         if not isinstance(result, dict):

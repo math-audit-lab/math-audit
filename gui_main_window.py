@@ -1382,13 +1382,17 @@ class MainWindow(QMainWindow):
         _set_text_if_changed(self.verification_scripts_available_value, f"Currently active verification scripts: {scripts_total}")
         last_run = verification_suite.get("last_run")
         if isinstance(last_run, dict) and last_run:
+            execution = last_run.get("execution_summary") or {}
+            outcomes = last_run.get("mathematical_outcome_summary") or {}
             _set_text_if_changed(
                 self.verification_last_run_value,
-                "Last run (active scripts): "
-                f"passed {int(last_run.get('passed', 0) or 0)}, "
-                f"failed {int(last_run.get('failed', 0) or 0)}, "
-                f"timed out {int(last_run.get('timeout', 0) or 0)}, "
-                f"skipped {int(last_run.get('skipped', 0) or 0)}"
+                "Last run (active scripts): execution "
+                f"completed {int(execution.get('completed', 0) or 0)}, "
+                f"errors {int(execution.get('runtime_error', 0) or 0) + int(execution.get('parse_error', 0) or 0)}, "
+                f"timed out {int(execution.get('timeout', 0) or 0)}; outcomes "
+                f"counterexamples {int(outcomes.get('counterexample_found', 0) or 0)}, "
+                f"claim failures {int(outcomes.get('claim_failed', 0) or 0)}, "
+                f"not reported {int(outcomes.get('not_reported', 0) or 0)}"
             )
         else:
             _set_text_if_changed(self.verification_last_run_value, "Last run: none")
@@ -1747,13 +1751,16 @@ class MainWindow(QMainWindow):
             self._append_report_output(message)
             return
         if event == "script_finished":
-            status = str((payload or {}).get("status") or "skipped").lower()
-            label = {
-                "passed": "PASS",
-                "failed": "FAIL",
-                "timeout": "TIMEOUT",
-                "skipped": "SKIPPED",
-            }.get(status, status.upper() or "UNKNOWN")
+            execution_status = str((payload or {}).get("execution_status") or "not_run").lower()
+            outcome = str((payload or {}).get("mathematical_outcome") or "not_reported").lower()
+            if outcome == "counterexample_found":
+                label = "COUNTEREXAMPLE FOUND"
+            elif outcome == "claim_failed":
+                label = "CLAIM FAILED"
+            elif execution_status != "completed":
+                label = execution_status.replace("_", " ").upper()
+            else:
+                label = outcome.replace("_", " ").upper()
             message = f"{label}: {script_name}"
             _set_text_if_changed(self.verification_live_progress_value, f"Verification {index} / {total}: {label} {script_name}")
             self._append_report_output(message)

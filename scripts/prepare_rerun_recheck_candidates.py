@@ -15,6 +15,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from audit_verification import (  # noqa: E402
+    TECHNICAL_VERIFICATION_FAILURE_STATUSES,
+    _normalize_verification_result,
+    verification_result_needs_technical_retry,
+)
 from scripts.prepare_issue_recheck_candidates import (  # noqa: E402
     SEVERITY_RANK,
     _build_evidence,
@@ -35,7 +40,7 @@ from scripts.prepare_issue_recheck_candidates import (  # noqa: E402
 
 
 SCHEMA_VERSION = "1.0"
-FAILED_VERIFICATION_STATUSES = {"failed", "timeout", "timed_out"}
+FAILED_VERIFICATION_STATUSES = set(TECHNICAL_VERIFICATION_FAILURE_STATUSES)
 ACTION_KIND_LABELS = {
     "issue_recheck": "Issue-level recheck candidates",
     "chunk_rerun": "Full chunk rerun candidates",
@@ -479,9 +484,10 @@ def _script_excerpt(path_text: Any, limit: int = 500) -> str:
 
 def _verification_failure_candidates(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     candidates = []
-    for result in results:
-        status = str(result.get("status") or "").strip().lower()
-        if status not in FAILED_VERIFICATION_STATUSES:
+    for raw_result in results:
+        result = _normalize_verification_result(raw_result)
+        status = str(result.get("execution_status") or "").strip().lower()
+        if not verification_result_needs_technical_retry(result):
             continue
         script_name = str(result.get("script_name") or Path(str(result.get("script_path") or "")).name)
         chunk_id = str(result.get("chunk_id") or "")
@@ -494,7 +500,7 @@ def _verification_failure_candidates(results: list[dict[str, Any]]) -> list[dict
                 "item_type": "verification_script",
                 "recommended_action_kind": "script_recheck",
                 "source_ids": [item for item in [script_name, chunk_id, str(result.get("result_path") or "")] if item],
-                "trigger_reason": f"verification result status is {status}",
+                "trigger_reason": f"verification execution status is {status}",
                 "recommended_action": "Recheck the verification script and the mathematical claim first; rerun the chunk only if the script or audit output needs regeneration.",
                 "priority": "high" if status == "failed" else "medium",
                 "status": "candidate",
@@ -508,6 +514,8 @@ def _verification_failure_candidates(results: list[dict[str, Any]]) -> list[dict
                 "requires_user_confirmation": True,
                 "evidence_summary": {
                     "returncode": result.get("returncode"),
+                    "execution_status": result.get("execution_status"),
+                    "mathematical_outcome": result.get("mathematical_outcome"),
                     "conclusion": _short_text(result.get("conclusion"), 500),
                     "stdout_excerpt": _short_text(result.get("stdout"), 700),
                     "stderr_excerpt": _short_text(result.get("stderr"), 700),

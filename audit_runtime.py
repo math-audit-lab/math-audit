@@ -56,19 +56,25 @@ from audit_state import (
     workdir_from_pdf,
 )
 from audit_verification import (
+    NEGATIVE_VERIFICATION_OUTCOMES,
+    TECHNICAL_VERIFICATION_FAILURE_STATUSES,
     _chunk_id_from_script_name,
     _chunk_index_from_chunk_id,
     _collect_verification_scripts,
     _load_verification_results,
     _truncate_text,
+    _normalize_verification_result,
     _verification_summary_counts,
     load_verification_state,
     run_verification_suite,
     save_verification_state,
+    supersede_verification_findings_for_chunks,
+    verification_findings_for_session,
+    verification_result_needs_technical_retry,
 )
 
 WORKING_STATUSES = {"queued", "in_progress"}
-FAILED_VERIFICATION_STATUSES = {"failed", "timeout"}
+FAILED_VERIFICATION_STATUSES = set(TECHNICAL_VERIFICATION_FAILURE_STATUSES)
 
 _OPENAI_CLIENT = None
 _PROMPT_BUILDER_HOOK: Optional[Callable[[dict[str, Any], dict[str, Any]], list[dict[str, Any]]]] = None
@@ -1663,9 +1669,11 @@ def _cleanup_verification_state_for_rerun(session: dict[str, Any], chunk_ids: se
             state["last_run"].update(counts)
             state["last_run"]["selected_chunk_results_removed_by_rerun"] = sorted(chunk_ids)
         save_verification_state(session, state)
+    finding_cleanup = supersede_verification_findings_for_chunks(session, chunk_ids)
     return {
         "removed_result_count": len(removed),
         "removed_results": removed,
+        **finding_cleanup,
     }
 
 
@@ -1702,12 +1710,15 @@ def _sort_active_chunk_records(session: dict[str, Any]) -> None:
 
 
 def _compact_failed_verification_result(result: dict[str, Any]) -> dict[str, Any]:
+    result = _normalize_verification_result(result)
     return {
         "chunk_id": str(result.get("chunk_id") or "").strip(),
         "chunk_index": result.get("chunk_index"),
         "script_name": str(result.get("script_name") or "").strip(),
         "script_path": str(result.get("script_path") or "").strip(),
         "status": str(result.get("status") or "").strip(),
+        "execution_status": str(result.get("execution_status") or "").strip(),
+        "mathematical_outcome": str(result.get("mathematical_outcome") or "").strip(),
         "returncode": result.get("returncode"),
         "elapsed_seconds": result.get("elapsed_seconds"),
         "conclusion": _truncate_text(str(result.get("conclusion") or ""), limit=500),
@@ -1857,7 +1868,7 @@ def _verification_inventory_warning(session: dict[str, Any]) -> dict[str, Any]:
         f"are not represented in the currently active verification suite. Affected chunks: {', '.join(invalidated_chunks[:10])}"
         f"{', ...' if len(invalidated_chunks) > 10 else ''}. "
         f"{detail_clause}"
-        "Active-suite pass counts describe only currently active verification scripts, not the full historical verification inventory."
+        "Active-suite execution and mathematical-outcome counts describe only currently active verification scripts, not the full historical verification inventory."
     )
     return {
         "has_invalidated_obligations": True,
@@ -1884,8 +1895,7 @@ def get_failed_verification_chunks(session_or_pdf: dict[str, Any] | str | Path) 
     results = _load_verification_results(session, state=state)
     grouped: dict[str, dict[str, Any]] = {}
     for result in results:
-        status = str(result.get("status") or "").strip().lower()
-        if status not in FAILED_VERIFICATION_STATUSES:
+        if not verification_result_needs_technical_retry(result):
             continue
         chunk_id = str(result.get("chunk_id") or "").strip()
         if not chunk_id:
@@ -2852,6 +2862,77 @@ def _verification_conclusion_for_display(result: dict[str, Any], limit: int = 16
     return _truncate_text(text, limit=limit).replace("\\n", " ")
 
 
+def _verification_outcome_display(outcome: Any) -> str:
+    labels = {
+        "counterexample_found": "COUNTEREXAMPLE FOUND",
+        "claim_failed": "CLAIM FAILED",
+        "no_counterexample_found": "No counterexample found in tested scope",
+        "check_satisfied": "Check satisfied",
+        "diagnostic_only": "Diagnostic only",
+        "inconclusive": "Inconclusive",
+        "not_reported": "Not reported",
+    }
+    clean = str(outcome or "not_reported").strip().lower()
+    return labels.get(clean, clean.replace("_", " ").title())
+
+
+def _verification_findings_markdown(findings: list[dict[str, Any]]) -> str:
+    if not findings:
+        return ""
+    lines = ["## Verification findings requiring attention", ""]
+    for finding in findings:
+        lines.extend(
+            [
+                f"### {finding.get('finding_id')} — {normalize_math_delimiters(str(finding.get('title') or 'Verification finding'))} [high-priority, provisional]",
+                f"- Script: `{finding.get('script_name')}`",
+                f"- Chunk: {finding.get('chunk_id') or 'unknown'}",
+                f"- Location/target: {normalize_math_delimiters(str(finding.get('location') or 'unknown'))}",
+                f"- Execution: {finding.get('execution_status')}",
+                f"- Mathematical outcome: {_verification_outcome_display(finding.get('mathematical_outcome'))}",
+                f"- Outcome source: {finding.get('outcome_source')}",
+                f"- Tested scope: {normalize_math_delimiters(json.dumps(finding.get('tested_range'), ensure_ascii=False, sort_keys=True) if finding.get('tested_range') is not None else 'not reported')}",
+                f"- Evidence: {normalize_math_delimiters(str(finding.get('evidence') or ''))}",
+                f"- Matched audit issues: {', '.join(finding.get('matched_issue_ids') or []) or 'none'}",
+                f"- Recommended action: {normalize_math_delimiters(str(finding.get('recommended_action') or 'Human review required.'))}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _verification_findings_tex(findings: list[dict[str, Any]]) -> str:
+    if not findings:
+        return ""
+    parts = [r"\section*{Verification findings requiring attention}" + "\n"]
+    for finding in findings:
+        heading = report_latex_paragraph(
+            f"{finding.get('finding_id')} -- {finding.get('title') or 'Verification finding'} [high-priority, provisional]"
+        )
+        parts.append(r"\subsection*{" + heading + "}" + "\n")
+        parts.append(r"\begin{itemize}" + "\n")
+        items = [
+            ("Script", finding.get("script_name")),
+            ("Chunk", finding.get("chunk_id") or "unknown"),
+            ("Location/target", finding.get("location") or "unknown"),
+            ("Execution", finding.get("execution_status")),
+            ("Mathematical outcome", _verification_outcome_display(finding.get("mathematical_outcome"))),
+            ("Outcome source", finding.get("outcome_source")),
+            (
+                "Tested scope",
+                json.dumps(finding.get("tested_range"), ensure_ascii=False, sort_keys=True)
+                if finding.get("tested_range") is not None
+                else "not reported",
+            ),
+            ("Evidence", finding.get("evidence") or ""),
+            ("Matched audit issues", ", ".join(finding.get("matched_issue_ids") or []) or "none"),
+            ("Recommended action", finding.get("recommended_action") or "Human review required."),
+        ]
+        for label, value in items:
+            parts.append(r"\item " + report_latex_paragraph(f"{label}: {value}") + "\n")
+        parts.append(r"\end{itemize}" + "\n")
+    return "".join(parts)
+
+
 def _verification_report_markdown(
     session: dict[str, Any],
     state: dict[str, Any],
@@ -2859,6 +2940,9 @@ def _verification_report_markdown(
     inventory_warning: Optional[dict[str, Any]] = None,
 ) -> str:
     counts = _verification_summary_counts(results)
+    execution = counts.get("execution_summary") or {}
+    outcomes = counts.get("mathematical_outcome_summary") or {}
+    findings = verification_findings_for_session(session, results=results)
     last_run = state.get("last_run") or {}
     inventory_warning = inventory_warning or {"has_invalidated_obligations": False}
     title = Path(session["pdf_path"]).stem
@@ -2871,12 +2955,22 @@ def _verification_report_markdown(
         f"- Safe only mode: {last_run.get('safe_only', True)}",
         f"- Timeout per script: {last_run.get('timeout_seconds', 0)}s",
         f"- Currently active scripts run: {counts['scripts_total']}",
-        f"- Passed: {counts['passed']}",
-        f"- Failed: {counts['failed']}",
-        f"- Timed out: {counts['timeout']}",
-        f"- Skipped: {counts['skipped']}",
+        "- Execution summary:",
+        f"  - Completed: {execution.get('completed', 0)}",
+        f"  - Runtime errors: {execution.get('runtime_error', 0)}",
+        f"  - Parse errors: {execution.get('parse_error', 0)}",
+        f"  - Timed out: {execution.get('timeout', 0)}",
+        f"  - Skipped/unsafe/not run: {execution.get('skipped', 0) + execution.get('unsafe', 0) + execution.get('not_run', 0)}",
+        "- Mathematical outcome summary:",
+        f"  - Counterexamples found: {outcomes.get('counterexample_found', 0)}",
+        f"  - Claims failed: {outcomes.get('claim_failed', 0)}",
+        f"  - No counterexample found in tested scope: {outcomes.get('no_counterexample_found', 0)}",
+        f"  - Checks satisfied: {outcomes.get('check_satisfied', 0)}",
+        f"  - Diagnostic/inconclusive/not reported: {outcomes.get('diagnostic_only', 0) + outcomes.get('inconclusive', 0) + outcomes.get('not_reported', 0)}",
         "",
     ]
+    if findings:
+        lines.extend([_verification_findings_markdown(findings).rstrip(), ""])
     if inventory_warning.get("has_invalidated_obligations"):
         lines.extend(
             [
@@ -2896,9 +2990,12 @@ def _verification_report_markdown(
     for result in results:
         lines.extend(
             [
-                f"## {result.get('script_name','script')} [{result.get('status','unknown')}]",
+                f"## {result.get('script_name','script')}",
                 f"- Chunk: {result.get('chunk_id') or 'unknown'}",
                 f"- Script: {_display_verification_script_path(session, result)}",
+                f"- Execution: {result.get('execution_status')}",
+                f"- Mathematical outcome: {_verification_outcome_display(result.get('mathematical_outcome'))}",
+                f"- Outcome source: {result.get('outcome_source')}",
                 f"- Return code: {result.get('returncode')}",
                 f"- Elapsed time: {format_duration(result.get('elapsed_seconds', 0.0))}",
                 f"- Conclusion: {_verification_conclusion_for_display(result)}",
@@ -2923,6 +3020,9 @@ def _verification_report_tex(
     inventory_warning: Optional[dict[str, Any]] = None,
 ) -> str:
     counts = _verification_summary_counts(results)
+    execution = counts.get("execution_summary") or {}
+    outcomes = counts.get("mathematical_outcome_summary") or {}
+    findings = verification_findings_for_session(session, results=results)
     last_run = state.get("last_run") or {}
     inventory_warning = inventory_warning or {"has_invalidated_obligations": False}
     title = report_latex_paragraph(f"Verification report -- {Path(session['pdf_path']).stem}")
@@ -2953,11 +3053,19 @@ def _verification_report_tex(
     parts.append(r"\item Safe only mode: " + report_latex_paragraph(str(last_run.get("safe_only", True))) + "\n")
     parts.append(r"\item Timeout per script: " + str(last_run.get("timeout_seconds", 0)) + "s\n")
     parts.append(r"\item Currently active scripts run: " + str(counts["scripts_total"]) + "\n")
-    parts.append(r"\item Passed: " + str(counts["passed"]) + "\n")
-    parts.append(r"\item Failed: " + str(counts["failed"]) + "\n")
-    parts.append(r"\item Timed out: " + str(counts["timeout"]) + "\n")
-    parts.append(r"\item Skipped: " + str(counts["skipped"]) + "\n")
+    parts.append(r"\item Execution completed: " + str(execution.get("completed", 0)) + "\n")
+    parts.append(r"\item Runtime errors: " + str(execution.get("runtime_error", 0)) + "\n")
+    parts.append(r"\item Parse errors: " + str(execution.get("parse_error", 0)) + "\n")
+    parts.append(r"\item Timed out: " + str(execution.get("timeout", 0)) + "\n")
+    parts.append(r"\item Skipped/unsafe/not run: " + str(execution.get("skipped", 0) + execution.get("unsafe", 0) + execution.get("not_run", 0)) + "\n")
+    parts.append(r"\item Counterexamples found: " + str(outcomes.get("counterexample_found", 0)) + "\n")
+    parts.append(r"\item Claims failed: " + str(outcomes.get("claim_failed", 0)) + "\n")
+    parts.append(r"\item No counterexample found in tested scope: " + str(outcomes.get("no_counterexample_found", 0)) + "\n")
+    parts.append(r"\item Checks satisfied: " + str(outcomes.get("check_satisfied", 0)) + "\n")
+    parts.append(r"\item Diagnostic/inconclusive/not reported: " + str(outcomes.get("diagnostic_only", 0) + outcomes.get("inconclusive", 0) + outcomes.get("not_reported", 0)) + "\n")
     parts.append(r"\end{itemize}" + "\n")
+    if findings:
+        parts.append(_verification_findings_tex(findings))
     if inventory_warning.get("has_invalidated_obligations"):
         parts.append(r"\section*{Verification inventory warning}" + "\n")
         parts.append(
@@ -2976,11 +3084,14 @@ def _verification_report_tex(
         parts.append("No verification results found.\n")
     else:
         for result in results:
-            heading = report_latex_paragraph(f"{result.get('script_name','script')} [{result.get('status','unknown')}]")
+            heading = report_latex_paragraph(f"{result.get('script_name','script')}")
             parts.append(r"\subsection*{" + heading + "}" + "\n")
             parts.append(r"\begin{itemize}" + "\n")
             parts.append(r"\item Chunk: " + report_latex_paragraph(result.get("chunk_id") or "unknown") + "\n")
             parts.append(r"\item Script: " + report_latex_paragraph(_display_verification_script_path(session, result)) + "\n")
+            parts.append(r"\item Execution: " + report_latex_paragraph(str(result.get("execution_status") or "unknown")) + "\n")
+            parts.append(r"\item Mathematical outcome: " + report_latex_paragraph(_verification_outcome_display(result.get("mathematical_outcome"))) + "\n")
+            parts.append(r"\item Outcome source: " + report_latex_paragraph(str(result.get("outcome_source") or "unknown")) + "\n")
             parts.append(r"\item Return code: " + report_latex_paragraph(str(result.get("returncode"))) + "\n")
             parts.append(r"\item Elapsed time: " + report_latex_paragraph(format_duration(result.get("elapsed_seconds", 0.0))) + "\n")
             parts.append(r"\item Conclusion: " + report_latex_paragraph(_verification_conclusion_for_display(result)) + "\n")
@@ -3003,6 +3114,8 @@ def build_verification_report(session_or_pdf: dict[str, Any] | str | Path) -> di
     session = _resolve_session(session_or_pdf)
     state = load_verification_state(session)
     results = _load_verification_results(session, state=state)
+    summary = _verification_summary_counts(results)
+    findings = verification_findings_for_session(session, results=results)
     inventory_warning = _verification_inventory_warning(session)
     if not state.get("last_run") and not results:
         return {}
@@ -3021,6 +3134,14 @@ def build_verification_report(session_or_pdf: dict[str, Any] | str | Path) -> di
             "session": load_session_from_pdf(session["pdf_path"]),
             "verification_state": state,
             "results": results,
+            "execution_summary": summary.get("execution_summary", {}),
+            "mathematical_outcome_summary": summary.get("mathematical_outcome_summary", {}),
+            "verification_findings": findings,
+            "verification_findings_summary": {
+                "active_count": len(findings),
+                "counterexample_found": sum(1 for item in findings if item.get("mathematical_outcome") == "counterexample_found"),
+                "claim_failed": sum(1 for item in findings if item.get("mathematical_outcome") == "claim_failed"),
+            },
             "inventory_warning": inventory_warning,
             "generated_at": utc_now(),
         },
@@ -3050,12 +3171,36 @@ def run_verification_suite_and_build_report(
         progress_callback=progress_callback,
     )
     report_paths = build_verification_report(session)
+    main_report_paths: dict[str, str] = {}
+    concise_report_paths: dict[str, str] = {}
+    report_generation_warnings: list[str] = []
+    if _FINAL_REPORT_BUILDER_HOOK is not None:
+        try:
+            main_report_paths = build_final_report(session)
+        except Exception as exc:
+            report_generation_warnings.append(
+                f"Full report rebuild after verification failed: {type(exc).__name__}: {exc}"
+            )
+    else:
+        report_generation_warnings.append(
+            "Full report was not rebuilt after verification because no report-builder hook is registered."
+        )
+    try:
+        concise_report_paths = build_concise_report(session)
+    except Exception as exc:
+        report_generation_warnings.append(
+            f"Concise report rebuild after verification failed: {type(exc).__name__}: {exc}"
+        )
     inventory_warning = _verification_inventory_warning(session)
     return {
         "session": load_session_from_pdf(session["pdf_path"]) or session,
         "summary": verification_run.get("summary", {}),
         "report_paths": report_paths,
+        "full_report_paths": main_report_paths,
+        "concise_report_paths": concise_report_paths,
+        "report_generation_warnings": report_generation_warnings,
         "state": verification_run.get("state", {}),
+        "verification_findings": verification_run.get("verification_findings", []),
         "inventory_warning": inventory_warning,
     }
 
@@ -3064,7 +3209,38 @@ def get_verification_suite_status(session_or_pdf: dict[str, Any] | str | Path) -
     session = _resolve_session(session_or_pdf)
     scripts = _collect_verification_scripts(session)
     state = load_verification_state(session)
+    results = _load_verification_results(session, state=state)
+    summary = _verification_summary_counts(results) if results else {}
     inventory_warning = _verification_inventory_warning(session)
+    last_run = dict(state.get("last_run") or {}) if isinstance(state.get("last_run"), dict) else None
+    if last_run is not None and not summary:
+        completed = int(last_run.get("passed", 0) or 0)
+        runtime_errors = int(last_run.get("failed", 0) or 0)
+        timed_out = int(last_run.get("timeout", 0) or 0)
+        skipped = int(last_run.get("skipped", 0) or 0)
+        summary = {
+            "scripts_total": int(last_run.get("scripts_total", completed + runtime_errors + timed_out + skipped) or 0),
+            "execution_summary": {
+                "completed": completed,
+                "runtime_error": runtime_errors,
+                "parse_error": 0,
+                "timeout": timed_out,
+                "skipped": skipped,
+                "unsafe": 0,
+                "not_run": 0,
+            },
+            "mathematical_outcome_summary": {
+                "counterexample_found": 0,
+                "claim_failed": 0,
+                "no_counterexample_found": 0,
+                "check_satisfied": 0,
+                "diagnostic_only": 0,
+                "inconclusive": runtime_errors + timed_out,
+                "not_reported": completed + skipped,
+            },
+        }
+    if last_run is not None and summary:
+        last_run.update(summary)
     return {
         "scripts_total": len(scripts),
         "scripts": [
@@ -3076,7 +3252,9 @@ def get_verification_suite_status(session_or_pdf: dict[str, Any] | str | Path) -
             }
             for item in scripts
         ],
-        "last_run": state.get("last_run") if isinstance(state.get("last_run"), dict) else None,
+        "last_run": last_run,
+        "summary": summary,
+        "verification_findings": verification_findings_for_session(session, results=results),
         "inventory_warning": inventory_warning,
     }
 
@@ -3478,8 +3656,7 @@ def _build_paper_structure_context(session: dict[str, Any]) -> dict[str, Any]:
         verification_counts = {}
     failed_verification = []
     for item in verification_results:
-        status_text = str(item.get("status") or "").lower()
-        if status_text not in {"failed", "timeout", "timed_out"}:
+        if not verification_result_needs_technical_retry(item):
             continue
         failed_verification.append(
             {
@@ -3487,6 +3664,8 @@ def _build_paper_structure_context(session: dict[str, Any]) -> dict[str, Any]:
                 "chunk_index": item.get("chunk_index"),
                 "script_name": item.get("script_name"),
                 "status": item.get("status"),
+                "execution_status": item.get("execution_status"),
+                "mathematical_outcome": item.get("mathematical_outcome"),
                 "returncode": item.get("returncode"),
                 "elapsed_seconds": item.get("elapsed_seconds"),
                 "conclusion": clean_text(item.get("conclusion"), limit=700),
@@ -3555,7 +3734,9 @@ def _build_paper_structure_context(session: dict[str, Any]) -> dict[str, Any]:
         "verification": {
             "source": "state/verification.json",
             "summary": verification_counts or verification_state.get("last_run") or {},
+            "technical_failures": failed_verification,
             "failed_or_timed_out_checks": failed_verification,
+            "verification_findings": verification_findings_for_session(session, results=verification_results),
         },
         "reruns": {
             "source": "logs/*.jsonl",
@@ -4692,19 +4873,26 @@ def _build_reduced_audit_qa_context(session: dict[str, Any], question: str, max_
         verification_counts = {}
     lines.extend(["", "Verification summary:"])
     if verification_counts:
+        execution = verification_counts.get("execution_summary") or {}
+        outcomes = verification_counts.get("mathematical_outcome_summary") or {}
         lines.append(
-            "- scripts: {scripts_total}, passed: {passed}, failed: {failed}, timed out: {timeout}, skipped: {skipped}".format(
-                **{key: verification_counts.get(key, 0) for key in ("scripts_total", "passed", "failed", "timeout", "skipped")}
-            )
+            f"- scripts: {verification_counts.get('scripts_total', 0)}; execution completed: {execution.get('completed', 0)}, "
+            f"runtime/parse errors: {execution.get('runtime_error', 0) + execution.get('parse_error', 0)}, "
+            f"timed out: {execution.get('timeout', 0)}; mathematical outcomes: "
+            f"counterexamples: {outcomes.get('counterexample_found', 0)}, claim failures: {outcomes.get('claim_failed', 0)}, "
+            f"no counterexample in tested scope: {outcomes.get('no_counterexample_found', 0)}, "
+            f"checks satisfied: {outcomes.get('check_satisfied', 0)}, not reported/inconclusive: "
+            f"{outcomes.get('not_reported', 0) + outcomes.get('inconclusive', 0)}"
         )
         bad_results = [
             result
             for result in verification_results
-            if str(result.get("status") or "").lower() in {"failed", "timeout"}
+            if verification_result_needs_technical_retry(result)
+            or str(result.get("mathematical_outcome") or "") in NEGATIVE_VERIFICATION_OUTCOMES
         ]
         for result in bad_results[:8]:
             lines.append(
-                f"- {result.get('chunk_id', '')} | {result.get('script_name', '')} | {result.get('status', '')}: "
+                f"- {result.get('chunk_id', '')} | {result.get('script_name', '')} | execution {result.get('execution_status', '')} | outcome {result.get('mathematical_outcome', '')}: "
                 + _truncate_text(result.get("conclusion", "") or result.get("stderr", "") or result.get("stdout", ""), limit=220)
             )
     else:
@@ -4867,25 +5055,32 @@ def _build_full_audit_qa_context(session: dict[str, Any], question: str, max_cha
         verification_counts = {}
     lines.extend(["", "Verification state/results:"])
     if verification_counts:
+        execution = verification_counts.get("execution_summary") or {}
+        outcomes = verification_counts.get("mathematical_outcome_summary") or {}
         lines.append(
-            "- scripts: {scripts_total}, passed: {passed}, failed: {failed}, timed out: {timeout}, skipped: {skipped}".format(
-                **{key: verification_counts.get(key, 0) for key in ("scripts_total", "passed", "failed", "timeout", "skipped")}
-            )
+            f"- scripts: {verification_counts.get('scripts_total', 0)}; execution completed: {execution.get('completed', 0)}, "
+            f"runtime/parse errors: {execution.get('runtime_error', 0) + execution.get('parse_error', 0)}, "
+            f"timed out: {execution.get('timeout', 0)}; mathematical outcomes: "
+            f"counterexamples: {outcomes.get('counterexample_found', 0)}, claim failures: {outcomes.get('claim_failed', 0)}, "
+            f"no counterexample in tested scope: {outcomes.get('no_counterexample_found', 0)}, "
+            f"checks satisfied: {outcomes.get('check_satisfied', 0)}, not reported/inconclusive: "
+            f"{outcomes.get('not_reported', 0) + outcomes.get('inconclusive', 0)}"
         )
         bad_results = [
             result
             for result in verification_results
-            if str(result.get("status") or "").lower() in {"failed", "timeout"}
+            if verification_result_needs_technical_retry(result)
+            or str(result.get("mathematical_outcome") or "") in NEGATIVE_VERIFICATION_OUTCOMES
         ]
         if bad_results:
-            lines.append("Failed/timed-out verification results:")
+            lines.append("Verification results requiring attention:")
             for result in bad_results[:16]:
                 lines.append(
-                    f"- {result.get('chunk_id', '')} | {result.get('script_name', '')} | {result.get('status', '')}: "
+                    f"- {result.get('chunk_id', '')} | {result.get('script_name', '')} | execution {result.get('execution_status', '')} | outcome {result.get('mathematical_outcome', '')}: "
                     + _truncate_text(result.get("conclusion", "") or result.get("stderr", "") or result.get("stdout", ""), limit=320)
                 )
         else:
-            lines.append("- No failed or timed-out verification results were recorded.")
+            lines.append("- No technical failures or negative mathematical outcomes were recorded.")
     else:
         lines.append("- No verification state was available.")
 
@@ -8246,11 +8441,14 @@ def audit_the_paper(
         if verbose:
             summary = verification_run.get("summary", {})
             print(
-                "Verification suite:"
-                f"{summary.get('passed', 0)} passed, "
-                f"{summary.get('failed', 0)} failed, "
-                f"{summary.get('timeout', 0)} timed out, "
-                f"{summary.get('skipped', 0)} skipped"
+                "Verification suite execution: "
+                f"{summary.get('execution_completed', 0)} completed, "
+                f"{summary.get('execution_runtime_error', 0) + summary.get('execution_parse_error', 0)} technical errors, "
+                f"{summary.get('execution_timeout', 0)} timed out; "
+                "mathematical outcomes: "
+                f"{summary.get('outcome_counterexample_found', 0)} counterexample(s), "
+                f"{summary.get('outcome_claim_failed', 0)} failed claim(s), "
+                f"{summary.get('outcome_not_reported', 0) + summary.get('outcome_inconclusive', 0)} unresolved"
             )
     session = _resolve_session(pdf_path)
     report_result = build_audit_completion_reports(

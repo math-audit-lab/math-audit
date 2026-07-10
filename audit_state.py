@@ -57,6 +57,7 @@ def session_paths(workdir: str | Path) -> dict[str, Path]:
         "chunk_records": root / "state" / "chunks.jsonl",
         "audit_context_db": root / "state" / "audit_context_db.jsonl",
         "verification_state": root / "state" / "verification.json",
+        "verification_findings": root / "state" / "verification_findings.json",
     }
 
 
