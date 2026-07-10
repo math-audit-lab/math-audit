@@ -79,6 +79,8 @@ For the easiest startup path:
 
 The launcher does not bundle Python. It searches for Conda/Mamba in `PATH` and common installation locations, then installs required Python/GUI dependencies into the `math-audit` environment automatically. Users should not manually install PySide6, Qt WebEngine, the OpenAI SDK, or PDF packages one by one. Very old or heavily customized Conda installations may have package-solving problems; if that happens, rerun the launcher, refresh the environment, or try a clean Miniforge installation. Windows support is experimental and less tested than macOS. Linux users should use the manual Conda setup for now. A packaged `.app` or installer is a future milestone; the `.command` and `.bat` launchers are the current public-preview convenience paths.
 
+New audits default to GPT-5.6 Sol with `xhigh` reasoning effort for serious research-level mathematical auditing. GPT-5.5 remains selectable for comparison and compatibility with older audits. GPT-5.6 Sol `max` effort is available for the hardest quality-first audits or focused rechecks, but it is not the global default. Existing audits resume with their saved model and effort.
+
 At a high level:
 
 > **Important: use searchable PDFs, not scanned PDFs.** Best results come from PDFs compiled from TeX/LaTeX, but any PDF with good selectable text may work. The app does not perform OCR, so scanned/image-only PDFs can produce empty or corrupted chunks and unreliable audits.
@@ -112,7 +114,7 @@ Do not commit audit outputs, paper PDFs/TeX sources, request/response logs, gene
 - TeX-aware chunking is preferred when a companion `.tex` file is available and covers the paper reliably.
 - Report TeX is intended to be robust, but local LaTeX installations still vary.
 - The GUI discussion rendered mode depends on bundled local MathJax assets.
-- Pricing/cost estimates are local calculations and may differ from platform billing in edge cases.
+- Pricing/cost estimates are local calculations and may differ from platform billing in edge cases, including cache-write charges when those token counts are not exposed in usage metadata.
 
 ## License
 

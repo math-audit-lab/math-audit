@@ -38,6 +38,9 @@ from audit_runtime import (
     load_post_audit_review_summary,
     list_qa_threads,
     load_qa_turns,
+    model_display_choices,
+    model_display_name,
+    model_guidance,
     model_choices,
     normalize_model_and_reasoning_effort,
     prepare_issue_family_recheck_dry_run,
@@ -48,6 +51,7 @@ from audit_runtime import (
     resume_audit,
     run_issue_family_recheck_live,
     run_verification_suite_and_build_report,
+    reasoning_effort_guidance_for_model,
     set_openai_client,
     set_active_qa_thread,
     start_fresh_audit,
@@ -60,6 +64,7 @@ from audit_state import load_session_from_pdf, load_usage, workdir_from_pdf
 DEFAULT_MODEL = RUNTIME_DEFAULT_MODEL
 DEFAULT_REASONING_EFFORT = default_reasoning_effort_for_model(DEFAULT_MODEL)
 MODEL_CHOICES = model_choices()
+MODEL_DISPLAY_CHOICES = model_display_choices()
 DISCUSSION_CONTEXT_MODE_LABELS = {
     "Reduced audit context": "reduced_audit_context",
     "Full audit context": "full_audit_context",
@@ -348,7 +353,13 @@ class GuiController(QObject):
         self.poll_status()
 
     def set_model(self, model: str) -> None:
-        self.model, self.reasoning_effort = normalize_model_and_reasoning_effort(model, None)
+        previous_effort = self.reasoning_effort
+        self.model, self.reasoning_effort = normalize_model_and_reasoning_effort(model, previous_effort)
+        if previous_effort and self.reasoning_effort != previous_effort:
+            self.log_message.emit(
+                f"Reasoning effort adjusted to {self.reasoning_effort} for model {self.model}; "
+                f"{previous_effort} is not supported by this model."
+            )
         self._mark_model_effort_override_if_needed()
 
     def set_reasoning_effort(self, reasoning_effort: str) -> None:
@@ -360,6 +371,15 @@ class GuiController(QObject):
 
     def default_reasoning_effort(self, model: Optional[str] = None) -> str:
         return default_reasoning_effort_for_model(model or self.model)
+
+    def model_display_name(self, model: Optional[str] = None) -> str:
+        return model_display_name(model or self.model)
+
+    def model_guidance(self, model: Optional[str] = None) -> str:
+        return model_guidance(model or self.model)
+
+    def reasoning_effort_guidance(self, model: Optional[str] = None) -> dict[str, str]:
+        return reasoning_effort_guidance_for_model(model or self.model)
 
     def prompt_profile_targets(self) -> list[str]:
         return ["Default prompt"] + list(MODEL_CHOICES)

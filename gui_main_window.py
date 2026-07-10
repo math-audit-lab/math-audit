@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui_controller import AUDIT_CONTEXT_MODE_CHOICES, AUDIT_CONTEXT_MODE_LABELS, DEFAULT_MODEL, MODEL_CHOICES, GuiController
+from gui_controller import AUDIT_CONTEXT_MODE_CHOICES, AUDIT_CONTEXT_MODE_LABELS, DEFAULT_MODEL, MODEL_DISPLAY_CHOICES, GuiController
 
 
 def review_tab_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
@@ -506,7 +506,7 @@ class MainWindow(QMainWindow):
         self.controller.audit_context_mode_changed.connect(self._on_audit_context_mode_changed)
         self.controller.review_summary_updated.connect(self._update_review_summary)
 
-        self.model_combo.setCurrentText(DEFAULT_MODEL)
+        self.model_combo.setCurrentText(self.controller.model_display_name(DEFAULT_MODEL))
         self._refresh_reasoning_options(DEFAULT_MODEL)
         self._apply_button_states()
 
@@ -559,7 +559,7 @@ class MainWindow(QMainWindow):
 
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
-        self.model_combo.addItems(MODEL_CHOICES)
+        self.model_combo.addItems(MODEL_DISPLAY_CHOICES)
         self.model_combo.currentTextChanged.connect(self._on_model_changed)
         layout.addRow("Model", self.model_combo)
 
@@ -1180,7 +1180,11 @@ class MainWindow(QMainWindow):
 
     def _on_model_changed(self, model: str) -> None:
         self.controller.set_model(model)
-        self._refresh_reasoning_options(model)
+        self._refresh_reasoning_options(
+            self.controller.model,
+            selected_effort=self.controller.reasoning_effort,
+            notify_controller=False,
+        )
 
     def _on_audit_settings_changed(self, model: str, reasoning_effort: str) -> None:
         self._set_model_effort_controls(model, reasoning_effort)
@@ -1221,7 +1225,7 @@ class MainWindow(QMainWindow):
 
     def _set_model_effort_controls(self, model: str, reasoning_effort: str) -> None:
         self.model_combo.blockSignals(True)
-        self.model_combo.setCurrentText(model)
+        self.model_combo.setCurrentText(self.controller.model_display_name(model))
         self.model_combo.blockSignals(False)
         self._refresh_reasoning_options(model, selected_effort=reasoning_effort, notify_controller=False)
 
@@ -1242,7 +1246,11 @@ class MainWindow(QMainWindow):
         if len(options) == 1:
             self.reasoning_combo.setToolTip("Reasoning effort is fixed for this model.")
         else:
-            self.reasoning_combo.setToolTip("")
+            guidance = self.controller.reasoning_effort_guidance(model)
+            if guidance:
+                self.reasoning_combo.setToolTip("\n".join(f"{effort} — {guidance.get(effort, '')}" for effort in options))
+            else:
+                self.reasoning_combo.setToolTip("")
         self.reasoning_combo.blockSignals(False)
         if notify_controller:
             self.controller.set_reasoning_effort(self.reasoning_combo.currentText())

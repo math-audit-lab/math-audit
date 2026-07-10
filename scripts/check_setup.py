@@ -118,6 +118,7 @@ def run_checks() -> list[CheckResult]:
 
     core_modules = [
         "audit_gui",
+        "audit_models",
         "audit_state",
         "audit_prompts",
         "audit_chunking",

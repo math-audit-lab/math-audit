@@ -11,6 +11,19 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from audit_chunking import build_auto_chunks, ensure_chunk_display_labels
+from audit_models import (
+    DEFAULT_MODEL,
+    DEFAULT_REASONING_EFFORT,
+    MODEL_CHOICES,
+    default_reasoning_effort_for_model,
+    model_choices,
+    model_display_choices,
+    model_display_name,
+    model_guidance,
+    normalize_model_and_reasoning_effort,
+    reasoning_effort_guidance_for_model,
+    supported_reasoning_efforts_for_model,
+)
 from audit_prompts import (
     SHIPPED_AUDIT_SYSTEM_PROMPT,
     effective_audit_system_prompt_with_source,
@@ -54,22 +67,8 @@ from audit_verification import (
     save_verification_state,
 )
 
-DEFAULT_MODEL = "gpt-5.5"
-DEFAULT_REASONING_EFFORT = "high"
 WORKING_STATUSES = {"queued", "in_progress"}
 FAILED_VERIFICATION_STATUSES = {"failed", "timeout"}
-MODEL_CHOICES = ("gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-mini", "gpt-5.2")
-LEGACY_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
-MODEL_REASONING_EFFORTS = {
-    "gpt-5.5": ("none", "low", "medium", "high", "xhigh"),
-    "gpt-5.5-pro": ("high",),
-    "gpt-5.4-pro": ("medium", "high", "xhigh"),
-}
-MODEL_DEFAULT_REASONING_EFFORTS = {
-    "gpt-5.5": "xhigh",
-    "gpt-5.5-pro": "high",
-    "gpt-5.4-pro": "high",
-}
 
 _OPENAI_CLIENT = None
 _PROMPT_BUILDER_HOOK: Optional[Callable[[dict[str, Any], dict[str, Any]], list[dict[str, Any]]]] = None
@@ -249,39 +248,6 @@ def _resolve_audit_system_prompt(
 
 def _ensure_timing_state(session: dict[str, Any]) -> dict[str, Any]:
     return _audit_state_ensure_timing_state(session, default_model=DEFAULT_MODEL)
-
-
-def _model_family(model: str) -> str:
-    clean = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    for candidate in sorted(MODEL_REASONING_EFFORTS, key=len, reverse=True):
-        if clean == candidate or clean.startswith(candidate + "-"):
-            return candidate
-    return clean
-
-
-def model_choices() -> list[str]:
-    return list(MODEL_CHOICES)
-
-
-def supported_reasoning_efforts_for_model(model: str) -> list[str]:
-    return list(MODEL_REASONING_EFFORTS.get(_model_family(model), LEGACY_REASONING_EFFORTS))
-
-
-def default_reasoning_effort_for_model(model: str) -> str:
-    return MODEL_DEFAULT_REASONING_EFFORTS.get(_model_family(model), DEFAULT_REASONING_EFFORT)
-
-
-def normalize_model_and_reasoning_effort(
-    model: Optional[str] = None,
-    reasoning_effort: Optional[str] = None,
-) -> tuple[str, str]:
-    clean_model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    supported = supported_reasoning_efforts_for_model(clean_model)
-    default_effort = default_reasoning_effort_for_model(clean_model)
-    clean_effort = str(reasoning_effort or "").strip().lower()
-    if clean_effort not in supported:
-        clean_effort = default_effort
-    return clean_model, clean_effort
 
 
 def set_openai_client(client) -> None:
@@ -8455,6 +8421,9 @@ __all__ = [
     "list_qa_threads",
     "load_qa_turns",
     "model_choices",
+    "model_display_choices",
+    "model_display_name",
+    "model_guidance",
     "normalize_model_and_reasoning_effort",
     "process_one_chunk",
     "QA_CONTEXT_MODES",
@@ -8465,6 +8434,7 @@ __all__ = [
     "refresh_report_latex_compile_health_sidecar",
     "report_latex_compile_health",
     "request_pause",
+    "reasoning_effort_guidance_for_model",
     "rerun_failed_verification_chunks",
     "rerun_selected_chunks",
     "resume_audit",

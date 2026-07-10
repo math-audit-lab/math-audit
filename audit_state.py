@@ -5,31 +5,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from audit_models import (
+    GPT56_SOL_CACHE_WRITE_LIMITATION,
+    LONG_CONTEXT_INPUT_TOKEN_THRESHOLD,
+    LONG_CONTEXT_PRICING_USD_PER_1M,
+    PRICING_USD_PER_1M,
+    pricing_key_for_model,
+)
 
-# Standard-tier prices in USD per 1M tokens.
-# Update these if OpenAI pricing changes.
-PRICING_USD_PER_1M = {
-    "gpt-5.5": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
-    "gpt-5.5-pro": {"input": 30.00, "cached_input": None, "output": 180.00},
-    "gpt-5.4": {"input": 2.50, "cached_input": 0.25, "output": 15.00},
-    "gpt-5.4-pro": {"input": 30.00, "cached_input": None, "output": 180.00},
-    "gpt-5": {"input": 1.25, "cached_input": 0.125, "output": 10.00},
-    "gpt-5-mini": {"input": 0.25, "cached_input": 0.025, "output": 2.00},
-    "gpt-5-nano": {"input": 0.05, "cached_input": 0.005, "output": 0.40},
-}
-
-LONG_CONTEXT_INPUT_TOKEN_THRESHOLD = 270_000
 LOW_CACHED_INPUT_RATIO_WARNING_THRESHOLD = 0.10
 LOW_CACHED_INPUT_REUSE_WARNING = (
     "Low cached-input reuse for this chunk; cost may be higher, especially after resume/relaunch."
 )
-
-LONG_CONTEXT_PRICING_USD_PER_1M = {
-    "gpt-5.5": {"input": 10.00, "cached_input": 1.00, "output": 45.00},
-    "gpt-5.5-pro": {"input": 60.00, "cached_input": None, "output": 270.00},
-    "gpt-5.4": {"input": 5.00, "cached_input": 0.50, "output": 22.50},
-    "gpt-5.4-pro": {"input": 60.00, "cached_input": None, "output": 270.00},
-}
 
 
 def utc_now() -> str:
@@ -192,26 +179,35 @@ def save_manifest(session: dict[str, Any], manifest: dict[str, Any]) -> None:
 
 def pricing_context_for_model_usage(model: str, usage_obj: Optional[dict[str, Any]] = None) -> str:
     usage_obj = usage_obj or {}
+    pricing_key = pricing_key_for_model(model)
     input_tokens = int(usage_obj.get("input_tokens", 0) or 0)
-    if model in LONG_CONTEXT_PRICING_USD_PER_1M and input_tokens > LONG_CONTEXT_INPUT_TOKEN_THRESHOLD:
+    if pricing_key in LONG_CONTEXT_PRICING_USD_PER_1M and input_tokens > LONG_CONTEXT_INPUT_TOKEN_THRESHOLD:
         return "long"
     return "short"
 
 
 def pricing_for_model(model: str, usage_obj: Optional[dict[str, Any]] = None) -> dict[str, Optional[float]]:
+    pricing_key = pricing_key_for_model(model)
     if pricing_context_for_model_usage(model, usage_obj) == "long":
-        return LONG_CONTEXT_PRICING_USD_PER_1M[model]
-    if model in PRICING_USD_PER_1M:
-        return PRICING_USD_PER_1M[model]
+        return LONG_CONTEXT_PRICING_USD_PER_1M[pricing_key]
+    if pricing_key in PRICING_USD_PER_1M:
+        return PRICING_USD_PER_1M[pricing_key]
     return {"input": 0.0, "cached_input": 0.0, "output": 0.0}
 
 
 def compute_usage_cost(model: str, usage_obj: dict[str, Any]) -> dict[str, Any]:
+    pricing_key = pricing_key_for_model(model)
     pricing_context = pricing_context_for_model_usage(model, usage_obj)
     pricing = pricing_for_model(model, usage_obj)
+    pricing_available = pricing_key in PRICING_USD_PER_1M or (
+        pricing_context == "long" and pricing_key in LONG_CONTEXT_PRICING_USD_PER_1M
+    )
     input_tokens = int(usage_obj.get("input_tokens", 0) or 0)
     output_tokens = int(usage_obj.get("output_tokens", 0) or 0)
     cached_tokens = int(((usage_obj.get("input_tokens_details") or {}).get("cached_tokens", 0)) or 0)
+    pricing_limitations: list[str] = []
+    if pricing_key == "gpt-5.6-sol":
+        pricing_limitations.append(GPT56_SOL_CACHE_WRITE_LIMITATION)
 
     if pricing.get("cached_input") is None:
         billable_uncached = input_tokens
@@ -229,10 +225,13 @@ def compute_usage_cost(model: str, usage_obj: dict[str, Any]) -> dict[str, Any]:
         "output_cost": output_cost,
         "total_cost": input_cost + cached_cost + output_cost,
         "pricing_context": pricing_context,
+        "pricing_model": pricing_key,
+        "pricing_available": pricing_available,
         "pricing_rates_usd_per_1m": dict(pricing),
         "pricing_input_token_threshold": (
-            LONG_CONTEXT_INPUT_TOKEN_THRESHOLD if model in LONG_CONTEXT_PRICING_USD_PER_1M else None
+            LONG_CONTEXT_INPUT_TOKEN_THRESHOLD if pricing_key in LONG_CONTEXT_PRICING_USD_PER_1M else None
         ),
+        "pricing_limitations": pricing_limitations,
     }
 
 

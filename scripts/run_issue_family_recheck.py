@@ -16,7 +16,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from audit_runtime import _get_client, to_jsonable, wait_for_response  # noqa: E402
+from audit_runtime import (  # noqa: E402
+    DEFAULT_MODEL,
+    DEFAULT_REASONING_EFFORT,
+    _get_client,
+    normalize_model_and_reasoning_effort,
+    to_jsonable,
+    wait_for_response,
+)
 from audit_state import compute_usage_cost, session_paths, usage_cache_diagnostics  # noqa: E402
 
 
@@ -690,8 +697,10 @@ def run_issue_family_recheck(
     validate_result_schema(RESULT_SCHEMA)
 
     session = _load_session(audit_workdir)
-    selected_model = str(model or session.get("model") or "gpt-5.5")
-    selected_effort = str(reasoning_effort or session.get("reasoning_effort") or "xhigh")
+    selected_model, selected_effort = normalize_model_and_reasoning_effort(
+        model or session.get("model") or DEFAULT_MODEL,
+        reasoning_effort or session.get("reasoning_effort") or DEFAULT_REASONING_EFFORT,
+    )
     families_payload = _load_json(families_json, default={})
     if not isinstance(families_payload, dict):
         raise RuntimeError(f"Families JSON is not an object: {families_json}")

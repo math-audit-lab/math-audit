@@ -19,11 +19,14 @@ from audit_runtime import (
     AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL,
     AUDIT_RESPONSE_SCHEMA,
     AUDIT_SYSTEM_PROMPT,
+    DEFAULT_MODEL,
+    DEFAULT_REASONING_EFFORT,
     FRESH_CONTEXT_TEXT_FIRST_NOTE,
     _audit_request_size_diagnostics,
     _coerce_audit_payload,
     _get_client,
     build_fresh_audit_context_for_chunk,
+    normalize_model_and_reasoning_effort,
     parse_audit_response,
     render_audit_markdown,
     to_jsonable,
@@ -271,8 +274,10 @@ def run_context_mode_ab_test(
 
     source_paths = session_paths(audit_workdir)
     source_session, manifest, issues = _load_source_state(audit_workdir)
-    selected_model = str(model or source_session.get("model") or "gpt-5.5")
-    selected_effort = str(reasoning_effort or source_session.get("reasoning_effort") or "xhigh")
+    selected_model, selected_effort = normalize_model_and_reasoning_effort(
+        model or source_session.get("model") or DEFAULT_MODEL,
+        reasoning_effort or source_session.get("reasoning_effort") or DEFAULT_REASONING_EFFORT,
+    )
     chunks = manifest.get("chunks") or []
     if not isinstance(chunks, list):
         raise RuntimeError(f"Manifest has no chunk list: {source_paths['manifest']}")

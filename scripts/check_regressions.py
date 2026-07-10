@@ -65,7 +65,7 @@ from audit_runtime import (
     report_latex_paragraph,
     report_latex_compile_health,
 )
-from audit_state import save_json, session_paths, usage_cache_diagnostics
+from audit_state import compute_usage_cost, pricing_for_model, save_json, session_paths, usage_cache_diagnostics
 from audit_verification import _check_verification_script_safety
 from gui_controller import (
     format_chunk_completion_log_line,
@@ -185,6 +185,51 @@ def _write_report_metadata(session: dict[str, Any], kind: str, generated_at: str
 def _assert(condition: bool, message: str) -> None:
     if not condition:
         raise RegressionFailure(message)
+
+
+def test_model_capabilities_defaults_and_pricing() -> None:
+    _assert(runtime.DEFAULT_MODEL == "gpt-5.6-sol", runtime.DEFAULT_MODEL)
+    _assert(runtime.DEFAULT_REASONING_EFFORT == "xhigh", runtime.DEFAULT_REASONING_EFFORT)
+    _assert(runtime.model_choices()[0] == "gpt-5.6-sol", str(runtime.model_choices()))
+    _assert(runtime.model_display_name("gpt-5.6-sol") == "GPT-5.6 Sol — recommended", runtime.model_display_name("gpt-5.6-sol"))
+    _assert(
+        runtime.supported_reasoning_efforts_for_model("gpt-5.6-sol")
+        == ["none", "low", "medium", "high", "xhigh", "max"],
+        str(runtime.supported_reasoning_efforts_for_model("gpt-5.6-sol")),
+    )
+    _assert(runtime.default_reasoning_effort_for_model("gpt-5.6-sol") == "xhigh", "bad Sol default")
+    _assert(runtime.normalize_model_and_reasoning_effort(None, None) == ("gpt-5.6-sol", "xhigh"), "bad global default")
+    _assert(
+        runtime.normalize_model_and_reasoning_effort("GPT-5.6 Sol — recommended", "max")
+        == ("gpt-5.6-sol", "max"),
+        "display label did not normalize to API model id",
+    )
+    _assert(runtime.normalize_model_and_reasoning_effort("gpt-5.5", "xhigh") == ("gpt-5.5", "xhigh"), "GPT-5.5 xhigh changed")
+    _assert("max" not in runtime.supported_reasoning_efforts_for_model("gpt-5.5"), "GPT-5.5 exposes max")
+    _assert(runtime.normalize_model_and_reasoning_effort("gpt-5.5", "max") == ("gpt-5.5", "xhigh"), "GPT-5.5 max not normalized")
+    _assert(runtime.normalize_model_and_reasoning_effort("gpt-5.6-sol", "unsupported") == ("gpt-5.6-sol", "xhigh"), "bad effort not normalized")
+
+    usage = {
+        "input_tokens": 100_000,
+        "input_tokens_details": {"cached_tokens": 20_000},
+        "output_tokens": 10_000,
+        "total_tokens": 110_000,
+    }
+    sol_cost = compute_usage_cost("gpt-5.6-sol", usage)
+    _assert(pricing_for_model("gpt-5.6-sol") == {"input": 5.0, "cached_input": 0.5, "output": 30.0}, str(sol_cost))
+    _assert(abs(sol_cost["total_cost"] - 0.71) < 1e-9, str(sol_cost))
+    _assert(sol_cost["pricing_model"] == "gpt-5.6-sol", str(sol_cost))
+    _assert(sol_cost["pricing_available"] is True, str(sol_cost))
+    _assert(sol_cost["pricing_limitations"], str(sol_cost))
+
+    gpt55_cost = compute_usage_cost("gpt-5.5", usage)
+    _assert(abs(gpt55_cost["total_cost"] - 0.71) < 1e-9, str(gpt55_cost))
+    _assert(gpt55_cost["pricing_model"] == "gpt-5.5", str(gpt55_cost))
+    _assert(not gpt55_cost["pricing_limitations"], str(gpt55_cost))
+
+    unknown_cost = compute_usage_cost("unknown-model", usage)
+    _assert(unknown_cost["total_cost"] == 0.0, str(unknown_cost))
+    _assert(unknown_cost["pricing_available"] is False, str(unknown_cost))
 
 
 def test_report_freshness_detection() -> None:
@@ -4253,6 +4298,7 @@ def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
 
 def main() -> int:
     cases: list[tuple[str, Callable[[], None]]] = [
+        ("model capabilities defaults and pricing", test_model_capabilities_defaults_and_pricing),
         ("report freshness detection", test_report_freshness_detection),
         ("audit completion builds full and concise reports", test_audit_completion_builds_full_and_concise_reports),
         ("invalidated verification inventory warning", test_invalidated_verification_inventory_warning),

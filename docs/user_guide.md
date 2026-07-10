@@ -35,11 +35,13 @@ API usage can cost real money. Cost depends on the model, reasoning effort, pape
 
 - [OpenAI API pricing](https://openai.com/api/pricing/)
 
-As a rough planning estimate, GPT-5.5 with `xhigh` reasoning effort may cost about $1 per PDF page for mathematically dense audits. Nontechnical or expository pages may cost less, while proof-heavy pages may cost more. A 20-page PDF with GPT-5.5 at `xhigh` may plausibly cost around $15-$25, but this is only an estimate, not a promise.
+As a rough planning estimate, GPT-5.6 Sol with `xhigh` reasoning effort may cost about $1 per PDF page for mathematically dense audits. Nontechnical or expository pages may cost less, while proof-heavy pages may cost more. A 20-page PDF with GPT-5.6 Sol at `xhigh` may plausibly cost around $15-$25, but this is only an estimate, not a promise.
 
 Cheaper models or lower reasoning effort can reduce cost, but they may noticeably reduce audit quality.
 
-> **Cost warning for GPT-5.5-pro:** GPT-5.5-pro is much more expensive than regular GPT-5.5. Its token rates are roughly 6 times higher, and it may not receive the same cached-input discount. Do not choose GPT-5.5-pro unless you are prepared for a much larger bill. A 20-page audit that might cost around $15-$25 with GPT-5.5 could plausibly exceed $100 with GPT-5.5-pro depending on token use and reasoning output.
+The app's local cost estimates are best-effort calculations from token usage metadata. They may differ from platform billing in edge cases; in particular, GPT-5.6 Sol cache-write charges are not estimated separately unless the API usage metadata exposes those token counts reliably.
+
+> **Cost warning for GPT-5.5-pro:** GPT-5.5-pro is much more expensive than regular GPT-5.6 Sol or GPT-5.5. Its token rates are roughly 6 times higher, and it may not receive the same cached-input discount. Do not choose GPT-5.5-pro unless you are prepared for a much larger bill. A 20-page audit that might cost around $15-$25 with GPT-5.6 Sol or GPT-5.5 could plausibly exceed $100 with GPT-5.5-pro depending on token use and reasoning output.
 
 ## 1. Install Conda/Miniforge and Download Math Paper Audit
 
@@ -166,7 +168,9 @@ The default context mode is the continuous-conversation audit flow. It is the st
 
 After selecting the PDF, choose model/reasoning settings and click **Start Fresh Audit**. The app will break the paper into chunks and audit them using OpenAI API calls. It creates an audit workdir next to the selected PDF; that folder contains the generated reports and saved audit state.
 
-For serious research-level mathematical manuscript analysis, GPT-5.5 with `xhigh` reasoning effort is the recommended setting. Lower reasoning effort or cheaper/earlier models can reduce cost, but they may noticeably reduce audit quality. It is reasonable to experiment with cheaper settings while testing the app or reading mostly expository material, but be cautious about relying on lower-quality settings for real mathematical auditing.
+For serious research-level mathematical manuscript analysis, GPT-5.6 Sol with `xhigh` reasoning effort is the recommended default for new audits. GPT-5.5 remains selectable for comparison and compatibility with older runs. The `max` effort for GPT-5.6 Sol is available for the hardest quality-first audits or focused rechecks, but it is not the global default because it can increase latency and token use.
+
+Lower reasoning effort or cheaper/earlier models can reduce cost, but they may noticeably reduce audit quality. It is reasonable to experiment with cheaper settings while testing the app or reading mostly expository material, but be cautious about relying on lower-quality settings for real mathematical auditing. Existing audits resume with the model and reasoning effort saved in their audit session.
 
 For a paper named `demo_paper.pdf`, the default workdir is:
 

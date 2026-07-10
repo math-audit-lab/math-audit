@@ -106,13 +106,16 @@ The PySide6 app is the primary maintained frontend for this public preview.
 
 1. Choose a paper PDF with **Browse...**.
 2. Optionally place a same-basename TeX file next to the PDF, for example `paper.pdf` and `paper.tex`.
-3. Click **Start Fresh Audit**.
-4. Monitor progress, cost, chunks, pages, and status in the GUI.
-5. Use **Quick review** to build/open a concise report.
-6. Run the verification suite and inspect verification progress/results.
-7. Rerun failed-verification chunks if needed.
-8. Rebuild/open final reports after verification and repairs.
-9. Optionally export a ChatGPT context pack for manual handoff outside the app.
+3. Use the default GPT-5.6 Sol / `xhigh` setting for serious research-level audits, or select GPT-5.5 for comparison/compatibility with older runs. GPT-5.6 Sol `max` is available for the hardest quality-first audits or focused rechecks, but it is not the default.
+4. Click **Start Fresh Audit**.
+5. Monitor progress, cost, chunks, pages, and status in the GUI.
+6. Use **Quick review** to build/open a concise report.
+7. Run the verification suite and inspect verification progress/results.
+8. Rerun failed-verification chunks if needed.
+9. Rebuild/open final reports after verification and repairs.
+10. Optionally export a ChatGPT context pack for manual handoff outside the app.
+
+Existing audits resume with the model and reasoning effort saved in their audit session; selecting a new default does not silently migrate old runs.
 
 ## Reports
 
