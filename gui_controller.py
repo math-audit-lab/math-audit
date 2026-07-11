@@ -50,6 +50,8 @@ from audit_runtime import (
     rerun_selected_chunks as runtime_rerun_selected_chunks,
     run_verification_finding_rechecks,
     run_verification_replacement_checks as runtime_run_verification_replacement_checks,
+    run_verification_technical_repairs,
+    run_verification_technical_replacement_checks as runtime_run_verification_technical_replacement_checks,
     resume_audit,
     run_issue_family_recheck_live,
     run_verification_suite_and_build_report,
@@ -982,6 +984,53 @@ class GuiController(QObject):
             rebuild_reports=True,
         )
 
+    def repair_verification_scripts(self, selection: str = "") -> None:
+        if self.has_active_task():
+            self.log_message.emit("Technical script repair is only available when no local GUI task is active.")
+            return
+        if not self._require_session() or not self._require_api_key_for_live_calls():
+            return
+        payload = self._load_status_payload()
+        session = payload.get("session") or {}
+        status = payload.get("status") or {}
+        inventory = (payload.get("verification_suite") or {}).get("verification_technical_repair_candidates") or {}
+        if session.get("pending") or str(status.get("status") or "") not in {"completed", "paused"}:
+            self.log_message.emit("Technical repairs require a completed or paused audit with no pending response.")
+            return
+        if int((inventory.get("summary") or {}).get("eligible_count", 0) or 0) <= 0:
+            self.log_message.emit("No eligible technical verification failures require repair.")
+            return
+        model = self.model if self._model_effort_override_active else None
+        reasoning_effort = self.reasoning_effort if self._model_effort_override_active else None
+        self._run_backend_task(
+            "Repair Failed Verification Scripts",
+            run_verification_technical_repairs,
+            self._handle_verification_technical_repair_result,
+            self.pdf_path,
+            selection=str(selection or "").strip() or None,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            rebuild_reports=True,
+        )
+
+    def run_verification_technical_replacement_checks(
+        self, repair_id: str, check_ids: list[str]
+    ) -> None:
+        if self.has_active_task():
+            self.log_message.emit("Technical replacement execution is only available when no task is active.")
+            return
+        if not self._require_session():
+            return
+        self._run_backend_task(
+            "Run Technical Replacement Checks",
+            runtime_run_verification_technical_replacement_checks,
+            self._handle_verification_technical_replacement_result,
+            self.pdf_path,
+            repair_id=str(repair_id),
+            check_ids=list(check_ids),
+            rebuild_reports=True,
+        )
+
     def ask_about_paper(self, question: str) -> None:
         clean = str(question or "").strip()
         if not clean:
@@ -1474,6 +1523,50 @@ class GuiController(QObject):
         if report_paths:
             self.report_output.emit(self._format_path_payload("Replacement verification report outputs", report_paths))
         self.status_updated.emit(self._normalize_status_payload(result))
+        self._emit_current_status()
+
+    def _handle_verification_technical_repair_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected technical-repair result.")
+            return
+        lines = [
+            f"Technical verification repair generation finished: {int(result.get('completed_count', 0) or 0)} completed, "
+            f"{int(result.get('failed_count', 0) or 0)} failed.",
+            f"API cost: ${float(result.get('verification_technical_repair_cost', 0.0) or 0.0):.4f}; "
+            f"tokens: {int(result.get('verification_technical_repair_tokens', 0) or 0)}; "
+            f"runtime: {float(result.get('verification_technical_repair_runtime', 0.0) or 0.0):.2f}s.",
+            "Review complete replacement code before local execution.",
+        ]
+        for item in result.get("repairs") or []:
+            if isinstance(item, dict):
+                lines.append(
+                    f"- {item.get('script_id')}: {item.get('status')} | "
+                    f"ready replacements {int(item.get('replacement_ready_count', 0) or 0)}"
+                )
+        message = "\n".join(lines)
+        self.log_message.emit(message)
+        self.report_output.emit(message)
+        self._emit_current_status()
+
+    def _handle_verification_technical_replacement_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected technical replacement result.")
+            return
+        attempts = result.get("attempts") or []
+        lines = [f"Technical replacement execution finished: {len(attempts)} check(s)."]
+        for attempt in attempts:
+            event = attempt.get("event") if isinstance(attempt, dict) else {}
+            lines.append(
+                f"- {event.get('replacement_check_id')}: {event.get('execution_status') or 'unknown'} / "
+                f"{event.get('mathematical_outcome') or 'outcome not reported'}"
+            )
+        lines.append(
+            f"Local runtime: {float(result.get('verification_technical_repair_local_runtime', 0.0) or 0.0):.2f}s; "
+            "API cost: $0.0000"
+        )
+        message = "\n".join(lines)
+        self.log_message.emit(message)
+        self.report_output.emit(message)
         self._emit_current_status()
 
     def _handle_discussion_result(self, result: Any) -> None:

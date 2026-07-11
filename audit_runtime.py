@@ -59,6 +59,7 @@ from audit_verification import (
     NEGATIVE_VERIFICATION_OUTCOMES,
     TECHNICAL_VERIFICATION_FAILURE_STATUSES,
     VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA,
+    VERIFICATION_TECHNICAL_REPAIR_RESPONSE_SCHEMA,
     _chunk_id_from_script_name,
     _chunk_index_from_chunk_id,
     _collect_verification_scripts,
@@ -69,19 +70,28 @@ from audit_verification import (
     append_verification_finding_recheck_event,
     build_verification_finding_recheck_evidence,
     build_verification_finding_recheck_prompt,
+    build_verification_technical_repair_evidence,
+    build_verification_technical_repair_prompt,
     persist_verification_replacement_proposals,
+    persist_verification_technical_repair_proposals,
     load_verification_state,
     run_verification_replacement_checks as _run_verification_replacement_checks,
+    run_verification_technical_replacement_checks as _run_verification_technical_replacement_checks,
     run_verification_suite,
     save_verification_state,
     supersede_verification_findings_for_chunks,
     validate_verification_finding_recheck_response,
+    validate_verification_technical_repair_response,
     verification_finding_recheck_candidates,
     verification_finding_recheck_map,
     verification_finding_recheck_summary,
     verification_finding_rechecks_for_session,
     verification_findings_for_session,
     verification_replacement_check_inventory,
+    verification_technical_repair_candidates,
+    verification_technical_repair_inventory,
+    verification_technical_repair_records,
+    append_verification_technical_repair_event,
     verification_result_needs_technical_retry,
 )
 
@@ -1138,6 +1148,20 @@ def _verification_replacement_timestamp(session: dict[str, Any]) -> Optional[dat
     return max(available) if available else None
 
 
+def _verification_technical_repair_timestamp(session: dict[str, Any]) -> Optional[datetime]:
+    root = Path(session["workdir"]) / "verification_technical_repairs"
+    timestamps = [
+        _jsonl_event_timestamp(path)
+        for path in root.glob("*/replacement_execution_events.jsonl")
+        if path.is_file()
+    ]
+    state_timestamp = _jsonl_event_timestamp(
+        session_paths(session["workdir"])["verification_technical_repairs"]
+    )
+    available = [item for item in [state_timestamp, *timestamps] if item is not None]
+    return max(available) if available else None
+
+
 def _read_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -1205,6 +1229,11 @@ def _report_freshness_sources(session: dict[str, Any], kind: str) -> list[dict[s
                     root / "verification_finding_rechecks",
                 ),
                 (
+                    "verification technical repairs",
+                    _verification_technical_repair_timestamp(session),
+                    paths["verification_technical_repairs"],
+                ),
+                (
                     "selected chunk rerun log",
                     _jsonl_event_timestamp(root / "logs" / "selected_chunk_reruns.jsonl"),
                     root / "logs" / "selected_chunk_reruns.jsonl",
@@ -1243,6 +1272,11 @@ def _report_freshness_sources(session: dict[str, Any], kind: str) -> list[dict[s
                     "verification replacement executions",
                     _verification_replacement_timestamp(session),
                     root / "verification_finding_rechecks",
+                ),
+                (
+                    "verification technical repairs",
+                    _verification_technical_repair_timestamp(session),
+                    paths["verification_technical_repairs"],
                 ),
                 (
                     "selected chunk rerun log",
@@ -1938,9 +1972,16 @@ def get_failed_verification_chunks(session_or_pdf: dict[str, Any] | str | Path) 
     session = _resolve_session(session_or_pdf)
     state = load_verification_state(session)
     results = _load_verification_results(session, state=state)
+    repaired_scripts = {
+        str(item.get("script_id") or "")
+        for item in verification_technical_repair_inventory(session).get("groups") or []
+        if (item.get("reconciliation") or {}).get("technical_failure_repaired")
+    }
     grouped: dict[str, dict[str, Any]] = {}
     for result in results:
         if not verification_result_needs_technical_retry(result):
+            continue
+        if _verification_result_script_name(result) in repaired_scripts:
             continue
         chunk_id = str(result.get("chunk_id") or "").strip()
         if not chunk_id:
@@ -3219,6 +3260,302 @@ def run_verification_finding_rechecks(
     }
 
 
+def _select_verification_technical_repair_candidates(
+    session: dict[str, Any], selection: Any = None
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    inventory = verification_technical_repair_candidates(session)
+    candidates = [item for item in inventory.get("candidates") or [] if item.get("eligible")]
+    requested = _normalize_verification_finding_recheck_selection(selection)
+    requested.discard("all")
+    if requested:
+        candidates = [
+            item for item in candidates
+            if str(item.get("script_id") or "") in requested or str(item.get("chunk_id") or "") in requested
+        ]
+        matched = {
+            token for token in requested
+            if any(token in {str(item.get("script_id") or ""), str(item.get("chunk_id") or "")} for item in candidates)
+        }
+        if requested - matched:
+            raise ValueError(
+                "No eligible technical repair candidate matched: " + ", ".join(sorted(requested - matched))
+            )
+    if not candidates:
+        raise RuntimeError("No eligible technical verification failures require repair.")
+    return inventory, candidates
+
+
+def prepare_verification_technical_repair_preview(
+    session_or_pdf: dict[str, Any] | str | Path, selection: Any = None,
+    output_dir: Optional[str | Path] = None, max_context_chars: int = 12000,
+) -> dict[str, Any]:
+    session = _resolve_session(session_or_pdf)
+    inventory, candidates = _select_verification_technical_repair_candidates(session, selection)
+    model, reasoning_effort = resolve_verification_finding_recheck_settings(session)
+    output_root = Path(output_dir).expanduser().resolve() if output_dir is not None else None
+    if output_root is not None:
+        workdir = Path(session["workdir"]).resolve()
+        try:
+            output_root.relative_to(workdir)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Technical repair preview output must be outside the audit workdir.")
+        output_root.mkdir(parents=True, exist_ok=True)
+    previews = []
+    for candidate in candidates:
+        script_id = str(candidate.get("script_id") or "script")
+        repair_id = f"technical_repair_preview_{_artifact_timestamp_token()}_{Path(script_id).stem}"
+        evidence = build_verification_technical_repair_evidence(
+            session, candidate, max_context_chars=max_context_chars
+        )
+        prompt = build_verification_technical_repair_prompt(evidence, repair_id)
+        artifacts = {}
+        if output_root is not None:
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(script_id).stem)
+            evidence_path = output_root / f"{safe_name}.failure_evidence.json"
+            prompt_path = output_root / f"{safe_name}.repair_prompt.txt"
+            save_json(evidence_path, evidence)
+            prompt_path.write_text(prompt, encoding="utf-8")
+            artifacts = {"evidence": str(evidence_path), "prompt": str(prompt_path)}
+        previews.append({"repair_id": repair_id, "candidate": candidate, "evidence": evidence, "prompt": prompt, "artifacts": artifacts})
+    manifest = {
+        "schema_version": 1,
+        "workflow": "verification_technical_repair",
+        "dry_run": True,
+        "generated_at": utc_now(),
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "candidate_count": len(previews),
+    }
+    if output_root is not None:
+        path = output_root / "verification_technical_repair_preview_manifest.json"
+        save_json(path, manifest)
+        manifest["path"] = str(path)
+    return {"manifest": manifest, "inventory": inventory, "previews": previews}
+
+
+def _extract_verification_technical_repair_response(resp: Any) -> dict[str, Any]:
+    parsed = getattr(resp, "output_parsed", None)
+    if isinstance(parsed, dict):
+        return validate_verification_technical_repair_response(parsed)
+    raw_text = str(getattr(resp, "output_text", None) or "").strip()
+    if not raw_text:
+        raise ValueError("Could not locate structured technical repair output.")
+    return validate_verification_technical_repair_response(extract_json_object(raw_text))
+
+
+def run_verification_technical_repairs(
+    session_or_pdf: dict[str, Any] | str | Path, selection: Any = None,
+    model: Optional[str] = None, reasoning_effort: Optional[str] = None,
+    rebuild_reports: bool = True, max_context_chars: int = 12000,
+    poll_every: float = 2.0, max_wait_seconds: Optional[float] = None,
+) -> dict[str, Any]:
+    session = _resolve_session(session_or_pdf)
+    status = load_status(session)
+    if session.get("pending"):
+        raise RuntimeError("Cannot repair verification scripts while an audit response is pending.")
+    if str(status.get("status") or "").lower() not in {"completed", "paused"}:
+        raise RuntimeError("Technical repairs are available only for completed or paused audits.")
+    inventory, candidates = _select_verification_technical_repair_candidates(session, selection)
+    selected_model, selected_effort = resolve_verification_finding_recheck_settings(
+        session, model=model, reasoning_effort=reasoning_effort
+    )
+    root = Path(session["workdir"])
+    repairs_root = root / "verification_technical_repairs"
+    repairs_root.mkdir(parents=True, exist_ok=True)
+    log_path = root / "logs" / "verification_technical_repairs.jsonl"
+    client = _get_client()
+    outcomes = []
+    completed_count = 0
+    prior_by_script = {
+        str(item.get("script_id") or ""): item for item in verification_technical_repair_records(session)
+    }
+    for candidate in candidates:
+        script_id = str(candidate.get("script_id") or "script")
+        chunk_id = str(candidate.get("chunk_id") or "")
+        repair_id = f"technical_repair_{_artifact_timestamp_token()}_{Path(script_id).stem}"
+        artifact_root = repairs_root / repair_id
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        evidence = build_verification_technical_repair_evidence(
+            session, candidate, max_context_chars=max_context_chars
+        )
+        prompt = build_verification_technical_repair_prompt(evidence, repair_id)
+        evidence_path = artifact_root / "failure_evidence.json"
+        prompt_path = artifact_root / "prompt.txt"
+        request_path = artifact_root / "request.json"
+        raw_response_path = artifact_root / "response.raw.json"
+        raw_text_path = artifact_root / "response.raw.txt"
+        result_path = artifact_root / "response.structured.json"
+        save_json(evidence_path, evidence)
+        prompt_path.write_text(prompt, encoding="utf-8")
+        (artifact_root / "original_script.py").write_text(
+            str((evidence.get("verification_failure") or {}).get("complete_original_python_script") or ""),
+            encoding="utf-8",
+        )
+        request_input = [
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": (
+                    "Repair one technically failed verification script from complete evidence. Preserve the original "
+                    "script/result and return the strict advisory repair schema."
+                )}],
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+        ]
+        request_kwargs = {
+            "model": selected_model,
+            "reasoning": {"effort": selected_effort},
+            "input": request_input,
+            "text": {"format": {
+                "type": "json_schema", "name": "verification_technical_repair", "strict": True,
+                "schema": VERIFICATION_TECHNICAL_REPAIR_RESPONSE_SCHEMA,
+            }},
+            "background": bool(session.get("background", True)),
+            "store": bool(session.get("store", True)),
+        }
+        save_json(request_path, {"time": utc_now(), "workflow": "verification_technical_repair", "repair_id": repair_id, "request": request_kwargs})
+        supersedes = str((prior_by_script.get(script_id) or {}).get("repair_id") or "") or None
+        started = append_verification_technical_repair_event(
+            session,
+            {
+                "event": "started", "status": "started", "repair_id": repair_id,
+                "script_id": script_id, "chunk_id": chunk_id,
+                "failure_type": candidate.get("execution_status"), "failure_reason": candidate.get("failure_reason"),
+                "model": selected_model, "reasoning_effort": selected_effort,
+                "artifact_root": str(artifact_root.relative_to(root)),
+                "request_path": str(request_path.relative_to(root)),
+                "input_evidence_hashes": evidence.get("input_evidence_hashes") or {},
+                "supersedes_repair_id": supersedes,
+            },
+        )
+        append_jsonl(log_path, started)
+        response_id = None
+        usage_info = {}
+        started_at = time.time()
+        try:
+            resp = client.responses.create(**request_kwargs)
+            response_id = getattr(resp, "id", None)
+            if getattr(resp, "status", None) in WORKING_STATUSES:
+                resp = wait_for_response(resp.id, poll_every=poll_every, max_wait_seconds=max_wait_seconds)
+            elapsed = max(0.0, time.time() - started_at)
+            save_json(raw_response_path, to_jsonable(resp))
+            raw_text = str(getattr(resp, "output_text", None) or "")
+            if raw_text:
+                raw_text_path.write_text(raw_text, encoding="utf-8")
+            usage_obj = to_jsonable(getattr(resp, "usage", {}) or {})
+            usage_info = update_usage_from_usage_obj(
+                session, chunk_id, usage_obj if isinstance(usage_obj, dict) else {},
+                model=selected_model, elapsed_seconds=elapsed,
+                activity_kind="verification_technical_repair", activity_id=repair_id,
+            )
+            if getattr(resp, "status", None) != "completed":
+                raise RuntimeError(f"Technical repair response ended with status={getattr(resp, 'status', None)!r}.")
+            structured = _extract_verification_technical_repair_response(resp)
+            if structured.get("repair_id") != repair_id or structured.get("script_id") != script_id:
+                raise ValueError("Technical repair response IDs do not match the request.")
+            if structured.get("chunk_id") != chunk_id or structured.get("failure_type") != candidate.get("execution_status"):
+                raise ValueError("Technical repair response chunk/failure type does not match the evidence.")
+            save_json(result_path, structured)
+            proposal_info = persist_verification_technical_repair_proposals(
+                session, repair_id=repair_id, artifact_root=artifact_root,
+                structured_result=structured, evidence=evidence,
+                model=selected_model, reasoning_effort=selected_effort,
+            )
+            completed = append_verification_technical_repair_event(
+                session,
+                {
+                    "event": "completed", "status": "completed", "canonical": True,
+                    "repair_id": repair_id, "script_id": script_id, "chunk_id": chunk_id,
+                    "failure_type": candidate.get("execution_status"), "failure_reason": candidate.get("failure_reason"),
+                    "model": selected_model, "reasoning_effort": selected_effort,
+                    "response_id": response_id, "artifact_root": str(artifact_root.relative_to(root)),
+                    "request_path": str(request_path.relative_to(root)),
+                    "response_path": str(raw_response_path.relative_to(root)),
+                    "result_path": str(result_path.relative_to(root)),
+                    "replacement_manifest_path": proposal_info.get("manifest_path"),
+                    "replacement_check_count": proposal_info.get("proposed_count", 0),
+                    "replacement_ready_count": proposal_info.get("ready_count", 0),
+                    "input_evidence_hashes": evidence.get("input_evidence_hashes") or {},
+                    "structured_result": structured,
+                    "usage": usage_info.get("usage") or {}, "cost": usage_info.get("cost") or {},
+                    "runtime_seconds": elapsed, "supersedes_repair_id": supersedes,
+                    "provisional": True,
+                },
+            )
+            append_jsonl(log_path, completed)
+            outcomes.append(completed)
+            prior_by_script[script_id] = completed
+            completed_count += 1
+        except Exception as exc:
+            failed = append_verification_technical_repair_event(
+                session,
+                {
+                    "event": "failed", "status": "failed", "canonical": False,
+                    "repair_id": repair_id, "script_id": script_id, "chunk_id": chunk_id,
+                    "failure_type": candidate.get("execution_status"), "model": selected_model,
+                    "reasoning_effort": selected_effort, "response_id": response_id,
+                    "artifact_root": str(artifact_root.relative_to(root)),
+                    "usage": usage_info.get("usage") or {}, "cost": usage_info.get("cost") or {},
+                    "runtime_seconds": max(0.0, time.time() - started_at),
+                    "error": f"{type(exc).__name__}: {exc}", "supersedes_repair_id": supersedes,
+                },
+            )
+            append_jsonl(log_path, failed)
+            outcomes.append(failed)
+    report_paths, report_warnings = _rebuild_reports_after_verification_change(session, rebuild_reports and bool(completed_count))
+    return {
+        "workflow": "verification_technical_repair", "model": selected_model,
+        "reasoning_effort": selected_effort, "candidate_inventory": inventory,
+        "selected_candidates": candidates, "repairs": outcomes,
+        "completed_count": completed_count, "failed_count": len(outcomes) - completed_count,
+        "verification_technical_repair_cost": sum(float((item.get("cost") or {}).get("total_cost", 0.0) or 0.0) for item in outcomes),
+        "verification_technical_repair_tokens": sum(int((item.get("usage") or {}).get("total_tokens", 0) or 0) for item in outcomes),
+        "verification_technical_repair_runtime": sum(float(item.get("runtime_seconds", 0.0) or 0.0) for item in outcomes),
+        "report_paths": report_paths, "report_generation_warnings": report_warnings,
+    }
+
+
+def _rebuild_reports_after_verification_change(
+    session: dict[str, Any], rebuild_reports: bool
+) -> tuple[dict[str, Any], list[str]]:
+    report_paths: dict[str, Any] = {}
+    warnings: list[str] = []
+    if not rebuild_reports:
+        return report_paths, warnings
+    for label, builder in (
+        ("verification", lambda: build_verification_report(session)),
+        ("full", lambda: build_final_report(session, write_separate_verification_report=False)),
+        ("concise", lambda: build_concise_report(session)),
+    ):
+        try:
+            report_paths[label] = builder()
+        except Exception as exc:
+            warnings.append(f"{label.title()} report rebuild failed: {type(exc).__name__}: {exc}")
+    return report_paths, warnings
+
+
+def run_verification_technical_replacement_checks(
+    session_or_pdf: dict[str, Any] | str | Path, repair_id: str,
+    check_ids: Optional[list[str]] = None, timeout: int = 120,
+    rebuild_reports: bool = True,
+    progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> dict[str, Any]:
+    session = _resolve_session(session_or_pdf)
+    status = load_status(session)
+    if session.get("pending"):
+        raise RuntimeError("Cannot run technical replacements while an audit response is pending.")
+    if str(status.get("status") or "").lower() not in {"completed", "paused"}:
+        raise RuntimeError("Technical replacements are available only for completed or paused audits.")
+    result = _run_verification_technical_replacement_checks(
+        session, repair_id=str(repair_id), check_ids=check_ids,
+        timeout=int(timeout), progress_callback=progress_callback,
+    )
+    report_paths, warnings = _rebuild_reports_after_verification_change(session, rebuild_reports)
+    result.update({"report_paths": report_paths, "report_generation_warnings": warnings})
+    return result
+
+
 def run_verification_replacement_checks(
     session_or_pdf: dict[str, Any] | str | Path,
     recheck_id: str,
@@ -3591,6 +3928,88 @@ def _verification_findings_tex(findings: list[dict[str, Any]]) -> str:
     return "".join(parts)
 
 
+def _verification_technical_repairs_markdown(session: dict[str, Any]) -> str:
+    groups = verification_technical_repair_inventory(session).get("groups") or []
+    if not groups:
+        return ""
+    lines = ["## Technical verification-script repairs", ""]
+    for group in groups:
+        reconciliation = group.get("reconciliation") or {}
+        lines.extend(
+            [
+                f"### {group.get('script_id') or 'verification script'}",
+                f"- Chunk: {group.get('chunk_id') or 'unknown'}",
+                f"- Original technical failure: {group.get('failure_type') or 'unknown'}",
+                f"- Failure reason: {normalize_math_delimiters(str(group.get('failure_reason') or 'not recorded'))}",
+                f"- Repair status: {str(reconciliation.get('status') or 'unresolved').replace('_', ' ')}",
+                f"- Interpretation: {normalize_math_delimiters(str(reconciliation.get('explanation') or 'Human review required.'))}",
+                f"- Recommended next action: {group.get('recommended_next_action') or 'human review'}",
+                f"- Repair-generation API cost: ${float((group.get('generation_cost') or {}).get('total_cost', 0.0) or 0.0):.4f}",
+                f"- Repair-generation tokens: {int((group.get('generation_usage') or {}).get('total_tokens', 0) or 0)}",
+                f"- Repair-generation runtime: {float(group.get('generation_runtime_seconds', 0.0) or 0.0):.2f}s",
+            ]
+        )
+        if group.get("no_replacement_reason"):
+            lines.append("- No replacement available: " + normalize_math_delimiters(str(group["no_replacement_reason"])))
+        for check in group.get("checks") or []:
+            latest = check.get("latest_execution") if isinstance(check.get("latest_execution"), dict) else {}
+            detail = (
+                f"{check.get('check_id')}: validation {(check.get('validation') or {}).get('status', 'unknown')}; "
+                f"scope preserved {'yes' if check.get('original_scope_preserved') else 'no'}"
+            )
+            if latest:
+                detail += (
+                    f"; execution {latest.get('execution_status') or 'unknown'}; "
+                    f"mathematical outcome {latest.get('mathematical_outcome') or 'not reported'}; "
+                    f"tested scope {json.dumps(check.get('tested_scope') or {}, ensure_ascii=False, sort_keys=True)}; "
+                    f"local runtime {float(latest.get('elapsed_seconds', 0.0) or 0.0):.2f}s; API cost $0.0000"
+                )
+            lines.append("- Replacement check: " + normalize_math_delimiters(detail))
+        lines.extend(["- Human mathematical review required: yes", ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _verification_technical_repairs_tex(session: dict[str, Any]) -> str:
+    groups = verification_technical_repair_inventory(session).get("groups") or []
+    if not groups:
+        return ""
+    parts = [r"\section*{Technical verification-script repairs}" + "\n"]
+    for group in groups:
+        reconciliation = group.get("reconciliation") or {}
+        parts.append(r"\subsection*{" + report_latex_paragraph(str(group.get("script_id") or "verification script")) + "}\n")
+        parts.append(r"\begin{itemize}" + "\n")
+        items = [
+            ("Chunk", group.get("chunk_id") or "unknown"),
+            ("Original technical failure", group.get("failure_type") or "unknown"),
+            ("Failure reason", group.get("failure_reason") or "not recorded"),
+            ("Repair status", str(reconciliation.get("status") or "unresolved").replace("_", " ")),
+            ("Interpretation", reconciliation.get("explanation") or "Human review required."),
+            ("Recommended next action", group.get("recommended_next_action") or "human review"),
+            ("Repair-generation API cost", f"${float((group.get('generation_cost') or {}).get('total_cost', 0.0) or 0.0):.4f}"),
+            ("Repair-generation tokens", int((group.get("generation_usage") or {}).get("total_tokens", 0) or 0)),
+            ("Repair-generation runtime", f"{float(group.get('generation_runtime_seconds', 0.0) or 0.0):.2f}s"),
+        ]
+        for label, value in items:
+            parts.append(r"\item " + report_latex_paragraph(f"{label}: {value}") + "\n")
+        for check in group.get("checks") or []:
+            latest = check.get("latest_execution") if isinstance(check.get("latest_execution"), dict) else {}
+            detail = (
+                f"{check.get('check_id')}: validation {(check.get('validation') or {}).get('status', 'unknown')}; "
+                f"scope preserved {'yes' if check.get('original_scope_preserved') else 'no'}"
+            )
+            if latest:
+                detail += (
+                    f"; execution {latest.get('execution_status') or 'unknown'}; "
+                    f"mathematical outcome {latest.get('mathematical_outcome') or 'not reported'}; "
+                    f"tested scope {json.dumps(check.get('tested_scope') or {}, ensure_ascii=False, sort_keys=True)}; "
+                    f"local runtime {float(latest.get('elapsed_seconds', 0.0) or 0.0):.2f}s; API cost $0.0000"
+                )
+            parts.append(r"\item " + report_latex_paragraph("Replacement check: " + detail) + "\n")
+        parts.append(r"\item Human mathematical review required: yes" + "\n")
+        parts.append(r"\end{itemize}" + "\n")
+    return "".join(parts)
+
+
 def _verification_report_markdown(
     session: dict[str, Any],
     state: dict[str, Any],
@@ -3629,6 +4048,9 @@ def _verification_report_markdown(
     ]
     if findings:
         lines.extend([_verification_findings_markdown(findings).rstrip(), ""])
+    technical_repairs = _verification_technical_repairs_markdown(session)
+    if technical_repairs:
+        lines.extend([technical_repairs.rstrip(), ""])
     if inventory_warning.get("has_invalidated_obligations"):
         lines.extend(
             [
@@ -3724,6 +4146,7 @@ def _verification_report_tex(
     parts.append(r"\end{itemize}" + "\n")
     if findings:
         parts.append(_verification_findings_tex(findings))
+    parts.append(_verification_technical_repairs_tex(session))
     if inventory_warning.get("has_invalidated_obligations"):
         parts.append(r"\section*{Verification inventory warning}" + "\n")
         parts.append(
@@ -3803,6 +4226,7 @@ def build_verification_report(session_or_pdf: dict[str, Any] | str | Path) -> di
             "verification_finding_recheck_summary": verification_finding_recheck_summary(session, findings=findings),
             "verification_finding_rechecks": verification_finding_rechecks_for_session(session),
             "verification_replacement_checks": verification_replacement_check_inventory(session),
+            "verification_technical_repairs": verification_technical_repair_inventory(session),
             "inventory_warning": inventory_warning,
             "generated_at": utc_now(),
         },
@@ -3926,6 +4350,8 @@ def get_verification_suite_status(session_or_pdf: dict[str, Any] | str | Path) -
             findings=findings,
         ),
         "verification_replacement_checks": verification_replacement_check_inventory(session),
+        "verification_technical_repair_candidates": verification_technical_repair_candidates(session),
+        "verification_technical_repairs": verification_technical_repair_inventory(session),
         "inventory_warning": inventory_warning,
     }
 
@@ -9281,6 +9707,7 @@ __all__ = [
     "get_failed_verification_chunks",
     "get_audit_status",
     "prepare_verification_finding_recheck_preview",
+    "prepare_verification_technical_repair_preview",
     "resolve_verification_finding_recheck_settings",
     "import_accepted_issue_family_recheck",
     "load_post_audit_review_summary",
@@ -9312,6 +9739,8 @@ __all__ = [
     "run_verification_suite_and_build_report",
     "run_verification_finding_rechecks",
     "run_verification_replacement_checks",
+    "run_verification_technical_repairs",
+    "run_verification_technical_replacement_checks",
     "verification_finding_recheck_candidates",
     "set_display_audit_hook",
     "set_final_report_builder",

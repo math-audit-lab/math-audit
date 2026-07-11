@@ -62,6 +62,7 @@ from audit_runtime import (
     get_report_freshness,
     get_verification_suite_status,
     prepare_verification_finding_recheck_preview,
+    prepare_verification_technical_repair_preview,
     refresh_report_latex_compile_health_sidecar,
     resolve_verification_finding_recheck_settings,
     report_latex_paragraph,
@@ -77,6 +78,7 @@ from audit_state import (
 )
 from audit_verification import (
     VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA,
+    VERIFICATION_TECHNICAL_REPAIR_RESPONSE_SCHEMA,
     VERIFICATION_RESULT_SENTINEL,
     _check_verification_script_safety,
     _load_verification_results,
@@ -84,12 +86,18 @@ from audit_verification import (
     _run_verification_scripts,
     _verification_summary_counts,
     append_verification_finding_recheck_event,
+    append_verification_technical_repair_event,
     build_verification_finding_recheck_evidence,
     build_verification_finding_recheck_prompt,
+    build_verification_technical_repair_evidence,
+    build_verification_technical_repair_prompt,
     persist_verification_replacement_proposals,
+    persist_verification_technical_repair_proposals,
     run_verification_replacement_checks,
+    run_verification_technical_replacement_checks,
     supersede_verification_findings_for_chunks,
     validate_verification_finding_recheck_response,
+    validate_verification_technical_repair_response,
     validate_verification_replacement_code,
     verification_finding_recheck_candidates,
     verification_finding_recheck_map,
@@ -97,6 +105,9 @@ from audit_verification import (
     verification_finding_rechecks_for_session,
     verification_findings_for_session,
     verification_replacement_check_inventory,
+    verification_technical_repair_candidates,
+    verification_technical_repair_inventory,
+    verification_technical_repair_records,
     verification_result_needs_technical_retry,
 )
 from gui_controller import (
@@ -1397,6 +1408,7 @@ def test_counterexample_recheck_panel_helpers() -> None:
         _counterexample_recheck_selection_index,
         _counterexample_recheck_view,
         _verification_replacement_view,
+        _verification_technical_repair_view,
     )
 
     inventory = {
@@ -1525,6 +1537,30 @@ def test_counterexample_recheck_panel_helpers() -> None:
         str(replacement_view),
     )
     _assert(not replacement_view["entries"][-1]["ready"], str(replacement_view))
+    technical_view = _verification_technical_repair_view(
+        {
+            "candidates": [{
+                "eligible": True, "script_id": "chunk_005_check_01.py",
+                "chunk_id": "chunk_005", "execution_status": "timeout", "failure_reason": "Exceeded 120 seconds.",
+            }, {
+                "eligible": True, "script_id": "chunk_005_check_02.py",
+                "chunk_id": "chunk_005", "execution_status": "runtime_error", "failure_reason": "ZeroDivisionError.",
+            }]
+        },
+        {
+            "groups": [{
+                "repair_id": "TR-005", "script_id": "chunk_005_check_01.py",
+                "checks": [{
+                    "check_id": "optimized_primary", "script_path": "verification_technical_repairs/TR-005/replacement_optimized_primary.py",
+                    "validation": {"status": "ready"},
+                }],
+            }]
+        },
+    )
+    _assert("Repair script first" in technical_view["summary_text"], str(technical_view))
+    _assert(technical_view["candidate_entries"][0]["selection"] == "all", str(technical_view))
+    _assert(technical_view["candidate_entries"][1]["selection"] == "chunk_005", str(technical_view))
+    _assert(technical_view["replacement_entries"][0]["data"]["ready"], str(technical_view))
 
 
 def test_review_summary_polling_feature_flag() -> None:
@@ -5435,6 +5471,255 @@ def test_verification_finding_recheck_workflow() -> None:
         )
 
 
+def test_verification_technical_repair_workflow() -> None:
+    _assert(not verification_finding_recheck_schema_errors(VERIFICATION_TECHNICAL_REPAIR_RESPONSE_SCHEMA), "technical repair schema is not strict-valid")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        pdf = root / "paper.pdf"
+        pdf.write_bytes(b"%PDF-synthetic")
+        workdir = root / "paper_audit"
+        for name in ("state", "python_checks", "verification_results", "responses", "logs", "reports"):
+            (workdir / name).mkdir(parents=True, exist_ok=True)
+        session = {
+            "pdf_path": str(pdf), "workdir": str(workdir), "model": "gpt-5.6-sol",
+            "reasoning_effort": "max", "background": True, "store": True, "pending": None,
+        }
+        save_json(session_paths(workdir)["session"], session)
+        save_json(session_paths(workdir)["status"], {"status": "completed", "updated_at": OLD})
+        save_json(session_paths(workdir)["usage"], {
+            "model": "gpt-5.6-sol", "totals": {
+                "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0,
+                "reasoning_tokens": 0, "total_tokens": 0, "cost_usd": 0.0, "audit_seconds": 0.0,
+            }, "per_chunk": [],
+        })
+        save_json(session_paths(workdir)["ledger"], {"assumptions": [], "notes": []})
+        save_json(session_paths(workdir)["issues"], {
+            "next_issue_id": 2,
+            "issues": [{
+                "issue_id": "I001", "chunk_id": "chunk_005", "severity": "high", "status": "open",
+                "title": "Synthetic claim", "location": "Theorem 2", "description": "Synthetic issue.",
+                "evidence": "Synthetic evidence.", "proposed_fix": "Check the claim.", "tags": ["verification"],
+            }],
+        })
+        save_json(session_paths(workdir)["manifest"], {
+            "chunks": [{
+                "chunk_id": "chunk_005", "chunk_index": 5, "display_label": "Theorem 2",
+                "label": "Theorem 2",
+                "page_start": 4, "page_end": 5, "source_kind": "tex", "source_label": "thm:two",
+                "printed_label": "Theorem 2", "boundary": {"kind": "theorem"},
+                "chunk_text": "Theorem 2. For every integer n >= 1, the stated identity holds.",
+            }]
+        })
+        structured_path = workdir / "responses" / "chunk_005.structured.json"
+        save_json(structured_path, {"audit": {"issues": [{"title": "Synthetic claim"}]}})
+        session_paths(workdir)["chunk_records"].write_text(
+            json.dumps({
+                "chunk_id": "chunk_005", "chunk_index": 5,
+                "label": "Theorem 2",
+                "boundary": "Theorem 2, pages 4-5",
+                "page_start": 4, "page_end": 5,
+                "cost_usd": 0.0,
+                "structured_response_path": str(structured_path),
+                "python_paths": [str(workdir / "python_checks" / "chunk_005_check_01.py")],
+            }) + "\n",
+            encoding="utf-8",
+        )
+        original_script = "for n in range(1, 10):\n    if n > 0 print(n)\n"
+        script_path = workdir / "python_checks" / "chunk_005_check_01.py"
+        script_path.write_text(original_script, encoding="utf-8")
+        result_path = workdir / "verification_results" / "chunk_005_check_01.result.json"
+        result = {
+            "time": OLD, "chunk_id": "chunk_005", "chunk_index": 5,
+            "script_name": script_path.name, "script_path": str(script_path),
+            "result_path": str(result_path), "execution_status": "parse_error", "status": "failed",
+            "mathematical_outcome": "inconclusive", "outcome_source": "execution_incomplete",
+            "returncode": 1, "elapsed_seconds": 0.01, "timeout_seconds": 120, "safe_only": True,
+            "stdout": "partial diagnostic before parser failure\n",
+            "stderr": "SyntaxError: invalid syntax at line 2, column 14\n",
+            "outcome_parse_error": "SyntaxError at line 2, column 14", "conclusion": "SyntaxError at line 2",
+            "purpose": "Search the stated range for a counterexample.",
+            "description": "Counterexample search for Theorem 2.",
+            "expected_outcome": "counterexample_search", "target": {"kind": "Theorem", "label": "2"},
+            "tested_range": {"description": "1 <= n <= 9"}, "linked_issue_ids": ["I001"],
+        }
+        save_json(result_path, result)
+        save_json(session_paths(workdir)["verification_state"], {
+            "last_run": {"timeout_seconds": 120},
+            "results": [{"script_name": script_path.name, "result_path": str(result_path)}],
+        })
+
+        inventory = verification_technical_repair_candidates(session)
+        _assert(inventory["summary"]["eligible_count"] == 1, str(inventory))
+        candidate = inventory["candidates"][0]
+        evidence = build_verification_technical_repair_evidence(session, candidate)
+        prompt = build_verification_technical_repair_prompt(evidence, "TR-001")
+        _assert(original_script in prompt, "technical repair prompt omitted complete script")
+        _assert("line 2, column 14" in prompt and "partial diagnostic" in prompt, "failure evidence omitted")
+        _assert(evidence["manuscript"]["complete_canonical_chunk_text"].startswith("Theorem 2"), str(evidence))
+        timeout_evidence = copy.deepcopy(evidence)
+        timeout_evidence["verification_failure"].update({
+            "execution_status": "timeout", "timeout_seconds": 120,
+            "stdout": "partial output before timeout", "failure_reason": "Exceeded 120 seconds",
+        })
+        timeout_prompt = build_verification_technical_repair_prompt(timeout_evidence, "TR-TIMEOUT")
+        _assert("partial output before timeout" in timeout_prompt and "Preserve the original scope" in timeout_prompt, timeout_prompt)
+        runtime_evidence = copy.deepcopy(evidence)
+        runtime_evidence["verification_failure"].update({
+            "execution_status": "runtime_error", "stderr": "Traceback (most recent call last):\nZeroDivisionError",
+        })
+        _assert("complete traceback" in build_verification_technical_repair_prompt(runtime_evidence, "TR-RUNTIME"), "runtime-specific repair instruction missing")
+        unsafe_evidence = copy.deepcopy(evidence)
+        unsafe_evidence["verification_failure"].update({
+            "execution_status": "unsafe", "failure_reason": "subprocess import is prohibited",
+        })
+        _assert("prohibited operation" in build_verification_technical_repair_prompt(unsafe_evidence, "TR-UNSAFE"), "unsafe-specific repair instruction missing")
+        preview_dir = root / "preview"
+        preview = prepare_verification_technical_repair_preview(session, script_path.name, preview_dir)
+        _assert(preview["manifest"]["model"] == "gpt-5.6-sol", str(preview))
+        _assert(preview["manifest"]["reasoning_effort"] == "max", str(preview))
+        _assert(any(preview_dir.glob("*.repair_prompt.txt")), "technical repair preview prompt missing")
+
+        replacement_code = (
+            "import json\n"
+            "payload = {'schema_version': 1, 'check_kind': 'counterexample_search', "
+            "'outcome': 'no_counterexample_found', 'summary': 'No counterexample in 1 <= n <= 9.', "
+            "'counterexamples': [], 'failed_cases': [], 'tested_range': {'description': '1 <= n <= 9'}, "
+            "'target': {'kind': 'Theorem', 'label': '2'}, 'linked_issue_ids': ['I001']}\n"
+            "print('MATH_AUDIT_VERIFICATION_RESULT_JSON=' + json.dumps(payload, sort_keys=True))\n"
+        )
+        repair_payload = {
+            "schema_version": 1, "repair_id": "TR-001", "script_id": script_path.name,
+            "chunk_id": "chunk_005", "failure_type": "parse_error",
+            "failure_assessment": {
+                "root_cause": "Missing colon before print call.", "affected_lines": ["line 2"],
+                "original_scope": "1 <= n <= 9", "scope_preservable": True,
+            },
+            "replacement_available": True,
+            "replacement_checks": [{
+                "check_id": "corrected_primary", "relationship_to_original": "corrected_implementation",
+                "purpose": "Preserve the original finite counterexample search.",
+                "correction_explanation": "Fix syntax without changing scope.",
+                "independence_note": "Primary corrected implementation.", "python_code": replacement_code,
+                "expected_check_kind": "counterexample_search", "original_scope_preserved": True,
+                "tested_scope": {"description": "1 <= n <= 9", "parameters": [{"name": "n", "value": "1..9"}]},
+            }],
+            "no_replacement_reason": "", "recommended_next_action": "run_replacement",
+            "chunk_reaudit_recommended": False, "human_review_required": True,
+            "summary": "The generated script has a repairable syntax error.",
+        }
+        validated = validate_verification_technical_repair_response(repair_payload)
+        class FakeTechnicalResponses:
+            def __init__(self) -> None:
+                self.request: dict[str, Any] = {}
+
+            def create(self, **kwargs: Any) -> Any:
+                self.request = kwargs
+                prompt_text = json.dumps(kwargs.get("input") or [], ensure_ascii=False)
+                match = __import__("re").search(r"Required repair_id: ([A-Za-z0-9_.-]+)", prompt_text)
+                payload = copy.deepcopy(validated)
+                payload["repair_id"] = match.group(1) if match else "missing-repair-id"
+
+                class Response:
+                    id = "resp_fake_technical_repair"
+                    status = "completed"
+                    output_text = ""
+                    output_parsed = payload
+                    usage = {"input_tokens": 800, "output_tokens": 200, "total_tokens": 1000}
+
+                return Response()
+
+        class FakeTechnicalClient:
+            def __init__(self) -> None:
+                self.responses = FakeTechnicalResponses()
+
+        fake_client = FakeTechnicalClient()
+        previous_client = runtime._OPENAI_CLIENT
+        try:
+            runtime.set_openai_client(fake_client)
+            live = runtime.run_verification_technical_repairs(
+                session, script_path.name, rebuild_reports=False
+            )
+        finally:
+            runtime.set_openai_client(previous_client)
+        _assert(live["completed_count"] == 1 and live["failed_count"] == 0, str(live))
+        _assert(live["model"] == "gpt-5.6-sol" and live["reasoning_effort"] == "max", str(live))
+        request_text = json.dumps(fake_client.responses.request.get("input") or [], ensure_ascii=False)
+        _assert(original_script in request_text.replace("\\n", "\n"), "live technical repair omitted complete script")
+        _assert((fake_client.responses.request.get("text") or {}).get("format", {}).get("name") == "verification_technical_repair", str(fake_client.responses.request))
+        activity = (json.loads(session_paths(workdir)["usage"].read_text(encoding="utf-8")).get("activity_totals") or {}).get("verification_technical_repair") or {}
+        _assert(activity.get("calls") == 1 and activity.get("total_tokens") == 1000, str(activity))
+
+        artifact_root = workdir / "verification_technical_repairs" / "TR-001"
+        proposal = persist_verification_technical_repair_proposals(
+            session, repair_id="TR-001", artifact_root=artifact_root,
+            structured_result=validated, evidence=evidence, model="gpt-5.6-sol", reasoning_effort="max",
+        )
+        _assert(proposal["ready_count"] == 1, str(proposal))
+        append_verification_technical_repair_event(session, {
+            "event": "completed", "status": "completed", "canonical": True,
+            "repair_id": "TR-001", "script_id": script_path.name, "chunk_id": "chunk_005",
+            "failure_type": "parse_error", "structured_result": validated,
+            "replacement_manifest_path": proposal["manifest_path"], "model": "gpt-5.6-sol",
+            "reasoning_effort": "max",
+        })
+        original_before = script_path.read_bytes()
+        result_before = result_path.read_bytes()
+        execution = run_verification_technical_replacement_checks(
+            session, "TR-001", ["corrected_primary"], timeout=10
+        )
+        _assert(execution["attempts"][0]["result"]["execution_status"] == "completed", str(execution))
+        _assert(execution["attempts"][0]["result"]["mathematical_outcome"] == "no_counterexample_found", str(execution))
+        _assert(execution["verification_technical_repair_local_api_cost_usd"] == 0.0, str(execution))
+        _assert(script_path.read_bytes() == original_before, "technical repair changed original script")
+        _assert(result_path.read_bytes() == result_before, "technical repair changed original result")
+        repaired_inventory = verification_technical_repair_inventory(session)
+        _assert(repaired_inventory["groups"][0]["reconciliation"]["technical_failure_repaired"], str(repaired_inventory))
+        report_paths = runtime.build_verification_report(session)
+        report_md = Path(report_paths["markdown"]).read_text(encoding="utf-8")
+        report_json = json.loads(Path(report_paths["json"]).read_text(encoding="utf-8"))
+        _assert(report_md.count("## Technical verification-script repairs") == 1, report_md)
+        _assert("technical failure repaired no counterexample" in report_md, report_md)
+        _assert(report_json["verification_technical_repairs"]["summary"]["repaired_script_count"] == 1, str(report_json))
+        full_md = build_final_report_markdown(session)
+        concise_md = build_concise_report_markdown(session)
+        _assert(full_md.count("## Technical verification-script repairs") == 1, full_md)
+        _assert(concise_md.count("## Technical verification-script repairs") == 1, concise_md)
+        _assert(verification_technical_repair_candidates(session)["summary"]["eligible_count"] == 0, "repaired result remained active")
+        _assert(not runtime.get_failed_verification_chunks(session)["chunk_ids"], "repaired script remained in chunk rerun queue")
+        historical = verification_technical_repair_records(session, include_superseded=True)
+        _assert(len(historical) == 2, str(historical))
+        _assert(verification_technical_repair_records(session)[0]["repair_id"] == "TR-001", str(historical))
+
+        no_replacement = copy.deepcopy(repair_payload)
+        no_replacement.update({
+            "repair_id": "TR-002", "failure_type": "timeout", "replacement_available": False,
+            "replacement_checks": [], "no_replacement_reason": "Requires an unavailable external solver.",
+            "recommended_next_action": "external_tool_required", "chunk_reaudit_recommended": False,
+        })
+        no_replacement["failure_assessment"]["scope_preservable"] = False
+        _assert(validate_verification_technical_repair_response(no_replacement)["replacement_available"] is False, str(no_replacement))
+        missing_reason = copy.deepcopy(no_replacement)
+        missing_reason["no_replacement_reason"] = ""
+        try:
+            validate_verification_technical_repair_response(missing_reason)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("technical repair accepted missing replacement and missing explanation")
+        silent_reduction = copy.deepcopy(repair_payload)
+        silent_reduction["replacement_checks"][0]["original_scope_preserved"] = False
+        try:
+            validate_verification_technical_repair_response(silent_reduction)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("technical repair accepted silent range reduction")
+        unsafe = validate_verification_replacement_code(
+            "import subprocess\nprint('MATH_AUDIT_VERIFICATION_RESULT_JSON={}')\n"
+        )
+        _assert(unsafe["status"] == "unsafe", str(unsafe))
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -5492,6 +5777,7 @@ def main() -> int:
         ("verification safety allows narrow string replace", test_verification_safety_allows_narrow_string_replace),
         ("verification execution and mathematical outcomes", test_verification_execution_and_mathematical_outcomes),
         ("verification finding recheck workflow", test_verification_finding_recheck_workflow),
+        ("verification technical repair workflow", test_verification_technical_repair_workflow),
     ]
     results = [_run_case(name, func) for name, func in cases]
 

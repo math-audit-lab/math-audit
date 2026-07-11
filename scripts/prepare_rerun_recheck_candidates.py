@@ -501,8 +501,8 @@ def _verification_failure_candidates(results: list[dict[str, Any]]) -> list[dict
                 "recommended_action_kind": "script_recheck",
                 "source_ids": [item for item in [script_name, chunk_id, str(result.get("result_path") or "")] if item],
                 "trigger_reason": f"verification execution status is {status}",
-                "recommended_action": "Recheck the verification script and the mathematical claim first; rerun the chunk only if the script or audit output needs regeneration.",
-                "priority": "high" if status == "failed" else "medium",
+                "recommended_action": "Use the dedicated evidence-rich technical script repair first; run a full chunk re-audit only if repair is unavailable, inconclusive, or reveals a broader audit problem.",
+                "priority": "high" if status in {"parse_error", "runtime_error", "unsafe"} else "medium",
                 "status": "candidate",
                 "context_refs": {
                     "chunk_id": chunk_id,
@@ -825,7 +825,7 @@ def _category_definitions() -> dict[str, dict[str, str]]:
         "verification_failure": {
             "item_type": "verification_script",
             "recommended_action_kind": "script_recheck",
-            "recommended_action": "recheck script/claim first; rerun chunk only if needed",
+            "recommended_action": "generate and review a technical script repair first; rerun chunk only as fallback",
         },
         "high_critical_issue_recheck": {
             "item_type": "issue",

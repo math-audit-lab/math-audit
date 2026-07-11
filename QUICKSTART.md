@@ -111,7 +111,7 @@ The PySide6 app is the primary maintained frontend for this public preview.
 5. Monitor progress, cost, chunks, pages, and status in the GUI.
 6. Use **Quick review** to build/open a concise report.
 7. Run the verification suite and inspect verification progress/results.
-8. Rerun failed-verification chunks when scripts failed technically, or use **Recheck Counterexample Chunks** when a completed script found a counterexample/claim failure.
+8. For technical script failures, use **Generate Repair Scripts** first. Re-auditing the manuscript chunk is a separate fallback. Use **Recheck Counterexample Chunks** when a completed script found a counterexample/claim failure.
 9. Rebuild/open final reports after verification and repairs.
 10. Optionally export a ChatGPT context pack for manual handoff outside the app.
 
@@ -134,6 +134,8 @@ The audit can generate local Python verification scripts. The GUI distinguishes 
 Successful Python execution does not mean the paper's claim succeeded: a completed script may find a counterexample. Likewise, a finite search with no counterexample does not prove an unrestricted theorem. Verification-derived findings are provisional supporting evidence, are surfaced in the main reports, and still require mathematical judgment.
 
 Technical failed-verification reruns are for timeouts, runtime/parse errors, and similar execution problems. **Recheck Counterexample Chunks** is a separate API-backed review for scripts that completed and reported `counterexample_found` or `claim_failed`. It sends the full affected chunk, complete script, exact output, structured counterexample data, linked issues, labels, and compact surrounding context to the audit session's saved model/effort by default. The original script, result, and finding remain preserved. Possible advisory outcomes include confirmed counterexample/claim failure, script error, scope/hypothesis mismatch, notation/interpretation mismatch, or inconclusive. Rechecks incur API cost and still require human mathematical review.
+
+For `parse_error`, `runtime_error`, `timeout`, or a safety-policy rejection, **Generate Repair Scripts** is the preferred first action. The API repair request receives the complete failed script, traceback/parser/safety/timeout evidence, exact output, complete manuscript chunk, labels, and linked issues. It must return corrected replacement code or explain why repair is unavailable. Review the complete code, then explicitly confirm local execution. Local execution uses no API call, never overwrites the original script/result, and remains provisional. A finite successful search does not prove a universal theorem. Use full chunk re-audit only as a separate fallback when repair is unavailable, repeatedly fails, or reveals a broader chunk-analysis problem.
 
 If the recheck identifies a script error, it may propose corrected and independent replacement checks. Review the complete code first, then explicitly confirm **Run Safe Replacement Checks**. Replacement execution is local, uses the existing safe-mode checks, and does not make an API call. The original script/result and all replacement attempts remain preserved. A finite replacement search reporting no counterexample does not prove an unrestricted theorem, and conflicting replacement outcomes require human review.
 

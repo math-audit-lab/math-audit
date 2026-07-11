@@ -46,7 +46,14 @@ VERIFICATION_MATHEMATICAL_OUTCOMES = {
     "not_reported",
 }
 NEGATIVE_VERIFICATION_OUTCOMES = {"counterexample_found", "claim_failed"}
-TECHNICAL_VERIFICATION_FAILURE_STATUSES = {"runtime_error", "timeout", "parse_error"}
+TECHNICAL_VERIFICATION_FAILURE_STATUSES = {"runtime_error", "timeout", "parse_error", "unsafe", "skipped"}
+VERIFICATION_TECHNICAL_REPAIR_NEXT_ACTIONS = {
+    "run_replacement",
+    "full_chunk_reaudit",
+    "human_review",
+    "increase_timeout",
+    "external_tool_required",
+}
 VERIFICATION_FINDING_RECHECK_OUTCOMES = {
     "counterexample_confirmed",
     "claim_failure_confirmed",
@@ -216,6 +223,91 @@ VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA = {
         "confidence",
         "needs_human_review",
         "summary",
+    ],
+}
+VERIFICATION_TECHNICAL_REPAIR_RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "schema_version": {"type": "integer", "enum": [1]},
+        "repair_id": {"type": "string"},
+        "script_id": {"type": "string"},
+        "chunk_id": {"type": "string"},
+        "failure_type": {
+            "type": "string",
+            "enum": sorted(TECHNICAL_VERIFICATION_FAILURE_STATUSES),
+        },
+        "failure_assessment": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "root_cause": {"type": "string"},
+                "affected_lines": {"type": "array", "items": {"type": "string"}},
+                "original_scope": {"type": "string"},
+                "scope_preservable": {"type": "boolean"},
+            },
+            "required": ["root_cause", "affected_lines", "original_scope", "scope_preservable"],
+        },
+        "replacement_available": {"type": "boolean"},
+        "replacement_checks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "check_id": {"type": "string"},
+                    "relationship_to_original": {
+                        "type": "string",
+                        "enum": ["corrected_implementation", "independent_implementation"],
+                    },
+                    "purpose": {"type": "string"},
+                    "correction_explanation": {"type": "string"},
+                    "independence_note": {"type": "string"},
+                    "python_code": {"type": "string"},
+                    "expected_check_kind": {"type": "string"},
+                    "original_scope_preserved": {"type": "boolean"},
+                    "tested_scope": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "description": {"type": "string"},
+                            "parameters": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "value": {"type": "string"},
+                                    },
+                                    "required": ["name", "value"],
+                                },
+                            },
+                        },
+                        "required": ["description", "parameters"],
+                    },
+                },
+                "required": [
+                    "check_id", "relationship_to_original", "purpose", "correction_explanation",
+                    "independence_note", "python_code", "expected_check_kind",
+                    "original_scope_preserved", "tested_scope",
+                ],
+            },
+        },
+        "no_replacement_reason": {"type": "string"},
+        "recommended_next_action": {
+            "type": "string",
+            "enum": sorted(VERIFICATION_TECHNICAL_REPAIR_NEXT_ACTIONS),
+        },
+        "chunk_reaudit_recommended": {"type": "boolean"},
+        "human_review_required": {"type": "boolean"},
+        "summary": {"type": "string"},
+    },
+    "required": [
+        "schema_version", "repair_id", "script_id", "chunk_id", "failure_type",
+        "failure_assessment", "replacement_available", "replacement_checks",
+        "no_replacement_reason", "recommended_next_action", "chunk_reaudit_recommended",
+        "human_review_required", "summary",
     ],
 }
 _LEGACY_FAILURE_LIST_RE = re.compile(
@@ -1430,6 +1522,94 @@ def validate_verification_finding_recheck_response(payload: Any) -> dict[str, An
     return dict(payload)
 
 
+def validate_verification_technical_repair_response(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Technical verification repair response must be a JSON object.")
+    properties = VERIFICATION_TECHNICAL_REPAIR_RESPONSE_SCHEMA["properties"]
+    required = set(VERIFICATION_TECHNICAL_REPAIR_RESPONSE_SCHEMA["required"])
+    missing = sorted(required - set(payload))
+    extra = sorted(set(payload) - set(properties))
+    if missing or extra:
+        raise ValueError(f"Invalid technical repair fields; missing={missing}, extra={extra}.")
+    if int(payload.get("schema_version") or 0) != 1:
+        raise ValueError("Unsupported technical repair schema_version.")
+    for key in ("repair_id", "script_id", "chunk_id", "failure_type", "summary"):
+        if not isinstance(payload.get(key), str) or not str(payload.get(key) or "").strip():
+            raise ValueError(f"Technical repair field {key!r} must be a nonempty string.")
+    if payload["failure_type"] not in TECHNICAL_VERIFICATION_FAILURE_STATUSES:
+        raise ValueError(f"Unsupported technical repair failure_type: {payload['failure_type']!r}")
+    assessment = payload.get("failure_assessment")
+    expected_assessment = {"root_cause", "affected_lines", "original_scope", "scope_preservable"}
+    if not isinstance(assessment, dict) or set(assessment) != expected_assessment:
+        raise ValueError("Technical repair failure_assessment has invalid fields.")
+    if not isinstance(assessment.get("affected_lines"), list) or any(
+        not isinstance(item, str) for item in assessment["affected_lines"]
+    ):
+        raise ValueError("Technical repair affected_lines must be an array of strings.")
+    if not isinstance(assessment.get("scope_preservable"), bool):
+        raise ValueError("Technical repair scope_preservable must be boolean.")
+    for key in ("root_cause", "original_scope"):
+        if not isinstance(assessment.get(key), str):
+            raise ValueError(f"Technical repair failure_assessment.{key} must be a string.")
+    for key in ("replacement_available", "chunk_reaudit_recommended", "human_review_required"):
+        if not isinstance(payload.get(key), bool):
+            raise ValueError(f"Technical repair field {key!r} must be boolean.")
+    if payload.get("recommended_next_action") not in VERIFICATION_TECHNICAL_REPAIR_NEXT_ACTIONS:
+        raise ValueError("Technical repair recommended_next_action is unsupported.")
+    replacements = payload.get("replacement_checks")
+    if not isinstance(replacements, list):
+        raise ValueError("Technical repair replacement_checks must be an array.")
+    item_schema = properties["replacement_checks"]["items"]
+    expected_keys = set(item_schema["required"])
+    seen: set[str] = set()
+    for index, replacement in enumerate(replacements):
+        if not isinstance(replacement, dict) or set(replacement) != expected_keys:
+            raise ValueError(f"Technical repair replacement check {index} has invalid fields.")
+        check_id = str(replacement.get("check_id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", check_id) or check_id in seen:
+            raise ValueError(f"Technical repair replacement check {index} has an invalid or duplicate check_id.")
+        seen.add(check_id)
+        if replacement.get("relationship_to_original") not in {
+            "corrected_implementation", "independent_implementation"
+        }:
+            raise ValueError(f"Technical repair replacement check {check_id} has an invalid relationship.")
+        for key in (
+            "purpose", "correction_explanation", "independence_note", "python_code", "expected_check_kind"
+        ):
+            if not isinstance(replacement.get(key), str) or not str(replacement.get(key) or "").strip():
+                raise ValueError(f"Technical repair replacement check {check_id} field {key} must be nonempty.")
+        if not isinstance(replacement.get("original_scope_preserved"), bool):
+            raise ValueError(f"Technical repair replacement check {check_id} scope flag must be boolean.")
+        scope = replacement.get("tested_scope")
+        if not isinstance(scope, dict) or set(scope) != {"description", "parameters"}:
+            raise ValueError(f"Technical repair replacement check {check_id} has invalid tested_scope.")
+        if not isinstance(scope.get("description"), str) or not isinstance(scope.get("parameters"), list):
+            raise ValueError(f"Technical repair replacement check {check_id} has invalid tested_scope values.")
+        for parameter in scope["parameters"]:
+            if not isinstance(parameter, dict) or set(parameter) != {"name", "value"} or not all(
+                isinstance(parameter.get(field), str) for field in ("name", "value")
+            ):
+                raise ValueError(f"Technical repair replacement check {check_id} has invalid scope parameters.")
+    replacement_available = payload["replacement_available"]
+    if replacement_available and not replacements:
+        raise ValueError("replacement_available=true requires at least one replacement check.")
+    if replacement_available and payload.get("recommended_next_action") != "run_replacement":
+        raise ValueError("A repair with replacement checks must recommend run_replacement.")
+    if not replacement_available and replacements:
+        raise ValueError("replacement_available=false cannot include replacement checks.")
+    if not replacement_available and not str(payload.get("no_replacement_reason") or "").strip():
+        raise ValueError("A repair without replacement checks requires no_replacement_reason.")
+    if replacement_available and str(payload.get("no_replacement_reason") or "").strip():
+        raise ValueError("A repair with replacement checks must leave no_replacement_reason empty.")
+    if payload["failure_type"] in {"parse_error", "runtime_error", "unsafe"} and not replacement_available:
+        if payload.get("recommended_next_action") == "run_replacement":
+            raise ValueError("A missing replacement cannot recommend run_replacement.")
+    for replacement in replacements:
+        if assessment.get("scope_preservable") and not replacement.get("original_scope_preserved"):
+            raise ValueError("A repair cannot silently reduce scope when the assessment says scope is preservable.")
+    return dict(payload)
+
+
 def validate_verification_replacement_code(code: Any) -> dict[str, Any]:
     source = str(code or "")
     code_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
@@ -1624,6 +1804,292 @@ def _bounded_verification_output(text: Any, limit: int = 30000) -> dict[str, Any
         bounded += middle + "\n... [end preserved mathematical-result lines] ...\n"
     bounded += raw[-keep:]
     return {"text": bounded, "truncated": True, "original_chars": len(raw)}
+
+
+def _verification_technical_repairs_path(session: dict[str, Any]) -> Path:
+    return session_paths(session["workdir"])["verification_technical_repairs"]
+
+
+def append_verification_technical_repair_event(
+    session: dict[str, Any], event: dict[str, Any]
+) -> dict[str, Any]:
+    payload = dict(event or {})
+    payload.setdefault("schema_version", 1)
+    payload.setdefault("time", utc_now())
+    append_jsonl(_verification_technical_repairs_path(session), payload)
+    return payload
+
+
+def verification_technical_repair_records(
+    session: dict[str, Any], include_superseded: bool = False
+) -> list[dict[str, Any]]:
+    path = _verification_technical_repairs_path(session)
+    if not path.is_file():
+        return []
+    collapsed: dict[str, dict[str, Any]] = {}
+    order: dict[str, int] = {}
+    try:
+        for index, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if not isinstance(item, dict) or not str(item.get("repair_id") or "").strip():
+                continue
+            repair_id = str(item["repair_id"])
+            merged = dict(collapsed.get(repair_id) or {})
+            merged.update(item)
+            collapsed[repair_id] = merged
+            order[repair_id] = index
+    except Exception:
+        return []
+    records = sorted(collapsed.values(), key=lambda item: order.get(str(item.get("repair_id") or ""), 0))
+    if include_superseded:
+        return records
+    latest: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if str(record.get("status") or "") != "completed" or record.get("canonical") is False:
+            continue
+        script_id = str(record.get("script_id") or "").strip()
+        if script_id:
+            latest[script_id] = record
+    return list(latest.values())
+
+
+def _technical_skip_is_repairable(result: dict[str, Any]) -> bool:
+    status = str(result.get("execution_status") or "").strip().lower()
+    if status != "skipped":
+        return status in TECHNICAL_VERIFICATION_FAILURE_STATUSES
+    reason = str(result.get("skip_reason") or result.get("conclusion") or "").lower()
+    return bool(reason) and any(
+        token in reason
+        for token in ("unsafe", "prohibited", "not allowed", "policy", "parse", "syntax", "validation", "safety")
+    )
+
+
+def _technical_repair_manifest(
+    session: dict[str, Any], record: dict[str, Any]
+) -> tuple[dict[str, Any], Optional[Path]]:
+    relative = str(record.get("replacement_manifest_path") or "").strip()
+    if not relative:
+        return {}, None
+    root = Path(session["workdir"]).resolve()
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return {}, None
+    if not path.is_file():
+        return {}, path
+    try:
+        value = load_json(path)
+    except Exception:
+        return {}, path
+    return (value if isinstance(value, dict) else {}), path
+
+
+def _technical_repair_execution_events(
+    session: dict[str, Any], manifest: dict[str, Any]
+) -> list[dict[str, Any]]:
+    relative = str(manifest.get("execution_events_path") or "").strip()
+    if not relative:
+        return []
+    root = Path(session["workdir"]).resolve()
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return []
+    if not path.is_file():
+        return []
+    events = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            item = json.loads(line)
+            if isinstance(item, dict):
+                events.append(item)
+    except Exception:
+        return []
+    return events
+
+
+def _technical_repair_reconciliation(checks: list[dict[str, Any]]) -> dict[str, Any]:
+    executed = [item for item in checks if isinstance(item.get("latest_execution"), dict)]
+    outcomes = {
+        str((item.get("latest_execution") or {}).get("mathematical_outcome") or "") for item in executed
+    } - {""}
+    statuses = {
+        str((item.get("latest_execution") or {}).get("execution_status") or "") for item in executed
+    } - {""}
+    negative = outcomes & NEGATIVE_VERIFICATION_OUTCOMES
+    favorable = outcomes & {"no_counterexample_found", "check_satisfied"}
+    technical = statuses & {"runtime_error", "timeout", "parse_error", "unsafe", "skipped", "not_run"}
+    if negative and favorable:
+        status = "conflicting_replacement_results"
+        explanation = "Replacement checks disagree; human review is required."
+    elif negative:
+        status = "technical_failure_repaired_counterexample_found"
+        explanation = "The replacement executed and produced an active counterexample or claim failure."
+    elif technical:
+        status = "unresolved_replacement_failure"
+        explanation = "A replacement still failed technically or emitted unusable output."
+    elif "check_satisfied" in outcomes:
+        status = "technical_failure_repaired_check_satisfied"
+        explanation = "The replacement exact check was satisfied; its mathematical scope remains provisional."
+    elif "no_counterexample_found" in outcomes:
+        status = "technical_failure_repaired_no_counterexample"
+        explanation = "No counterexample was found in the recorded tested scope; this is not a proof."
+    elif executed:
+        status = "unresolved_no_structured_outcome"
+        explanation = "Replacement execution did not produce a usable mathematical outcome."
+    elif checks:
+        status = "awaiting_replacement_execution"
+        explanation = "Validated replacement scripts await explicit local execution."
+    else:
+        status = "replacement_unavailable"
+        explanation = "No replacement script is available; use the recorded fallback recommendation."
+    return {
+        "status": status,
+        "explanation": explanation,
+        "execution_statuses": sorted(statuses),
+        "mathematical_outcomes": sorted(outcomes),
+        "executed_check_count": len(executed),
+        "technical_failure_repaired": status.startswith("technical_failure_repaired_"),
+        "human_review_required": True,
+    }
+
+
+def verification_technical_repair_inventory(session: dict[str, Any]) -> dict[str, Any]:
+    groups = []
+    for record in verification_technical_repair_records(session):
+        result = record.get("structured_result") if isinstance(record.get("structured_result"), dict) else {}
+        manifest, manifest_path = _technical_repair_manifest(session, record)
+        events = _technical_repair_execution_events(session, manifest)
+        latest_by_check: dict[str, dict[str, Any]] = {}
+        for event in events:
+            if str(event.get("event") or "") == "execution_completed":
+                latest_by_check[str(event.get("replacement_check_id") or "")] = event
+        checks = []
+        for check in manifest.get("replacement_checks") or []:
+            if not isinstance(check, dict):
+                continue
+            item = dict(check)
+            latest = latest_by_check.get(str(item.get("check_id") or ""))
+            if isinstance(latest, dict):
+                latest = dict(latest)
+                result_path = Path(session["workdir"]) / str(latest.get("result_path") or "")
+                if result_path.is_file():
+                    try:
+                        latest["result"] = load_json(result_path)
+                    except Exception:
+                        pass
+            item["latest_execution"] = latest
+            checks.append(item)
+        groups.append(
+            {
+                "repair_id": str(record.get("repair_id") or ""),
+                "script_id": str(record.get("script_id") or result.get("script_id") or ""),
+                "chunk_id": str(record.get("chunk_id") or result.get("chunk_id") or ""),
+                "failure_type": str(record.get("failure_type") or result.get("failure_type") or ""),
+                "failure_reason": str(record.get("failure_reason") or ""),
+                "model": str(record.get("model") or ""),
+                "reasoning_effort": str(record.get("reasoning_effort") or ""),
+                "summary": str(result.get("summary") or ""),
+                "recommended_next_action": str(result.get("recommended_next_action") or ""),
+                "chunk_reaudit_recommended": bool(result.get("chunk_reaudit_recommended")),
+                "no_replacement_reason": str(result.get("no_replacement_reason") or ""),
+                "manifest_path": str(record.get("replacement_manifest_path") or ""),
+                "manifest_available": bool(manifest_path and manifest),
+                "checks": checks,
+                "execution_history": events,
+                "reconciliation": _technical_repair_reconciliation(checks),
+                "generation_usage": record.get("usage") or {},
+                "generation_cost": record.get("cost") or {},
+                "generation_runtime_seconds": record.get("runtime_seconds"),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "groups": groups,
+        "summary": {
+            "repair_count": len(groups),
+            "replacement_check_count": sum(len(item.get("checks") or []) for item in groups),
+            "ready_check_count": sum(
+                1 for group in groups for check in group.get("checks") or []
+                if (check.get("validation") or {}).get("status") == "ready"
+            ),
+            "repaired_script_count": sum(
+                1 for item in groups if (item.get("reconciliation") or {}).get("technical_failure_repaired")
+            ),
+        },
+    }
+
+
+def verification_technical_repair_candidates(session: dict[str, Any]) -> dict[str, Any]:
+    current_repairs = {
+        str(item.get("script_id") or ""): item
+        for item in verification_technical_repair_inventory(session).get("groups") or []
+    }
+    candidates = []
+    excluded = []
+    for result in _load_verification_results(session):
+        normalized = _normalize_verification_result(result)
+        script_id = str(normalized.get("script_name") or Path(str(normalized.get("script_path") or "")).name)
+        status = str(normalized.get("execution_status") or "")
+        outcome = str(normalized.get("mathematical_outcome") or "")
+        repair = current_repairs.get(script_id) or {}
+        reconciliation = repair.get("reconciliation") or {}
+        reason = ""
+        if status == "completed" or outcome in NEGATIVE_VERIFICATION_OUTCOMES:
+            reason = "completed mathematical results belong to the finding/recheck workflow"
+        elif not _technical_skip_is_repairable(normalized):
+            reason = f"execution status {status or 'unknown'} is not an eligible technical failure"
+        elif reconciliation.get("technical_failure_repaired"):
+            reason = "a newer canonical repair completed conclusively"
+        script_path = _resolve_verification_script_path(session, normalized.get("script_path") or script_id)
+        item = {
+            "candidate_id": f"verification_technical_repair:{script_id}",
+            "workflow": "verification_technical_repair",
+            "script_id": script_id,
+            "script_name": script_id,
+            "script_path": _relative_audit_path(session, script_path or normalized.get("script_path")),
+            "script_available": script_path is not None,
+            "chunk_id": str(normalized.get("chunk_id") or ""),
+            "execution_status": status,
+            "failure_reason": str(
+                normalized.get("outcome_parse_error") or normalized.get("skip_reason")
+                or normalized.get("conclusion") or normalized.get("stderr") or ""
+            ),
+            "linked_issue_ids": list(normalized.get("linked_issue_ids") or []),
+            "purpose": str(normalized.get("purpose") or normalized.get("description") or ""),
+            "check_kind": str((normalized.get("structured_result") or {}).get("check_kind") or ""),
+            "target": normalized.get("target") or {},
+            "latest_repair_status": str(reconciliation.get("status") or "not_repaired"),
+            "eligible": not reason and script_path is not None,
+            "eligibility_reason": reason or (
+                "eligible technical failure; repair the script before considering a full chunk re-audit"
+                if script_path is not None else "original script artifact is unavailable"
+            ),
+        }
+        if reason:
+            excluded.append(item)
+        else:
+            candidates.append(item)
+    eligible = [item for item in candidates if item.get("eligible")]
+    return {
+        "schema_version": 1,
+        "workflow": "verification_technical_repair",
+        "candidates": candidates,
+        "excluded": excluded,
+        "summary": {
+            "candidate_count": len(candidates),
+            "eligible_count": len(eligible),
+            "unavailable_count": len(candidates) - len(eligible),
+            "by_status": {
+                status: sum(1 for item in eligible if item.get("execution_status") == status)
+                for status in sorted(TECHNICAL_VERIFICATION_FAILURE_STATUSES)
+            },
+        },
+    }
 
 
 def verification_finding_recheck_candidates(
@@ -2000,11 +2466,305 @@ def build_verification_finding_recheck_prompt(evidence: dict[str, Any]) -> str:
     return "\n\n".join(parts).strip() + "\n"
 
 
+def build_verification_technical_repair_evidence(
+    session: dict[str, Any], candidate: dict[str, Any], max_context_chars: int = 12000
+) -> dict[str, Any]:
+    script_id = str(candidate.get("script_id") or "").strip()
+    result = next(
+        (
+            dict(item) for item in _load_verification_results(session)
+            if str(item.get("script_name") or Path(str(item.get("script_path") or "")).name) == script_id
+        ),
+        None,
+    )
+    if result is None:
+        raise ValueError(f"Canonical verification result is unavailable: {script_id}")
+    script_path = _resolve_verification_script_path(session, result.get("script_path") or script_id)
+    if script_path is None:
+        raise FileNotFoundError(f"Original failed verification script is unavailable: {script_id}")
+    script_text = script_path.read_text(encoding="utf-8")
+    chunk_id = str(result.get("chunk_id") or candidate.get("chunk_id") or "")
+    manifest = load_manifest(session)
+    chunks = [item for item in manifest.get("chunks") or [] if isinstance(item, dict)]
+    chunk_position = next((i for i, item in enumerate(chunks) if str(item.get("chunk_id") or "") == chunk_id), -1)
+    if chunk_position < 0:
+        raise ValueError(f"Canonical manuscript chunk is unavailable: {chunk_id}")
+    chunk = dict(chunks[chunk_position])
+    chunk_text = str(chunk.get("chunk_text") or "")
+    records = [
+        item for item in _read_chunk_records_for_verification(session)
+        if str(item.get("chunk_id") or "") == chunk_id
+    ]
+    chunk_record = dict(records[-1]) if records else {}
+    structured_response = {}
+    structured_paths = [
+        Path(str(chunk_record.get("structured_response_path") or "")),
+        Path(session["workdir"]) / str(chunk_record.get("structured_response_path") or ""),
+        Path(session["workdir"]) / "responses" / f"{chunk_id}.structured.json",
+    ]
+    for path in structured_paths:
+        if str(path) and path.is_file():
+            try:
+                loaded = load_json(path)
+                if isinstance(loaded, dict):
+                    structured_response = loaded
+                    break
+            except Exception:
+                continue
+    issues = [item for item in load_issues(session).get("issues", []) if isinstance(item, dict)]
+    linked_ids = {str(item) for item in result.get("linked_issue_ids") or [] if str(item).strip()}
+    relevant_issues = [
+        item for item in issues
+        if str(item.get("chunk_id") or "") == chunk_id or str(item.get("issue_id") or "") in linked_ids
+    ]
+    reference_labels = []
+    reference_path = Path(session["workdir"]) / "state" / "reference_map.json"
+    if reference_path.is_file():
+        try:
+            reference_state = load_json(reference_path)
+        except Exception:
+            reference_state = {}
+        label_map = reference_state.get("label_map") if isinstance(reference_state, dict) else {}
+        if isinstance(label_map, dict):
+            target_text = json.dumps(result.get("target") or {}, ensure_ascii=False)
+            for source_label, info in label_map.items():
+                info_dict = dict(info) if isinstance(info, dict) else {"printed_label": info}
+                printed = str(info_dict.get("printed_label") or info_dict.get("number") or "")
+                if str(source_label) in chunk_text or str(source_label) in target_text or (printed and printed in target_text):
+                    reference_labels.append({"source_label": source_label, **info_dict})
+    neighbors = []
+    for index in (chunk_position - 1, chunk_position + 1):
+        if 0 <= index < len(chunks):
+            neighbor = chunks[index]
+            excerpt = _bounded_verification_output(
+                neighbor.get("chunk_text"), limit=max(1500, int(max_context_chars) // 4)
+            )
+            neighbors.append(
+                {
+                    "chunk_id": neighbor.get("chunk_id"),
+                    "title": neighbor.get("display_label") or neighbor.get("label"),
+                    "page_start": neighbor.get("page_start"),
+                    "page_end": neighbor.get("page_end"),
+                    "text_excerpt": excerpt["text"],
+                    "excerpt_truncated": excerpt["truncated"],
+                }
+            )
+    stdout = _bounded_verification_output(result.get("stdout"), limit=120000)
+    stderr = _bounded_verification_output(result.get("stderr"), limit=120000)
+    prior_repairs = [
+        item for item in verification_technical_repair_records(session, include_superseded=True)
+        if str(item.get("script_id") or "") == script_id
+    ]
+    return {
+        "schema_version": 1,
+        "workflow": "verification_technical_repair",
+        "candidate": candidate,
+        "manuscript": {
+            "chunk_id": chunk_id,
+            "chunk_index": chunk.get("chunk_index"),
+            "title": chunk.get("display_label") or chunk.get("label"),
+            "page_start": chunk.get("page_start"),
+            "page_end": chunk.get("page_end"),
+            "source_kind": chunk.get("source_kind"),
+            "source_label": chunk.get("source_label"),
+            "printed_label": chunk.get("printed_label"),
+            "theorem_lemma_equation_metadata": chunk.get("boundary") or {},
+            "complete_canonical_chunk_text": chunk_text,
+            "chunk_record": chunk_record,
+            "original_structured_chunk_audit_response": structured_response,
+            "current_linked_issues": relevant_issues,
+            "relevant_reference_labels": reference_labels,
+            "neighboring_context": neighbors,
+        },
+        "verification_failure": {
+            "script_id": script_id,
+            "script_filename": script_path.name,
+            "script_path": _relative_audit_path(session, script_path),
+            "complete_original_python_script": script_text,
+            "purpose": result.get("purpose"),
+            "description": result.get("description"),
+            "expected_outcome": result.get("expected_outcome"),
+            "intended_target": result.get("target") or {},
+            "check_kind": str((result.get("structured_result") or {}).get("check_kind") or ""),
+            "tested_range": result.get("tested_range"),
+            "execution_status": result.get("execution_status"),
+            "failure_reason": result.get("outcome_parse_error") or result.get("skip_reason") or result.get("conclusion"),
+            "parser_or_contract_error": result.get("outcome_parse_error") or result.get("structured_result_error"),
+            "returncode": result.get("returncode"),
+            "runtime_seconds": result.get("elapsed_seconds"),
+            "timeout_seconds": result.get("timeout_seconds"),
+            "safe_only": result.get("safe_only"),
+            "skip_reason": result.get("skip_reason"),
+            "stdout": stdout["text"],
+            "stdout_bounded": stdout["truncated"],
+            "stdout_original_chars": stdout["original_chars"],
+            "stderr": stderr["text"],
+            "stderr_bounded": stderr["truncated"],
+            "stderr_original_chars": stderr["original_chars"],
+            "partial_output_preserved": str(result.get("execution_status") or "") == "timeout",
+            "structured_result_contract_status": result.get("outcome_source"),
+            "structured_result": result.get("structured_result") or {},
+            "linked_issue_ids": list(result.get("linked_issue_ids") or []),
+            "result_path": _relative_audit_path(session, result.get("result_path")),
+        },
+        "previous_repair_history": prior_repairs,
+        "input_evidence_hashes": {
+            "chunk_text_sha256": hashlib.sha256(chunk_text.encode("utf-8")).hexdigest(),
+            "script_sha256": hashlib.sha256(script_text.encode("utf-8")).hexdigest(),
+            "result_sha256": hashlib.sha256(
+                json.dumps(result, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest(),
+        },
+        "evidence_policy": {
+            "complete_chunk_included": True,
+            "complete_script_included": True,
+            "traceback_and_error_preserved": True,
+            "stdout_bounded_only_if_extraordinary": stdout["truncated"],
+            "stderr_bounded_only_if_extraordinary": stderr["truncated"],
+            "bounded_output_preserves_head_tail_error_and_structured_result_lines": True,
+        },
+    }
+
+
+def build_verification_technical_repair_prompt(evidence: dict[str, Any], repair_id: str) -> str:
+    failure = evidence.get("verification_failure") or {}
+    failure_type = str(failure.get("execution_status") or "")
+    instructions = {
+        "parse_error": (
+            "Identify the exact syntax, JSON, sentinel, or serialization defect; preserve the intended computation; "
+            "return a complete script that passes ast.parse and emits exactly one structured result sentinel."
+        ),
+        "runtime_error": (
+            "Explain the complete traceback and root cause; correct the implementation without deleting the relevant "
+            "computation or weakening the intended claim, hypotheses, formulas, or scope."
+        ),
+        "timeout": (
+            "Identify the bottleneck and provide a materially faster implementation where possible. Preserve the "
+            "original scope and prefer exact arithmetic or mathematical simplification. State every scope reduction "
+            "explicitly; never silently reduce the range or present a reduced search as equivalent."
+        ),
+        "unsafe": (
+            "Identify the prohibited operation or AST construct and produce a safe equivalent within the supplied "
+            "verification policy. Do not use filesystem writes, network, subprocesses, or dynamic evaluation."
+        ),
+        "skipped": (
+            "Identify the validation or safety-policy reason for the skip and produce a safe executable equivalent, "
+            "or explain precisely why no safe equivalent exists."
+        ),
+    }.get(failure_type, "Repair the exact technical failure while preserving the intended mathematical check.")
+    return "\n\n".join(
+        [
+            "Technical verification-script repair task",
+            (
+                "Repair one failed verification script. Do not redo the manuscript chunk audit, replace its issues, "
+                "or reinterpret successful counterexample findings. The original script and result remain immutable."
+            ),
+            f"Required repair_id: {repair_id}",
+            f"Failure-specific instruction: {instructions}",
+            (
+                "Return replacement_available=true with one or more complete standalone replacement scripts, or "
+                "replacement_available=false with a precise no_replacement_reason and fallback action. A missing "
+                "replacement without an explanation is invalid. Parse errors, straightforward runtime errors, and "
+                "avoidable policy violations normally require a corrected script."
+            ),
+            (
+                "Every replacement must use the existing MATH_AUDIT_VERIFICATION_RESULT_JSON= contract exactly once, "
+                "state its tested scope, preserve the original scope when possible, and distinguish execution success "
+                "from mathematical outcome. A finite search is not a proof."
+            ),
+            "Complete failed script:",
+            "```python\n" + str(failure.get("complete_original_python_script") or "") + "\n```",
+            "Exact/bounded failure stdout:",
+            "```text\n" + str(failure.get("stdout") or "") + "\n```",
+            "Exact/bounded failure stderr and traceback:",
+            "```text\n" + str(failure.get("stderr") or "") + "\n```",
+            "Complete evidence package (JSON):",
+            json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True, default=str),
+        ]
+    ).strip() + "\n"
+
+
+def persist_verification_technical_repair_proposals(
+    session: dict[str, Any], *, repair_id: str, artifact_root: str | Path,
+    structured_result: dict[str, Any], evidence: dict[str, Any], model: str, reasoning_effort: str
+) -> dict[str, Any]:
+    root = Path(artifact_root)
+    root.mkdir(parents=True, exist_ok=True)
+    workdir = Path(session["workdir"]).resolve()
+    failure = evidence.get("verification_failure") or {}
+    original_source = str(failure.get("complete_original_python_script") or "")
+    original_path = root / "original_script.py"
+    original_path.write_text(original_source, encoding="utf-8")
+    checks = []
+    for proposal in structured_result.get("replacement_checks") or []:
+        check_id = _safe_replacement_check_id(proposal.get("check_id"))
+        code = str(proposal.get("python_code") or "")
+        script_path = root / f"replacement_{check_id}.py"
+        script_path.write_text(code, encoding="utf-8")
+        validation = validate_verification_replacement_code(code)
+        checks.append(
+            {
+                "check_id": check_id,
+                "relationship_to_original": proposal.get("relationship_to_original"),
+                "purpose": proposal.get("purpose"),
+                "correction_explanation": proposal.get("correction_explanation"),
+                "independence_note": proposal.get("independence_note"),
+                "expected_check_kind": proposal.get("expected_check_kind"),
+                "original_scope_preserved": bool(proposal.get("original_scope_preserved")),
+                "tested_scope": proposal.get("tested_scope") or {},
+                "script_path": str(script_path.resolve().relative_to(workdir)),
+                "code_sha256": validation["code_sha256"],
+                "validation": validation,
+            }
+        )
+    manifest_path = root / "replacement_manifest.json"
+    event_path = root / "replacement_execution_events.jsonl"
+    manifest = {
+        "schema_version": 1,
+        "created_at": utc_now(),
+        "repair_id": repair_id,
+        "script_id": str(structured_result.get("script_id") or ""),
+        "chunk_id": str(structured_result.get("chunk_id") or ""),
+        "failure_type": str(structured_result.get("failure_type") or ""),
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "original_script": {
+            "source_path": str(failure.get("script_path") or ""),
+            "preserved_copy_path": str(original_path.resolve().relative_to(workdir)),
+            "code_sha256": hashlib.sha256(original_source.encode("utf-8")).hexdigest(),
+        },
+        "replacement_available": bool(structured_result.get("replacement_available")),
+        "no_replacement_reason": str(structured_result.get("no_replacement_reason") or ""),
+        "recommended_next_action": str(structured_result.get("recommended_next_action") or ""),
+        "replacement_checks": checks,
+        "execution_events_path": str(event_path.resolve().relative_to(workdir)),
+    }
+    save_json(manifest_path, manifest)
+    return {
+        "manifest": manifest,
+        "manifest_path": str(manifest_path.resolve().relative_to(workdir)),
+        "proposed_count": len(checks),
+        "ready_count": sum(1 for item in checks if (item.get("validation") or {}).get("status") == "ready"),
+    }
+
+
 def verification_findings_for_session(
     session: dict[str, Any],
     results: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     active_results = _load_verification_results(session) if results is None else results
+    existing_paths = {str(item.get("result_path") or "") for item in active_results}
+    for group in verification_technical_repair_inventory(session).get("groups") or []:
+        for check in group.get("checks") or []:
+            latest = check.get("latest_execution") if isinstance(check.get("latest_execution"), dict) else {}
+            replacement_result = latest.get("result") if isinstance(latest.get("result"), dict) else {}
+            if (
+                replacement_result
+                and replacement_result.get("mathematical_outcome") in NEGATIVE_VERIFICATION_OUTCOMES
+                and str(replacement_result.get("result_path") or "") not in existing_paths
+            ):
+                active_results = [*active_results, replacement_result]
+                existing_paths.add(str(replacement_result.get("result_path") or ""))
     findings = [
         finding
         for result in active_results
@@ -2109,7 +2869,10 @@ def supersede_verification_findings_for_chunks(session: dict[str, Any], chunk_id
 
 def verification_result_needs_technical_retry(result: dict[str, Any]) -> bool:
     normalized = _normalize_verification_result(result)
-    return str(normalized.get("execution_status") or "") in TECHNICAL_VERIFICATION_FAILURE_STATUSES
+    status = str(normalized.get("execution_status") or "")
+    if status == "skipped":
+        return _technical_skip_is_repairable(normalized)
+    return status in TECHNICAL_VERIFICATION_FAILURE_STATUSES
 
 
 def _load_verification_results(session: dict[str, Any], state: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
@@ -2722,6 +3485,142 @@ def run_verification_replacement_checks(
             str((item.get("result") or {}).get("execution_status") or "") for item in attempts
         ],
         "inventory": verification_replacement_check_inventory(session),
+    }
+
+
+def run_verification_technical_replacement_checks(
+    session: dict[str, Any], repair_id: str, check_ids: Optional[list[str]] = None,
+    timeout: int = 120, progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> dict[str, Any]:
+    record = next(
+        (
+            item for item in verification_technical_repair_records(session)
+            if str(item.get("repair_id") or "") == str(repair_id or "")
+        ),
+        None,
+    )
+    if record is None:
+        raise ValueError(f"Canonical technical repair not found: {repair_id}")
+    manifest, manifest_path = _technical_repair_manifest(session, record)
+    if not manifest or manifest_path is None:
+        raise ValueError("This technical repair has no replacement manifest.")
+    requested = {str(item).strip() for item in (check_ids or []) if str(item).strip()}
+    checks = [item for item in manifest.get("replacement_checks") or [] if isinstance(item, dict)]
+    if requested:
+        checks = [item for item in checks if str(item.get("check_id") or "") in requested]
+        missing = requested - {str(item.get("check_id") or "") for item in checks}
+        if missing:
+            raise ValueError("Unknown technical replacement check ID(s): " + ", ".join(sorted(missing)))
+    if not checks:
+        raise ValueError("No technical replacement checks were selected.")
+    not_ready = [
+        str(item.get("check_id") or "") for item in checks
+        if (item.get("validation") or {}).get("status") != "ready"
+    ]
+    if not_ready:
+        raise ValueError("Technical replacement checks are not safe/ready: " + ", ".join(not_ready))
+    workdir = Path(session["workdir"]).resolve()
+    artifact_root = manifest_path.parent
+    workspace = artifact_root / "replacement_execution_workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    temp_session = dict(session)
+    temp_session["workdir"] = str(workspace)
+    event_path = (workdir / str(manifest.get("execution_events_path") or "")).resolve()
+    event_path.parent.mkdir(parents=True, exist_ok=True)
+    prior_events = _technical_repair_execution_events(session, manifest)
+    latest_prior = {
+        str(item.get("replacement_check_id") or ""): item
+        for item in prior_events if str(item.get("event") or "") == "execution_completed"
+    }
+    attempts = []
+    for check in checks:
+        check_id = str(check.get("check_id") or "")
+        script_path = (workdir / str(check.get("script_path") or "")).resolve()
+        source = script_path.read_text(encoding="utf-8")
+        validation = validate_verification_replacement_code(source)
+        if validation.get("status") != "ready" or validation.get("code_sha256") != check.get("code_sha256"):
+            raise ValueError(f"Technical replacement {check_id} changed or no longer passes safe validation.")
+        entry = {
+            "chunk_id": str(manifest.get("chunk_id") or ""),
+            "chunk_index": _chunk_index_from_chunk_id(str(manifest.get("chunk_id") or "")),
+            "script_name": script_path.name,
+            "script_path": str(script_path),
+            "purpose": str(check.get("purpose") or ""),
+            "description": str(check.get("correction_explanation") or ""),
+            "expected_outcome": str(check.get("expected_check_kind") or ""),
+        }
+        bundle = _run_verification_scripts(
+            temp_session, [entry], timeout=int(timeout), safe_only=True,
+            progress_callback=progress_callback, replace_all_results=True,
+        )
+        executed = dict((bundle.get("executed_results") or [{}])[0])
+        structured = executed.get("structured_result") if isinstance(executed.get("structured_result"), dict) else {}
+        expected_kind = str(check.get("expected_check_kind") or "").strip()
+        emitted_kind = str(structured.get("check_kind") or "").strip()
+        if executed.get("execution_status") == "completed" and emitted_kind != expected_kind:
+            executed.update(
+                {
+                    "execution_status": "parse_error",
+                    "mathematical_outcome": "inconclusive",
+                    "outcome_source": "technical_repair_contract_validation",
+                    "structured_result_error": (
+                        f"replacement emitted check_kind={emitted_kind!r}; expected {expected_kind!r}"
+                    ),
+                    "status": _legacy_status_for_execution("parse_error"),
+                }
+            )
+            executed["conclusion"] = _infer_verification_conclusion(executed)
+        attempt_id = f"technical_repair_attempt_{int(time.time() * 1000000)}_{check_id}"
+        result_path = artifact_root / "replacement_results" / f"{attempt_id}.result.json"
+        executed.update(
+            {
+                "origin": "verification_technical_repair",
+                "repair_id": str(repair_id),
+                "replacement_attempt_id": attempt_id,
+                "replacement_check_id": check_id,
+                "original_failed_script": str(manifest.get("script_id") or ""),
+                "original_scope_preserved": bool(check.get("original_scope_preserved")),
+                "tested_scope": check.get("tested_scope") or {},
+                "result_path": str(result_path.resolve().relative_to(workdir)),
+            }
+        )
+        save_json(result_path, executed)
+        previous = latest_prior.get(check_id)
+        event = {
+            "schema_version": 1,
+            "time": utc_now(),
+            "event": "execution_completed",
+            "origin": "verification_technical_repair",
+            "repair_id": str(repair_id),
+            "replacement_attempt_id": attempt_id,
+            "replacement_check_id": check_id,
+            "original_failed_script": str(manifest.get("script_id") or ""),
+            "supersedes_attempt_id": str((previous or {}).get("replacement_attempt_id") or "") or None,
+            "result_path": str(result_path.resolve().relative_to(workdir)),
+            "execution_status": executed.get("execution_status"),
+            "mathematical_outcome": executed.get("mathematical_outcome"),
+            "tested_scope": check.get("tested_scope") or {},
+            "original_scope_preserved": bool(check.get("original_scope_preserved")),
+            "elapsed_seconds": executed.get("elapsed_seconds"),
+            "local_execution": True,
+            "api_cost_usd": 0.0,
+        }
+        append_jsonl(event_path, event)
+        latest_prior[check_id] = event
+        attempts.append({"event": event, "result": executed})
+    # Findings are derived from an effective view; canonical verification.json and original result files stay untouched.
+    base_results = _load_verification_results(session)
+    replacement_results = [item["result"] for item in attempts if isinstance(item.get("result"), dict)]
+    _persist_verification_findings(session, base_results + replacement_results)
+    return {
+        "workflow": "verification_technical_replacement_execution",
+        "repair_id": str(repair_id),
+        "attempts": attempts,
+        "verification_technical_repair_local_runtime": sum(
+            float((item.get("result") or {}).get("elapsed_seconds", 0.0) or 0.0) for item in attempts
+        ),
+        "verification_technical_repair_local_api_cost_usd": 0.0,
+        "inventory": verification_technical_repair_inventory(session),
     }
 
 

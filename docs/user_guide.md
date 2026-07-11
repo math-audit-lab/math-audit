@@ -245,7 +245,9 @@ Successful execution does not mean that the paper's claim passed. A script may e
 
 ## 11. Rerunning Failed Verification Chunks
 
-If a verification script has a technical execution failure or times out, the GUI can help rerun chunks associated with those scripts. This technical workflow is for timeouts, runtime/parse errors, unsafe or skipped scripts, and missing/malformed execution. A script that executes successfully and finds a counterexample is not a technical rerun failure.
+If a verification script has a parse error, runtime error, timeout, or safety-policy failure, use **Generate Repair Scripts** first. This focused API action receives the complete failed script, exact traceback/parser/safety/timeout evidence, stdout/stderr, complete manuscript chunk, labels, linked issues, and compact surrounding context. It must propose a complete corrected replacement or explain why no safe replacement is available. This preserves the original chunk audit and its issues.
+
+Review the complete proposed code before selecting **Run Safe Replacement Checks**. Replacement execution is local, uses the existing verification safety policy, makes no API call, and never overwrites the original script or result. Its mathematical outcome remains provisional: no counterexample in a finite tested range is not a proof. Full failed-verification chunk re-audit remains available as a separate fallback when repair is impossible, repeatedly inconclusive, or indicates that the original chunk analysis needs reconsideration; it may replace that chunk's issues and checks.
 
 For an active `counterexample_found` or `claim_failed` finding, use **Recheck Counterexample Chunks** instead. This focused API action sends the complete manuscript chunk, full Python script, exact stdout/stderr and execution metadata, complete structured counterexample/failed cases, linked issues, source/printed labels when available, and compact neighboring/global context. It uses the audit session's saved model and reasoning effort by default and may incur additional API cost.
 

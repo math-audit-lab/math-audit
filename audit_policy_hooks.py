@@ -29,6 +29,7 @@ from audit_verification import (
     verification_finding_rechecks_for_session,
     verification_findings_for_session,
     verification_replacement_check_inventory,
+    verification_technical_repair_inventory,
 )
 from audit_runtime import (
     AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL,
@@ -49,6 +50,8 @@ from audit_runtime import (
     _verification_inventory_warning,
     _verification_findings_markdown,
     _verification_findings_tex,
+    _verification_technical_repairs_markdown,
+    _verification_technical_repairs_tex,
     build_fresh_audit_context_for_chunk,
     build_verification_report as runtime_build_verification_report,
     format_list_for_markdown,
@@ -2452,6 +2455,9 @@ def _build_final_report_markdown_base(session: dict[str, Any], report_title: Opt
     ]
     if verification_findings:
         lines.extend([_verification_findings_markdown(verification_findings).rstrip(), ""])
+    technical_repairs_md = _verification_technical_repairs_markdown(session)
+    if technical_repairs_md:
+        lines.extend([technical_repairs_md.rstrip(), ""])
     lines.append("## Open issues")
 
     open_issues = [x for x in issues_state["issues"] if x.get("status", "open") == "open"]
@@ -2629,6 +2635,7 @@ def _build_final_report_tex_base(session: dict[str, Any], report_title: Optional
 
     if verification_findings:
         parts.append(_verification_findings_tex(verification_findings) + "\n")
+    parts.append(_verification_technical_repairs_tex(session))
 
     parts.append(r"\section*{Open issues}" + "\n")
     open_issues = [x for x in issues_state["issues"] if x.get("status", "open") == "open"]
@@ -3901,6 +3908,7 @@ def build_final_report(
         ),
         "verification_finding_rechecks": verification_finding_rechecks_for_session(session),
         "verification_replacement_checks": verification_replacement_check_inventory(session),
+        "verification_technical_repairs": verification_technical_repair_inventory(session),
         "source_ingestion_diagnostics": source_diagnostics,
         "recheck_applied": bool(issue_recheck_overlay.get("recheck_applied")),
         "issue_recheck_summary": issue_recheck_overlay.get("issue_recheck_summary", {}),
@@ -4267,6 +4275,9 @@ def build_concise_report_markdown(
         lines.append(f"- {label}: {normalize_math_delimiters(value)}")
     if data["verification_findings"]:
         lines.extend(["", _verification_findings_markdown(data["verification_findings"]).rstrip()])
+    technical_repairs_md = _verification_technical_repairs_markdown(session)
+    if technical_repairs_md:
+        lines.extend(["", technical_repairs_md.rstrip()])
     lines.extend(
         [
             "",
@@ -4341,6 +4352,7 @@ def build_concise_report_tex(
     parts.append(r"\end{itemize}" + "\n")
     if data["verification_findings"]:
         parts.append(_verification_findings_tex(data["verification_findings"]) + "\n")
+    parts.append(_verification_technical_repairs_tex(session))
     parts.append(_high_priority_issues_tex(data["main_issue_entries"], normalized_options) + "\n")
     notable_tex = _notable_proof_reference_issues_tex(data["notable_proof_reference_entries"])
     if notable_tex:
@@ -4425,6 +4437,7 @@ def build_concise_report_json(
         ),
         "verification_finding_rechecks": verification_finding_rechecks_for_session(session),
         "verification_replacement_checks": verification_replacement_check_inventory(session),
+        "verification_technical_repairs": verification_technical_repair_inventory(session),
         "reference_status": _reference_report_status(session),
         "recheck_applied": bool(data["issue_recheck_overlay"].get("recheck_applied")),
         "issue_recheck_summary": data["issue_recheck_overlay"].get("issue_recheck_summary", {}),

@@ -59,6 +59,7 @@ def session_paths(workdir: str | Path) -> dict[str, Path]:
         "verification_state": root / "state" / "verification.json",
         "verification_findings": root / "state" / "verification_findings.json",
         "verification_finding_rechecks": root / "state" / "verification_finding_rechecks.jsonl",
+        "verification_technical_repairs": root / "state" / "verification_technical_repairs.jsonl",
     }
 
 

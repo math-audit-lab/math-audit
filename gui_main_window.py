@@ -289,6 +289,63 @@ def _verification_replacement_view(inventory: dict[str, Any]) -> dict[str, Any]:
     return {"summary_text": "\n".join(lines).rstrip(), "entries": entries}
 
 
+def _verification_technical_repair_view(
+    candidates: dict[str, Any], repairs: dict[str, Any]
+) -> dict[str, Any]:
+    eligible = [
+        item for item in candidates.get("candidates") or []
+        if isinstance(item, dict) and item.get("eligible")
+    ]
+    candidate_entries = [{"label": f"All eligible scripts ({len(eligible)})", "selection": "all"}] if eligible else []
+    lines = [
+        f"{len(eligible)} script(s) require technical repair.",
+        "Repair script first - this preserves the original chunk audit.",
+    ] if eligible else ["No active technical verification failures require repair."]
+    by_chunk: dict[str, int] = {}
+    for item in eligible:
+        chunk_id = str(item.get("chunk_id") or "")
+        if chunk_id:
+            by_chunk[chunk_id] = by_chunk.get(chunk_id, 0) + 1
+    for chunk_id, count in sorted(by_chunk.items()):
+        if count > 1:
+            candidate_entries.append(
+                {"label": f"{chunk_id} - all failed scripts ({count})", "selection": chunk_id}
+            )
+    for item in eligible:
+        script_id = str(item.get("script_id") or "unknown script")
+        status = str(item.get("execution_status") or "unknown")
+        reason = str(item.get("failure_reason") or "not recorded")
+        lines.append(f"{script_id} - {status}: {reason}")
+        candidate_entries.append({"label": f"{script_id} - {status}", "selection": script_id})
+    replacement_entries = []
+    for group in repairs.get("groups") or []:
+        if not isinstance(group, dict):
+            continue
+        repair_id = str(group.get("repair_id") or "")
+        script_id = str(group.get("script_id") or "unknown script")
+        for check in group.get("checks") or []:
+            if not isinstance(check, dict):
+                continue
+            validation = str((check.get("validation") or {}).get("status") or "unknown")
+            check_id = str(check.get("check_id") or "")
+            replacement_entries.append(
+                {
+                    "label": f"{script_id} - {check_id} - {validation}",
+                    "data": {
+                        "repair_id": repair_id,
+                        "check_ids": [check_id],
+                        "script_paths": [str(check.get("script_path") or "")],
+                        "ready": validation == "ready",
+                    },
+                }
+            )
+    return {
+        "summary_text": "\n".join(lines),
+        "candidate_entries": candidate_entries,
+        "replacement_entries": replacement_entries,
+    }
+
+
 class AuditPromptDialog(QDialog):
     def __init__(self, controller: GuiController, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -676,6 +733,7 @@ class MainWindow(QMainWindow):
         self._review_family_ids: list[str] = []
         self._counterexample_recheck_inventory_signature: Optional[tuple[Any, ...]] = None
         self._verification_replacement_inventory_signature: Optional[tuple[Any, ...]] = None
+        self._verification_technical_repair_signature: Optional[tuple[Any, ...]] = None
 
         self.setWindowTitle("Math Audit Control Panel (V1)")
         self.resize(980, 820)
@@ -1032,6 +1090,52 @@ class MainWindow(QMainWindow):
         failed_rerun_layout.addWidget(self.failed_verification_stack)
         self._set_failed_verification_rerun_compact(0)
 
+        technical_repair_box = QGroupBox("Technical Verification Repairs")
+        technical_repair_layout = QVBoxLayout(technical_repair_box)
+        technical_repair_hint = QLabel(
+            "Repair a failed script first, preserving the original chunk audit. Generation uses the API; reviewed "
+            "replacement execution is local and makes no API call. Full chunk re-audit remains a separate fallback."
+        )
+        technical_repair_hint.setWordWrap(True)
+        technical_repair_hint.setStyleSheet("color: #555;")
+        technical_repair_layout.addWidget(technical_repair_hint)
+        self.verification_technical_repair_summary = QPlainTextEdit()
+        self.verification_technical_repair_summary.setReadOnly(True)
+        self.verification_technical_repair_summary.setMaximumHeight(145)
+        self.verification_technical_repair_summary.setPlainText(
+            "No active technical verification failures require repair."
+        )
+        technical_repair_layout.addWidget(self.verification_technical_repair_summary)
+        self.verification_technical_repair_combo = QComboBox()
+        self.verification_technical_repair_combo.currentIndexChanged.connect(self._apply_button_states)
+        technical_repair_layout.addWidget(self.verification_technical_repair_combo)
+        self.generate_verification_technical_repair_button = QPushButton("Generate Repair Scripts")
+        self.generate_verification_technical_repair_button.clicked.connect(
+            self._generate_verification_technical_repairs
+        )
+        technical_repair_layout.addWidget(
+            self.generate_verification_technical_repair_button, 0, Qt.AlignmentFlag.AlignLeft
+        )
+        replacement_row = QHBoxLayout()
+        self.verification_technical_replacement_combo = QComboBox()
+        self.verification_technical_replacement_combo.currentIndexChanged.connect(self._apply_button_states)
+        replacement_row.addWidget(self.verification_technical_replacement_combo, 1)
+        self.review_verification_technical_replacement_button = QPushButton("Review Complete Code")
+        self.review_verification_technical_replacement_button.clicked.connect(
+            self._review_verification_technical_replacement
+        )
+        self.run_verification_technical_replacement_button = QPushButton("Run Safe Replacement Checks")
+        self.run_verification_technical_replacement_button.clicked.connect(
+            self._run_verification_technical_replacements
+        )
+        replacement_row.addWidget(self.review_verification_technical_replacement_button)
+        replacement_row.addWidget(self.run_verification_technical_replacement_button)
+        technical_repair_layout.addLayout(replacement_row)
+        self.verification_technical_repair_status = QLabel("No repair action available.")
+        self.verification_technical_repair_status.setWordWrap(True)
+        self.verification_technical_repair_status.setStyleSheet("color: #8a4b00; font-weight: 600;")
+        technical_repair_layout.addWidget(self.verification_technical_repair_status)
+
         counterexample_recheck_box = QGroupBox("Counterexample Finding Recheck")
         counterexample_recheck_layout = QVBoxLayout(counterexample_recheck_box)
         counterexample_recheck_layout.setContentsMargins(8, 8, 8, 8)
@@ -1136,6 +1240,7 @@ class MainWindow(QMainWindow):
         self.verification_report_freshness_value = QLabel("Verification Report: freshness unknown")
         self.verification_report_freshness_value.setWordWrap(True)
         verification_layout.addWidget(self.verification_report_freshness_value)
+        verification_layout.addWidget(technical_repair_box)
         verification_layout.addWidget(failed_rerun_box)
         verification_layout.addWidget(counterexample_recheck_box)
         reports_layout.addWidget(verification_box)
@@ -1679,6 +1784,136 @@ class MainWindow(QMainWindow):
         data = self.verification_replacement_combo.currentData()
         return dict(data) if isinstance(data, dict) else {}
 
+    def _update_verification_technical_repairs(
+        self, candidates: dict[str, Any], repairs: dict[str, Any]
+    ) -> None:
+        view = _verification_technical_repair_view(candidates, repairs)
+        signature = (
+            str(view.get("summary_text") or ""),
+            json.dumps(view.get("candidate_entries") or [], sort_keys=True),
+            json.dumps(view.get("replacement_entries") or [], sort_keys=True),
+        )
+        if signature == self._verification_technical_repair_signature:
+            return
+        prior_candidate = str(self.verification_technical_repair_combo.currentData() or "")
+        prior_replacement = json.dumps(
+            self.verification_technical_replacement_combo.currentData() or {}, sort_keys=True
+        )
+        _set_plain_text_preserving_scroll(
+            self.verification_technical_repair_summary, str(view.get("summary_text") or "")
+        )
+        self.verification_technical_repair_combo.blockSignals(True)
+        try:
+            self.verification_technical_repair_combo.clear()
+            candidate_index = 0
+            for index, entry in enumerate(view.get("candidate_entries") or []):
+                selection = str(entry.get("selection") or "")
+                self.verification_technical_repair_combo.addItem(str(entry.get("label") or ""), selection)
+                if selection == prior_candidate:
+                    candidate_index = index
+            if self.verification_technical_repair_combo.count():
+                self.verification_technical_repair_combo.setCurrentIndex(candidate_index)
+        finally:
+            self.verification_technical_repair_combo.blockSignals(False)
+        self.verification_technical_replacement_combo.blockSignals(True)
+        try:
+            self.verification_technical_replacement_combo.clear()
+            replacement_index = 0
+            for index, entry in enumerate(view.get("replacement_entries") or []):
+                data = dict(entry.get("data") or {})
+                self.verification_technical_replacement_combo.addItem(str(entry.get("label") or ""), data)
+                if json.dumps(data, sort_keys=True) == prior_replacement:
+                    replacement_index = index
+            if self.verification_technical_replacement_combo.count():
+                self.verification_technical_replacement_combo.setCurrentIndex(replacement_index)
+        finally:
+            self.verification_technical_replacement_combo.blockSignals(False)
+        self.verification_technical_repair_combo.setEnabled(bool(view.get("candidate_entries")))
+        self.verification_technical_replacement_combo.setEnabled(bool(view.get("replacement_entries")))
+        self._verification_technical_repair_signature = signature
+
+    def _generate_verification_technical_repairs(self) -> None:
+        self._apply_api_key()
+        self._apply_pdf_path()
+        selection = str(self.verification_technical_repair_combo.currentData() or "")
+        payload = self._last_status_payload or {}
+        session = payload.get("session") or {}
+        model = self.controller.model or session.get("model")
+        effort = self.controller.reasoning_effort or session.get("reasoning_effort")
+        choice = QMessageBox.question(
+            self,
+            "Generate Repair Scripts",
+            (
+                "Send the complete failed script, exact failure evidence, complete manuscript chunk, linked issues, "
+                "and bounded context to the OpenAI API?\n\n"
+                f"Model/reasoning: {model or 'saved session model'} / {effort or 'saved session effort'}\n"
+                "This incurs API cost. The original script, result, chunk issues, and chunk context remain unchanged."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            self.controller.repair_verification_scripts("" if selection == "all" else selection)
+        else:
+            self.controller.log_message.emit("Technical verification repair cancelled.")
+
+    def _selected_verification_technical_replacement(self) -> dict[str, Any]:
+        data = self.verification_technical_replacement_combo.currentData()
+        return dict(data) if isinstance(data, dict) else {}
+
+    def _review_verification_technical_replacement(self) -> None:
+        selected = self._selected_verification_technical_replacement()
+        session = (self._last_status_payload or {}).get("session") or {}
+        workdir = Path(str(session.get("workdir") or "")).resolve()
+        blocks = []
+        for relative in selected.get("script_paths") or []:
+            path = (workdir / str(relative)).resolve()
+            try:
+                path.relative_to(workdir)
+            except ValueError:
+                continue
+            if path.is_file():
+                blocks.append(f"# {path.name}\n\n{path.read_text(encoding='utf-8')}")
+        if not blocks:
+            QMessageBox.information(self, "Technical Replacement", "No replacement code is selected.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Review Complete Technical Replacement Code")
+        dialog.resize(820, 620)
+        layout = QVBoxLayout(dialog)
+        editor = QPlainTextEdit()
+        editor.setReadOnly(True)
+        editor.setPlainText("\n\n".join(blocks))
+        layout.addWidget(editor, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def _run_verification_technical_replacements(self) -> None:
+        self._apply_pdf_path()
+        selected = self._selected_verification_technical_replacement()
+        repair_id = str(selected.get("repair_id") or "")
+        check_ids = [str(item) for item in selected.get("check_ids") or [] if str(item).strip()]
+        if not repair_id or not check_ids or not selected.get("ready"):
+            QMessageBox.information(self, "Technical Replacement", "Select a safe, ready replacement first.")
+            return
+        choice = QMessageBox.question(
+            self,
+            "Run Safe Technical Replacement",
+            (
+                "Run the reviewed replacement locally in safe mode?\n\n"
+                "This makes no API call and does not overwrite the original script or verification result. "
+                "The mathematical outcome remains provisional."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            self.controller.run_verification_technical_replacement_checks(repair_id, check_ids)
+        else:
+            self.controller.log_message.emit("Technical replacement execution cancelled.")
+
     def _review_verification_replacement_script(self) -> None:
         selected = self._selected_verification_replacement()
         script_paths = [str(item) for item in selected.get("script_paths") or [] if str(item).strip()]
@@ -1863,6 +2098,10 @@ class MainWindow(QMainWindow):
         )
         self._update_verification_replacement_inventory(
             verification_suite.get("verification_replacement_checks") or {}
+        )
+        self._update_verification_technical_repairs(
+            verification_suite.get("verification_technical_repair_candidates") or {},
+            verification_suite.get("verification_technical_repairs") or {},
         )
         inventory_warning = verification_suite.get("inventory_warning") or {}
         if inventory_warning.get("has_invalidated_obligations"):
@@ -2354,6 +2593,39 @@ class MainWindow(QMainWindow):
             if can_run_replacement
             else "color: #8a4b00; font-weight: 600;",
         )
+        technical_candidate_available = self.verification_technical_repair_combo.count() > 0
+        can_generate_technical = (
+            technical_candidate_available and session_available and not self._task_running
+            and status_name in {"completed", "paused"} and not pending_response
+            and self.controller.live_api_key_available()
+        )
+        self.generate_verification_technical_repair_button.setEnabled(can_generate_technical)
+        technical_replacement = self._selected_verification_technical_replacement()
+        technical_replacement_available = bool(technical_replacement.get("repair_id"))
+        technical_replacement_ready = bool(technical_replacement.get("ready"))
+        self.review_verification_technical_replacement_button.setEnabled(
+            technical_replacement_available and not self._task_running
+        )
+        can_run_technical = (
+            technical_replacement_available and technical_replacement_ready and session_available
+            and not self._task_running and status_name in {"completed", "paused"} and not pending_response
+        )
+        self.run_verification_technical_replacement_button.setEnabled(can_run_technical)
+        if can_generate_technical:
+            technical_reason = "Ready to generate evidence-rich repair scripts; this API action may incur cost."
+        elif can_run_technical:
+            technical_reason = "Ready for confirmed local safe-mode execution; no API call is made."
+        elif self._task_running:
+            technical_reason = "Another audit action is currently running."
+        elif not technical_candidate_available and not technical_replacement_available:
+            technical_reason = "No active technical repair candidate or replacement is available."
+        elif technical_replacement_available and not technical_replacement_ready:
+            technical_reason = "Selected replacement failed validation and cannot be executed."
+        elif not self.controller.live_api_key_available() and technical_candidate_available:
+            technical_reason = "API key required to generate repair scripts."
+        else:
+            technical_reason = "Technical repair requires a completed or paused audit with no pending response."
+        _set_text_if_changed(self.verification_technical_repair_status, technical_reason)
         self.ask_button.setEnabled(session_ready)
         self.new_discussion_thread_button.setEnabled(session_ready)
         self.discussion_thread_combo.setEnabled(session_ready and self.discussion_thread_combo.count() > 0)
