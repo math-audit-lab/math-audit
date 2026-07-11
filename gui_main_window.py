@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 from datetime import datetime
@@ -209,6 +210,83 @@ def _counterexample_recheck_action_state(
     elif not api_key_available:
         enabled, reason = False, "API key required to run the recheck."
     return {"enabled": enabled, "reason": reason, "button_text": button_text}
+
+
+def _verification_replacement_view(inventory: dict[str, Any]) -> dict[str, Any]:
+    groups = [item for item in inventory.get("groups") or [] if isinstance(item, dict)]
+    if not groups:
+        return {
+            "summary_text": "No replacement verification scripts have been proposed.",
+            "entries": [],
+        }
+    lines = []
+    entries = []
+    for group in groups:
+        recheck_id = str(group.get("recheck_id") or "")
+        chunk_id = str(group.get("chunk_id") or "unknown chunk")
+        finding_ids = ", ".join(str(item) for item in group.get("finding_ids") or []) or "unknown finding"
+        lines.extend(
+            [
+                f"{chunk_id} - {finding_ids}",
+                "  Original script error: " + str(group.get("script_error_explanation") or "not specified"),
+            ]
+        )
+        ready_ids = []
+        ready_paths = []
+        for check in group.get("checks") or []:
+            if not isinstance(check, dict):
+                continue
+            check_id = str(check.get("check_id") or "")
+            validation = check.get("validation") or {}
+            validation_status = str(validation.get("status") or "unknown")
+            latest = check.get("latest_execution") if isinstance(check.get("latest_execution"), dict) else {}
+            execution_text = "not run"
+            if latest:
+                execution_text = (
+                    f"{latest.get('execution_status') or 'unknown'} / "
+                    f"{latest.get('mathematical_outcome') or 'outcome not reported'}"
+                )
+            lines.extend(
+                [
+                    f"  {check_id} ({check.get('relationship_to_original') or 'replacement'})",
+                    f"    Validation: {validation_status}; execution: {execution_text}",
+                    f"    Purpose: {check.get('purpose') or 'not specified'}",
+                ]
+            )
+            entry_data = {
+                "recheck_id": recheck_id,
+                "check_ids": [check_id],
+                "script_paths": [str(check.get("script_path") or "")],
+            }
+            entries.append(
+                {
+                    "label": f"{chunk_id} - {check_id} - {validation_status}",
+                    "data": entry_data,
+                    "ready": validation_status == "ready",
+                }
+            )
+            if validation_status == "ready":
+                ready_ids.append(check_id)
+                ready_paths.append(str(check.get("script_path") or ""))
+        if ready_ids:
+            entries.insert(
+                len(entries) - len(group.get("checks") or []),
+                {
+                    "label": f"{chunk_id} - All ready replacement checks ({len(ready_ids)})",
+                    "data": {
+                        "recheck_id": recheck_id,
+                        "check_ids": ready_ids,
+                        "script_paths": ready_paths,
+                    },
+                    "ready": True,
+                },
+            )
+        reconciliation = group.get("reconciliation") or {}
+        lines.append(
+            "  Status: " + str(reconciliation.get("status") or "unresolved").replace("_", " ")
+        )
+        lines.append("")
+    return {"summary_text": "\n".join(lines).rstrip(), "entries": entries}
 
 
 class AuditPromptDialog(QDialog):
@@ -597,6 +675,7 @@ class MainWindow(QMainWindow):
         self._discussion_transcript_parts: list[str] = []
         self._review_family_ids: list[str] = []
         self._counterexample_recheck_inventory_signature: Optional[tuple[Any, ...]] = None
+        self._verification_replacement_inventory_signature: Optional[tuple[Any, ...]] = None
 
         self.setWindowTitle("Math Audit Control Panel (V1)")
         self.resize(980, 820)
@@ -989,6 +1068,40 @@ class MainWindow(QMainWindow):
         self.recheck_counterexample_button = QPushButton("Recheck Counterexample Findings")
         self.recheck_counterexample_button.clicked.connect(self._recheck_counterexample_findings)
         counterexample_recheck_layout.addWidget(self.recheck_counterexample_button, 0, Qt.AlignmentFlag.AlignLeft)
+        replacement_heading = QLabel("Replacement verification scripts")
+        replacement_heading.setStyleSheet("font-weight: 600; margin-top: 6px;")
+        counterexample_recheck_layout.addWidget(replacement_heading)
+        self.verification_replacement_summary_value = QPlainTextEdit()
+        self.verification_replacement_summary_value.setReadOnly(True)
+        self.verification_replacement_summary_value.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.verification_replacement_summary_value.setMinimumHeight(78)
+        self.verification_replacement_summary_value.setMaximumHeight(190)
+        self.verification_replacement_summary_value.setPlainText(
+            "No replacement verification scripts have been proposed."
+        )
+        counterexample_recheck_layout.addWidget(self.verification_replacement_summary_value)
+        self.verification_replacement_combo = QComboBox()
+        self.verification_replacement_combo.currentIndexChanged.connect(self._apply_button_states)
+        counterexample_recheck_layout.addWidget(self.verification_replacement_combo)
+        replacement_actions = QHBoxLayout()
+        self.review_verification_replacement_button = QPushButton("Review Script")
+        self.review_verification_replacement_button.clicked.connect(self._review_verification_replacement_script)
+        self.run_verification_replacement_button = QPushButton("Run Safe Replacement Checks")
+        self.run_verification_replacement_button.clicked.connect(self._run_verification_replacement_checks)
+        replacement_actions.addWidget(self.review_verification_replacement_button)
+        replacement_actions.addWidget(self.run_verification_replacement_button)
+        replacement_actions.addStretch(1)
+        counterexample_recheck_layout.addLayout(replacement_actions)
+        replacement_hint = QLabel(
+            "Review generated code before running it. Execution is local, uses safe-mode validation, and makes no API call."
+        )
+        replacement_hint.setWordWrap(True)
+        replacement_hint.setStyleSheet("color: #555;")
+        counterexample_recheck_layout.addWidget(replacement_hint)
+        self.verification_replacement_status_value = QLabel("No runnable replacement checks.")
+        self.verification_replacement_status_value.setWordWrap(True)
+        self.verification_replacement_status_value.setStyleSheet("color: #8a4b00; font-weight: 600;")
+        counterexample_recheck_layout.addWidget(self.verification_replacement_status_value)
 
         quick_buttons = QHBoxLayout()
         quick_buttons.addWidget(self.build_concise_button)
@@ -1522,6 +1635,110 @@ class MainWindow(QMainWindow):
         self.counterexample_recheck_combo.setEnabled(bool(entries))
         self._counterexample_recheck_inventory_signature = signature
 
+    def _update_verification_replacement_inventory(self, inventory: dict[str, Any]) -> None:
+        view = _verification_replacement_view(inventory)
+        entries = view.get("entries") or []
+        signature = (
+            str(view.get("summary_text") or ""),
+            tuple(
+                (
+                    str(item.get("label") or ""),
+                    json.dumps(item.get("data") or {}, sort_keys=True),
+                    bool(item.get("ready")),
+                )
+                for item in entries
+                if isinstance(item, dict)
+            ),
+        )
+        if signature == self._verification_replacement_inventory_signature:
+            return
+        previous = self.verification_replacement_combo.currentData()
+        previous_key = json.dumps(previous or {}, sort_keys=True)
+        _set_plain_text_preserving_scroll(
+            self.verification_replacement_summary_value,
+            str(view.get("summary_text") or ""),
+        )
+        self.verification_replacement_combo.blockSignals(True)
+        try:
+            self.verification_replacement_combo.clear()
+            selected_index = 0
+            for index, entry in enumerate(entries):
+                data = dict(entry.get("data") or {})
+                data["ready"] = bool(entry.get("ready"))
+                self.verification_replacement_combo.addItem(str(entry.get("label") or ""), data)
+                if json.dumps(entry.get("data") or {}, sort_keys=True) == previous_key:
+                    selected_index = index
+            if entries:
+                self.verification_replacement_combo.setCurrentIndex(selected_index)
+        finally:
+            self.verification_replacement_combo.blockSignals(False)
+        self.verification_replacement_combo.setEnabled(bool(entries))
+        self._verification_replacement_inventory_signature = signature
+
+    def _selected_verification_replacement(self) -> dict[str, Any]:
+        data = self.verification_replacement_combo.currentData()
+        return dict(data) if isinstance(data, dict) else {}
+
+    def _review_verification_replacement_script(self) -> None:
+        selected = self._selected_verification_replacement()
+        script_paths = [str(item) for item in selected.get("script_paths") or [] if str(item).strip()]
+        session = (self._last_status_payload or {}).get("session") or {}
+        workdir_value = str(session.get("workdir") or "").strip()
+        if not script_paths or not workdir_value:
+            QMessageBox.information(self, "Replacement Script", "No replacement script is selected.")
+            return
+        workdir = Path(workdir_value).resolve()
+        blocks = []
+        for relative in script_paths:
+            path = (workdir / relative).resolve()
+            try:
+                path.relative_to(workdir)
+            except ValueError:
+                continue
+            if path.is_file():
+                blocks.append(f"# {path.name}\n\n{path.read_text(encoding='utf-8')}")
+        if not blocks:
+            QMessageBox.warning(self, "Replacement Script", "The selected replacement script is unavailable.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Review Replacement Verification Script")
+        dialog.resize(820, 620)
+        layout = QVBoxLayout(dialog)
+        editor = QPlainTextEdit()
+        editor.setReadOnly(True)
+        editor.setPlainText("\n\n".join(blocks))
+        layout.addWidget(editor, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def _run_verification_replacement_checks(self) -> None:
+        self._apply_pdf_path()
+        selected = self._selected_verification_replacement()
+        recheck_id = str(selected.get("recheck_id") or "")
+        check_ids = [str(item) for item in selected.get("check_ids") or [] if str(item).strip()]
+        if not recheck_id or not check_ids or not selected.get("ready"):
+            QMessageBox.information(self, "Replacement Checks", "Select a safe, ready replacement check first.")
+            return
+        check_text = ", ".join(check_ids)
+        choice = QMessageBox.question(
+            self,
+            "Run Safe Replacement Checks",
+            (
+                f"Run the following locally in safe mode?\n\n{check_text}\n\n"
+                "The original scripts and results will remain unchanged. This uses local computation and makes no API "
+                "call. Results remain provisional and require human review."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            self.controller.log_message.emit("Replacement verification execution cancelled.")
+            return
+        self.controller.run_verification_replacement_checks(recheck_id, check_ids)
+
     def _recheck_counterexample_findings(self) -> None:
         self._apply_api_key()
         self._apply_pdf_path()
@@ -1643,6 +1860,9 @@ class MainWindow(QMainWindow):
         self._update_counterexample_recheck_inventory(
             verification_finding_rechecks,
             recheck_history_summary,
+        )
+        self._update_verification_replacement_inventory(
+            verification_suite.get("verification_replacement_checks") or {}
         )
         inventory_warning = verification_suite.get("inventory_warning") or {}
         if inventory_warning.get("has_invalidated_obligations"):
@@ -2100,6 +2320,38 @@ class MainWindow(QMainWindow):
             self.counterexample_recheck_status_value,
             "color: #2f6b3a; font-weight: 600;"
             if recheck_action["enabled"]
+            else "color: #8a4b00; font-weight: 600;",
+        )
+        replacement_selection = self._selected_verification_replacement()
+        replacement_available = bool(replacement_selection.get("recheck_id"))
+        replacement_ready = bool(replacement_selection.get("ready"))
+        self.review_verification_replacement_button.setEnabled(
+            replacement_available and not self._task_running
+        )
+        can_run_replacement = (
+            replacement_available
+            and replacement_ready
+            and session_available
+            and not self._task_running
+            and status_name in {"completed", "paused"}
+            and not pending_response
+        )
+        self.run_verification_replacement_button.setEnabled(can_run_replacement)
+        if not replacement_available:
+            replacement_reason = "No runnable replacement checks."
+        elif self._task_running:
+            replacement_reason = "Another audit action is currently running."
+        elif not replacement_ready:
+            replacement_reason = "Selected replacement failed validation and cannot be executed."
+        elif status_name not in {"completed", "paused"} or pending_response:
+            replacement_reason = "Replacement checks require a completed or paused audit with no pending response."
+        else:
+            replacement_reason = "Ready for confirmed local safe-mode execution; no API call is made."
+        _set_text_if_changed(self.verification_replacement_status_value, replacement_reason)
+        _set_stylesheet_if_changed(
+            self.verification_replacement_status_value,
+            "color: #2f6b3a; font-weight: 600;"
+            if can_run_replacement
             else "color: #8a4b00; font-weight: 600;",
         )
         self.ask_button.setEnabled(session_ready)

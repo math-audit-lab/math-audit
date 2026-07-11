@@ -69,7 +69,9 @@ from audit_verification import (
     append_verification_finding_recheck_event,
     build_verification_finding_recheck_evidence,
     build_verification_finding_recheck_prompt,
+    persist_verification_replacement_proposals,
     load_verification_state,
+    run_verification_replacement_checks as _run_verification_replacement_checks,
     run_verification_suite,
     save_verification_state,
     supersede_verification_findings_for_chunks,
@@ -79,6 +81,7 @@ from audit_verification import (
     verification_finding_recheck_summary,
     verification_finding_rechecks_for_session,
     verification_findings_for_session,
+    verification_replacement_check_inventory,
     verification_result_needs_technical_retry,
 )
 
@@ -1124,6 +1127,17 @@ def _jsonl_event_timestamp(path: Path) -> Optional[datetime]:
     return _file_mtime_datetime(path)
 
 
+def _verification_replacement_timestamp(session: dict[str, Any]) -> Optional[datetime]:
+    root = Path(session["workdir"]) / "verification_finding_rechecks"
+    timestamps = [
+        _jsonl_event_timestamp(path)
+        for path in root.glob("*/replacement_execution_events.jsonl")
+        if path.is_file()
+    ]
+    available = [item for item in timestamps if item is not None]
+    return max(available) if available else None
+
+
 def _read_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -1186,6 +1200,11 @@ def _report_freshness_sources(session: dict[str, Any], kind: str) -> list[dict[s
                     paths["verification_finding_rechecks"],
                 ),
                 (
+                    "verification replacement executions",
+                    _verification_replacement_timestamp(session),
+                    root / "verification_finding_rechecks",
+                ),
+                (
                     "selected chunk rerun log",
                     _jsonl_event_timestamp(root / "logs" / "selected_chunk_reruns.jsonl"),
                     root / "logs" / "selected_chunk_reruns.jsonl",
@@ -1219,6 +1238,11 @@ def _report_freshness_sources(session: dict[str, Any], kind: str) -> list[dict[s
                     "verification-finding recheck state",
                     _jsonl_event_timestamp(paths["verification_finding_rechecks"]),
                     paths["verification_finding_rechecks"],
+                ),
+                (
+                    "verification replacement executions",
+                    _verification_replacement_timestamp(session),
+                    root / "verification_finding_rechecks",
                 ),
                 (
                     "selected chunk rerun log",
@@ -3088,6 +3112,15 @@ def run_verification_finding_rechecks(
             if str(structured_result.get("chunk_id") or "") != chunk_id:
                 raise ValueError("Recheck response chunk_id does not match the requested evidence package.")
             save_json(result_path, structured_result)
+            replacement_info = persist_verification_replacement_proposals(
+                session,
+                recheck_id=recheck_id,
+                artifact_root=artifact_root,
+                structured_result=structured_result,
+                evidence=evidence,
+                model=selected_model,
+                reasoning_effort=selected_effort,
+            )
             completed_event = append_verification_finding_recheck_event(
                 session,
                 {
@@ -3105,6 +3138,9 @@ def run_verification_finding_rechecks(
                     "artifact_root": str(artifact_root.relative_to(root)),
                     "input_evidence_hashes": evidence.get("input_evidence_hashes") or {},
                     "structured_result": structured_result,
+                    "replacement_manifest_path": replacement_info.get("manifest_path"),
+                    "replacement_check_count": int(replacement_info.get("proposed_count", 0) or 0),
+                    "replacement_ready_count": int(replacement_info.get("ready_count", 0) or 0),
                     "usage": usage_info.get("usage") or {},
                     "cost": usage_info.get("cost") or {},
                     "runtime_seconds": elapsed_seconds,
@@ -3181,6 +3217,58 @@ def run_verification_finding_rechecks(
         "recheck_state_path": str(session_paths(session["workdir"])["verification_finding_rechecks"]),
         "log_path": str(log_path),
     }
+
+
+def run_verification_replacement_checks(
+    session_or_pdf: dict[str, Any] | str | Path,
+    recheck_id: str,
+    check_ids: Optional[list[str]] = None,
+    timeout: int = 120,
+    rebuild_reports: bool = True,
+    progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> dict[str, Any]:
+    session = _resolve_session(session_or_pdf)
+    status = load_status(session)
+    if session.get("pending"):
+        raise RuntimeError("Cannot run replacement checks while the audit has a pending response.")
+    if str(status.get("status") or "").strip().lower() not in {"completed", "paused"}:
+        raise RuntimeError("Replacement checks are available only for completed or paused audits.")
+    result = _run_verification_replacement_checks(
+        session,
+        recheck_id=str(recheck_id),
+        check_ids=check_ids,
+        timeout=int(timeout),
+        progress_callback=progress_callback,
+    )
+    report_paths: dict[str, Any] = {}
+    report_warnings = []
+    if rebuild_reports:
+        try:
+            report_paths["verification"] = build_verification_report(session)
+        except Exception as exc:
+            report_warnings.append(f"Verification report rebuild failed: {type(exc).__name__}: {exc}")
+        if _FINAL_REPORT_BUILDER_HOOK is not None:
+            try:
+                report_paths["full"] = build_final_report(
+                    session,
+                    write_separate_verification_report=False,
+                )
+            except Exception as exc:
+                report_warnings.append(f"Full report rebuild failed: {type(exc).__name__}: {exc}")
+        try:
+            report_paths["concise"] = build_concise_report(session)
+        except Exception as exc:
+            report_warnings.append(f"Concise report rebuild failed: {type(exc).__name__}: {exc}")
+    result.update(
+        {
+            "session": load_session_from_pdf(session["pdf_path"]) or session,
+            "status": load_status(session),
+            "usage": load_usage(session),
+            "report_paths": report_paths,
+            "report_generation_warnings": report_warnings,
+        }
+    )
+    return result
 
 
 def build_final_report(
@@ -3338,6 +3426,42 @@ def _verification_finding_recheck_markdown_lines(finding: dict[str, Any]) -> lis
     lines.append(
         "- Human review required: " + ("yes" if result.get("needs_human_review", True) else "recommended")
     )
+    replacement = finding.get("replacement_check_state") if isinstance(finding.get("replacement_check_state"), dict) else {}
+    if replacement:
+        reconciliation = replacement.get("reconciliation") or {}
+        lines.extend(
+            [
+                "- Original script error: "
+                + normalize_math_delimiters(str(replacement.get("script_error_explanation") or "not specified")),
+                "- Replacement-check status: "
+                + str(reconciliation.get("status") or "unresolved").replace("_", " "),
+                "- Replacement interpretation: "
+                + normalize_math_delimiters(str(reconciliation.get("explanation") or "Human review required.")),
+            ]
+        )
+        for check in replacement.get("checks") or []:
+            if not isinstance(check, dict):
+                continue
+            validation = check.get("validation") or {}
+            latest_execution = check.get("latest_execution") if isinstance(check.get("latest_execution"), dict) else {}
+            executed_result = latest_execution.get("result") if isinstance(latest_execution.get("result"), dict) else {}
+            detail = (
+                f"{check.get('check_id')} ({check.get('relationship_to_original')}): "
+                f"validation {validation.get('status', 'unknown')}"
+            )
+            if latest_execution:
+                detail += (
+                    f", execution {latest_execution.get('execution_status', 'unknown')}, "
+                    f"outcome {latest_execution.get('mathematical_outcome') or 'not reported'}, "
+                    f"scope {json.dumps(check.get('tested_scope') or {}, ensure_ascii=False, sort_keys=True)}"
+                )
+            lines.append("- Replacement check: " + normalize_math_delimiters(detail))
+            cases = list(executed_result.get("counterexamples") or []) + list(executed_result.get("failed_cases") or [])
+            if cases:
+                lines.append(
+                    "- Replacement counterexamples: "
+                    + normalize_math_delimiters(json.dumps(cases, ensure_ascii=False, sort_keys=True))
+                )
     return lines
 
 
@@ -3429,6 +3553,38 @@ def _verification_findings_tex(findings: list[dict[str, Any]]) -> str:
             if result.get("downstream_dependencies"):
                 recheck_items.append(("Downstream dependencies", "; ".join(str(item) for item in result.get("downstream_dependencies") or [])))
             recheck_items.append(("Human review required", "yes" if result.get("needs_human_review", True) else "recommended"))
+            replacement = finding.get("replacement_check_state") if isinstance(finding.get("replacement_check_state"), dict) else {}
+            if replacement:
+                reconciliation = replacement.get("reconciliation") or {}
+                recheck_items.extend(
+                    [
+                        ("Original script error", replacement.get("script_error_explanation") or "not specified"),
+                        (
+                            "Replacement-check status",
+                            str(reconciliation.get("status") or "unresolved").replace("_", " "),
+                        ),
+                        (
+                            "Replacement interpretation",
+                            reconciliation.get("explanation") or "Human review required.",
+                        ),
+                    ]
+                )
+                for check in replacement.get("checks") or []:
+                    if not isinstance(check, dict):
+                        continue
+                    validation = check.get("validation") or {}
+                    latest_execution = check.get("latest_execution") if isinstance(check.get("latest_execution"), dict) else {}
+                    detail = (
+                        f"{check.get('check_id')} ({check.get('relationship_to_original')}): "
+                        f"validation {validation.get('status', 'unknown')}"
+                    )
+                    if latest_execution:
+                        detail += (
+                            f", execution {latest_execution.get('execution_status', 'unknown')}, "
+                            f"outcome {latest_execution.get('mathematical_outcome') or 'not reported'}, "
+                            f"scope {json.dumps(check.get('tested_scope') or {}, ensure_ascii=False, sort_keys=True)}"
+                        )
+                    recheck_items.append(("Replacement check", detail))
             for label, value in recheck_items:
                 parts.append(r"\item " + report_latex_paragraph(f"{label}: {value}") + "\n")
         parts.append(r"\end{itemize}" + "\n")
@@ -3646,6 +3802,7 @@ def build_verification_report(session_or_pdf: dict[str, Any] | str | Path) -> di
             },
             "verification_finding_recheck_summary": verification_finding_recheck_summary(session, findings=findings),
             "verification_finding_rechecks": verification_finding_rechecks_for_session(session),
+            "verification_replacement_checks": verification_replacement_check_inventory(session),
             "inventory_warning": inventory_warning,
             "generated_at": utc_now(),
         },
@@ -3768,6 +3925,7 @@ def get_verification_suite_status(session_or_pdf: dict[str, Any] | str | Path) -
             session,
             findings=findings,
         ),
+        "verification_replacement_checks": verification_replacement_check_inventory(session),
         "inventory_warning": inventory_warning,
     }
 
@@ -9153,6 +9311,7 @@ __all__ = [
     "resume_audit",
     "run_verification_suite_and_build_report",
     "run_verification_finding_rechecks",
+    "run_verification_replacement_checks",
     "verification_finding_recheck_candidates",
     "set_display_audit_hook",
     "set_final_report_builder",

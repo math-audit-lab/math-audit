@@ -251,6 +251,10 @@ For an active `counterexample_found` or `claim_failed` finding, use **Recheck Co
 
 The recheck can classify the result as a confirmed counterexample/claim failure, script error, scope or hypothesis mismatch, notation or interpretation mismatch, or inconclusive. It does not replace the original chunk audit, verification script, result, or deterministic finding. Challenged and inconclusive findings remain visible for human review, and every recheck conclusion is provisional.
 
+For a `script_error` conclusion, the recheck may propose a corrected primary script and a materially independent secondary check. The **Replacement verification scripts** panel shows the defect explanation, purpose, validation status, and latest local outcome. Use **Review Script** to inspect the complete source, then explicitly confirm **Run Safe Replacement Checks**. Proposed scripts are retained even when parsing, safe-mode, or structured-result validation fails, but invalid scripts are not executed. Original scripts and results are never overwritten.
+
+Replacement execution is local and does not incur API cost. Its result remains provisional: “no counterexample found” applies only to the stated tested scope and is not a proof of an unrestricted claim. Timeouts, malformed output, unsafe code, or disagreement between replacement checks leave the finding unresolved and require human mathematical review.
+
 Use either workflow selectively. A technical failure or negative result may indicate:
 
 - The script is wrong.

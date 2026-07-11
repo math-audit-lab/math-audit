@@ -135,6 +135,8 @@ Successful Python execution does not mean the paper's claim succeeded: a complet
 
 Technical failed-verification reruns are for timeouts, runtime/parse errors, and similar execution problems. **Recheck Counterexample Chunks** is a separate API-backed review for scripts that completed and reported `counterexample_found` or `claim_failed`. It sends the full affected chunk, complete script, exact output, structured counterexample data, linked issues, labels, and compact surrounding context to the audit session's saved model/effort by default. The original script, result, and finding remain preserved. Possible advisory outcomes include confirmed counterexample/claim failure, script error, scope/hypothesis mismatch, notation/interpretation mismatch, or inconclusive. Rechecks incur API cost and still require human mathematical review.
 
+If the recheck identifies a script error, it may propose corrected and independent replacement checks. Review the complete code first, then explicitly confirm **Run Safe Replacement Checks**. Replacement execution is local, uses the existing safe-mode checks, and does not make an API call. The original script/result and all replacement attempts remain preserved. A finite replacement search reporting no counterexample does not prove an unrestricted theorem, and conflicting replacement outcomes require human review.
+
 ## Experimental Context Modes
 
 The default context mode is the stable continuous-conversation audit flow. The `fresh_context_experimental` mode is still experimental: it can be useful for long audits or for reducing dependence on a single long conversation/file-service state, but continuous mode may be cheaper for short PDF-only audits when context-cache reuse is good.

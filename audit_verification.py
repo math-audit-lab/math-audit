@@ -26,6 +26,7 @@ from audit_state import (
 _VERIFICATION_SCRIPT_RE = re.compile(r"^(chunk_\d+)_check_\d+\.py$")
 VERIFICATION_RESULT_SENTINEL = "MATH_AUDIT_VERIFICATION_RESULT_JSON="
 VERIFICATION_RESULT_SCHEMA_VERSION = 1
+MAX_VERIFICATION_REPLACEMENT_CODE_CHARS = 200000
 VERIFICATION_EXECUTION_STATUSES = {
     "completed",
     "runtime_error",
@@ -78,9 +79,19 @@ VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA = {
             "properties": {
                 "implements_intended_quantity": {"type": ["boolean", "null"]},
                 "script_correct": {"type": ["boolean", "null"]},
+                "error_type": {"type": "string"},
+                "error_explanation": {"type": "string"},
+                "affected_lines": {"type": "array", "items": {"type": "string"}},
                 "limitations": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["implements_intended_quantity", "script_correct", "limitations"],
+            "required": [
+                "implements_intended_quantity",
+                "script_correct",
+                "error_type",
+                "error_explanation",
+                "affected_lines",
+                "limitations",
+            ],
         },
         "mathematical_assessment": {
             "type": "object",
@@ -130,6 +141,57 @@ VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA = {
             "required": ["title", "location", "description", "evidence", "proposed_fix"],
         },
         "downstream_dependencies": {"type": "array", "items": {"type": "string"}},
+        "replacement_recommended": {"type": "boolean"},
+        "replacement_unavailable_explanation": {"type": "string"},
+        "replacement_checks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "check_id": {"type": "string"},
+                    "relationship_to_original": {
+                        "type": "string",
+                        "enum": ["corrected_implementation", "independent_implementation"],
+                    },
+                    "purpose": {"type": "string"},
+                    "correction_explanation": {"type": "string"},
+                    "independence_note": {"type": "string"},
+                    "python_code": {"type": "string"},
+                    "expected_check_kind": {"type": "string"},
+                    "tested_scope": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "description": {"type": "string"},
+                            "parameters": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "value": {"type": "string"},
+                                    },
+                                    "required": ["name", "value"],
+                                },
+                            },
+                        },
+                        "required": ["description", "parameters"],
+                    },
+                },
+                "required": [
+                    "check_id",
+                    "relationship_to_original",
+                    "purpose",
+                    "correction_explanation",
+                    "independence_note",
+                    "python_code",
+                    "expected_check_kind",
+                    "tested_scope",
+                ],
+            },
+        },
         "independent_check_recommended": {"type": "boolean"},
         "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
         "needs_human_review": {"type": "boolean"},
@@ -147,6 +209,9 @@ VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA = {
         "recommended_severity",
         "proposed_issue",
         "downstream_dependencies",
+        "replacement_recommended",
+        "replacement_unavailable_explanation",
+        "replacement_checks",
         "independent_check_recommended",
         "confidence",
         "needs_human_review",
@@ -1095,9 +1160,13 @@ def verification_finding_rechecks_for_session(
         if not isinstance(result, dict):
             continue
         try:
-            result = validate_verification_finding_recheck_response(result)
+            result = validate_verification_finding_recheck_response(
+                _backfill_verification_finding_recheck_result(result)
+            )
         except (TypeError, ValueError):
             continue
+        record = dict(record)
+        record["structured_result"] = result
         for finding_id in record.get("finding_ids") or result.get("finding_ids") or []:
             clean = str(finding_id or "").strip()
             if clean:
@@ -1106,6 +1175,32 @@ def verification_finding_rechecks_for_session(
     for record in latest_by_finding.values():
         unique[str(record.get("recheck_id") or "")] = record
     return sorted(unique.values(), key=lambda item: str(item.get("time") or ""))
+
+
+def _backfill_verification_finding_recheck_result(payload: dict[str, Any]) -> dict[str, Any]:
+    result = dict(payload)
+    script_assessment = result.get("script_assessment")
+    if isinstance(script_assessment, dict):
+        script_assessment = dict(script_assessment)
+        script_assessment.setdefault("error_type", "")
+        script_assessment.setdefault("error_explanation", "")
+        script_assessment.setdefault("affected_lines", [])
+        if str(result.get("recheck_outcome") or "") == "script_error":
+            script_assessment["error_explanation"] = str(
+                script_assessment.get("error_explanation")
+                or result.get("summary")
+                or "Legacy script-error recheck explanation unavailable."
+            )
+        result["script_assessment"] = script_assessment
+    result.setdefault("replacement_recommended", False)
+    result.setdefault("replacement_checks", [])
+    result.setdefault("replacement_unavailable_explanation", "")
+    if str(result.get("recheck_outcome") or "") == "script_error" and not result.get("replacement_recommended"):
+        result["replacement_unavailable_explanation"] = str(
+            result.get("replacement_unavailable_explanation")
+            or "Legacy recheck predates replacement-script support."
+        )
+    return result
 
 
 def verification_finding_recheck_map(session: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1138,6 +1233,11 @@ def apply_verification_finding_rechecks(
     findings: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     recheck_map = verification_finding_recheck_map(session)
+    replacement_groups = {
+        str(item.get("recheck_id") or ""): item
+        for item in verification_replacement_check_inventory(session).get("groups") or []
+        if isinstance(item, dict)
+    }
     applied = []
     for finding in findings:
         item = dict(finding)
@@ -1150,6 +1250,9 @@ def apply_verification_finding_rechecks(
         item["recheck_inconclusive"] = state == "inconclusive"
         if latest is not None:
             item["latest_recheck"] = latest
+            replacement_state = replacement_groups.get(str(latest.get("recheck_id") or ""))
+            if replacement_state is not None:
+                item["replacement_check_state"] = replacement_state
         applied.append(item)
     return applied
 
@@ -1237,9 +1340,86 @@ def validate_verification_finding_recheck_response(payload: Any) -> dict[str, An
     for key in ("finding_ids", "linked_issue_ids", "downstream_dependencies"):
         if not isinstance(payload.get(key), list) or any(not isinstance(item, str) for item in payload[key]):
             raise ValueError(f"Verification-finding recheck field {key!r} must be an array of strings.")
-    for key in ("independent_check_recommended", "needs_human_review"):
+    script_assessment = payload["script_assessment"]
+    if not isinstance(script_assessment.get("affected_lines"), list) or any(
+        not isinstance(item, str) for item in script_assessment["affected_lines"]
+    ):
+        raise ValueError("Verification-finding recheck script_assessment.affected_lines must be an array of strings.")
+    if not isinstance(script_assessment.get("limitations"), list) or any(
+        not isinstance(item, str) for item in script_assessment["limitations"]
+    ):
+        raise ValueError("Verification-finding recheck script_assessment.limitations must be an array of strings.")
+    for key in ("independent_check_recommended", "needs_human_review", "replacement_recommended"):
         if not isinstance(payload.get(key), bool):
             raise ValueError(f"Verification-finding recheck field {key!r} must be boolean.")
+    replacement_checks = payload.get("replacement_checks")
+    if not isinstance(replacement_checks, list):
+        raise ValueError("Verification-finding recheck replacement_checks must be an array.")
+    replacement_schema = VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA["properties"]["replacement_checks"]["items"]
+    replacement_required = set(replacement_schema["required"])
+    replacement_properties = set(replacement_schema["properties"])
+    seen_check_ids: set[str] = set()
+    for index, replacement in enumerate(replacement_checks):
+        if not isinstance(replacement, dict):
+            raise ValueError(f"Verification-finding replacement check {index} must be an object.")
+        missing_replacement = sorted(replacement_required - set(replacement))
+        extra_replacement = sorted(set(replacement) - replacement_properties)
+        if missing_replacement or extra_replacement:
+            raise ValueError(
+                f"Verification-finding replacement check {index} has invalid keys; "
+                f"missing={missing_replacement}, extra={extra_replacement}."
+            )
+        check_id = str(replacement.get("check_id") or "").strip()
+        if not check_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", check_id):
+            raise ValueError(f"Verification-finding replacement check {index} has an invalid check_id.")
+        if check_id in seen_check_ids:
+            raise ValueError(f"Verification-finding replacement check_id is duplicated: {check_id}")
+        seen_check_ids.add(check_id)
+        if replacement.get("relationship_to_original") not in {
+            "corrected_implementation",
+            "independent_implementation",
+        }:
+            raise ValueError(f"Verification-finding replacement check {check_id} has an invalid relationship.")
+        for text_key in (
+            "purpose",
+            "correction_explanation",
+            "independence_note",
+            "python_code",
+            "expected_check_kind",
+        ):
+            if not isinstance(replacement.get(text_key), str):
+                raise ValueError(f"Verification-finding replacement check {check_id} field {text_key} must be a string.")
+            if not str(replacement.get(text_key) or "").strip():
+                raise ValueError(f"Verification-finding replacement check {check_id} field {text_key} must be nonempty.")
+        tested_scope = replacement.get("tested_scope")
+        if not isinstance(tested_scope, dict) or set(tested_scope) != {"description", "parameters"}:
+            raise ValueError(f"Verification-finding replacement check {check_id} has invalid tested_scope.")
+        if not isinstance(tested_scope.get("description"), str) or not isinstance(tested_scope.get("parameters"), list):
+            raise ValueError(f"Verification-finding replacement check {check_id} has invalid tested_scope values.")
+        for parameter in tested_scope["parameters"]:
+            if (
+                not isinstance(parameter, dict)
+                or set(parameter) != {"name", "value"}
+                or not all(isinstance(parameter.get(field), str) for field in ("name", "value"))
+            ):
+                raise ValueError(f"Verification-finding replacement check {check_id} has invalid scope parameters.")
+    if outcome == "script_error":
+        if script_assessment.get("script_correct") is not False:
+            raise ValueError("script_error requires script_assessment.script_correct=false.")
+        if not str(script_assessment.get("error_explanation") or "").strip():
+            raise ValueError("script_error requires a precise script error explanation.")
+        if payload.get("replacement_recommended") and not replacement_checks:
+            raise ValueError("script_error with replacement_recommended=true requires replacement_checks.")
+        if not payload.get("replacement_recommended") and replacement_checks:
+            raise ValueError("script_error with replacement_recommended=false cannot include replacement_checks.")
+        if not payload.get("replacement_recommended") and not str(
+            payload.get("replacement_unavailable_explanation") or ""
+        ).strip():
+            raise ValueError(
+                "script_error without a replacement requires replacement_unavailable_explanation."
+            )
+    elif replacement_checks or payload.get("replacement_recommended"):
+        raise ValueError("Replacement checks are only supported when recheck_outcome=script_error.")
     for key, allowed in (
         ("recommended_issue_action", {"strengthen_existing", "link_existing", "create_new", "no_issue_change", "human_review"}),
         ("recommended_severity", {"none", "low", "medium", "high", "critical"}),
@@ -1248,6 +1428,135 @@ def validate_verification_finding_recheck_response(payload: Any) -> dict[str, An
         if payload.get(key) not in allowed:
             raise ValueError(f"Verification-finding recheck field {key!r} has unsupported value {payload.get(key)!r}.")
     return dict(payload)
+
+
+def validate_verification_replacement_code(code: Any) -> dict[str, Any]:
+    source = str(code or "")
+    code_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    if not source.strip():
+        return {"status": "parse_error", "reason": "replacement script is empty", "code_sha256": code_hash}
+    if len(source) > MAX_VERIFICATION_REPLACEMENT_CODE_CHARS:
+        return {
+            "status": "invalid_contract",
+            "reason": (
+                f"replacement script exceeds {MAX_VERIFICATION_REPLACEMENT_CODE_CHARS} characters"
+            ),
+            "code_sha256": code_hash,
+        }
+    try:
+        tree = ast.parse(source, filename="<verification replacement>")
+    except Exception as exc:
+        return {
+            "status": "parse_error",
+            "reason": f"could not parse replacement script: {type(exc).__name__}: {exc}",
+            "code_sha256": code_hash,
+        }
+    visitor = _VerificationSafetyVisitor()
+    visitor.visit(tree)
+    if visitor.reason:
+        return {"status": "unsafe", "reason": visitor.reason, "code_sha256": code_hash}
+    sentinel_mentions = source.count(VERIFICATION_RESULT_SENTINEL)
+    if sentinel_mentions != 1:
+        return {
+            "status": "invalid_contract",
+            "reason": (
+                "replacement script must contain exactly one structured-result sentinel marker; "
+                f"found {sentinel_mentions}"
+            ),
+            "code_sha256": code_hash,
+        }
+    return {"status": "ready", "reason": "", "code_sha256": code_hash}
+
+
+def _safe_replacement_check_id(value: Any) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value or "").strip()).strip("_")
+    return clean[:80] or "replacement"
+
+
+def persist_verification_replacement_proposals(
+    session: dict[str, Any],
+    *,
+    recheck_id: str,
+    artifact_root: str | Path,
+    structured_result: dict[str, Any],
+    evidence: dict[str, Any],
+    model: str,
+    reasoning_effort: str,
+) -> dict[str, Any]:
+    if str(structured_result.get("recheck_outcome") or "") != "script_error":
+        return {}
+    root = Path(artifact_root)
+    root.mkdir(parents=True, exist_ok=True)
+    workdir = Path(session["workdir"]).resolve()
+    originating_scripts = []
+    for index, item in enumerate(evidence.get("verification_evidence") or []):
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("complete_python_script") or "")
+        original_name = "original_script.py" if index == 0 else f"original_script_{index + 1:02d}.py"
+        original_path = root / original_name
+        original_path.write_text(source, encoding="utf-8")
+        originating_scripts.append(
+            {
+                "script_name": str(item.get("script_name") or ""),
+                "source_script_path": str(item.get("script_path") or ""),
+                "preserved_copy_path": str(original_path.resolve().relative_to(workdir)),
+                "code_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            }
+        )
+
+    replacement_entries = []
+    for proposal in structured_result.get("replacement_checks") or []:
+        check_id = _safe_replacement_check_id(proposal.get("check_id"))
+        code = str(proposal.get("python_code") or "")
+        script_path = root / f"replacement_{check_id}.py"
+        script_path.write_text(code, encoding="utf-8")
+        validation = validate_verification_replacement_code(code)
+        replacement_entries.append(
+            {
+                "check_id": check_id,
+                "relationship_to_original": proposal.get("relationship_to_original"),
+                "purpose": proposal.get("purpose"),
+                "correction_explanation": proposal.get("correction_explanation"),
+                "independence_note": proposal.get("independence_note"),
+                "expected_check_kind": proposal.get("expected_check_kind"),
+                "tested_scope": proposal.get("tested_scope") or {},
+                "script_path": str(script_path.resolve().relative_to(workdir)),
+                "code_sha256": validation["code_sha256"],
+                "validation": validation,
+            }
+        )
+
+    manifest_path = root / "replacement_manifest.json"
+    event_path = root / "replacement_execution_events.jsonl"
+    manifest = {
+        "schema_version": 1,
+        "created_at": utc_now(),
+        "recheck_id": str(recheck_id),
+        "finding_ids": list(structured_result.get("finding_ids") or []),
+        "chunk_id": str(structured_result.get("chunk_id") or ""),
+        "model": str(model or ""),
+        "reasoning_effort": str(reasoning_effort or ""),
+        "script_error_explanation": str(
+            (structured_result.get("script_assessment") or {}).get("error_explanation") or ""
+        ),
+        "replacement_recommended": bool(structured_result.get("replacement_recommended")),
+        "replacement_unavailable_explanation": str(
+            structured_result.get("replacement_unavailable_explanation") or ""
+        ),
+        "originating_scripts": originating_scripts,
+        "replacement_checks": replacement_entries,
+        "execution_events_path": str(event_path.resolve().relative_to(workdir)),
+    }
+    save_json(manifest_path, manifest)
+    return {
+        "manifest": manifest,
+        "manifest_path": str(manifest_path.resolve().relative_to(workdir)),
+        "ready_count": sum(
+            1 for item in replacement_entries if (item.get("validation") or {}).get("status") == "ready"
+        ),
+        "proposed_count": len(replacement_entries),
+    }
 
 
 def _relative_audit_path(session: dict[str, Any], path_value: Any) -> str:
@@ -1638,6 +1947,23 @@ def build_verification_finding_recheck_prompt(evidence: dict[str, Any]) -> str:
         "9. Is a new verification-derived issue needed?",
         "10. Which downstream results depend on the contradicted claim?",
         "11. Would an independently implemented second check be useful?",
+        (
+            "If and only if recheck_outcome is script_error, identify the exact defect and affected lines. "
+            "Normally provide a complete corrected standalone Python script in replacement_checks. If practical, "
+            "also provide a materially independent second implementation. If no safe or meaningful replacement can "
+            "be produced, set replacement_recommended=false and explain why in replacement_unavailable_explanation."
+        ),
+        (
+            "Each replacement must test the original claim as stated without weakening its hypotheses, range, "
+            "normalization, indexing, or arithmetic definitions. Prefer exact arithmetic. Each script must emit exactly "
+            "one final MATH_AUDIT_VERIFICATION_RESULT_JSON= record using the existing structured result contract. "
+            "Distinguish execution success from mathematical outcome, report counterexamples completely, and describe "
+            "finite negative searches as 'no counterexample found in tested range', never as proof of the theorem."
+        ),
+        (
+            "For non-script-error outcomes, set replacement_recommended=false, replacement_checks=[], and leave "
+            "replacement_unavailable_explanation empty."
+        ),
     ]
     for item in evidence.get("verification_evidence") or []:
         if not isinstance(item, dict):
@@ -2062,6 +2388,343 @@ def rerun_failed_verification_scripts(pdf_path: str | Path, timeout: int = 120, 
     )
 
 
+def _replacement_manifest_for_record(
+    session: dict[str, Any],
+    record: dict[str, Any],
+) -> tuple[dict[str, Any], Optional[Path]]:
+    relative = str(record.get("replacement_manifest_path") or "").strip()
+    if not relative:
+        return {}, None
+    workdir = Path(session["workdir"]).resolve()
+    path = (workdir / relative).resolve()
+    try:
+        path.relative_to(workdir)
+    except ValueError:
+        return {}, None
+    if not path.is_file():
+        return {}, path
+    try:
+        manifest = load_json(path)
+    except Exception:
+        return {}, path
+    return (manifest if isinstance(manifest, dict) else {}), path
+
+
+def _replacement_execution_events(
+    session: dict[str, Any],
+    manifest: dict[str, Any],
+) -> list[dict[str, Any]]:
+    relative = str(manifest.get("execution_events_path") or "").strip()
+    if not relative:
+        return []
+    workdir = Path(session["workdir"]).resolve()
+    path = (workdir / relative).resolve()
+    try:
+        path.relative_to(workdir)
+    except ValueError:
+        return []
+    if not path.is_file():
+        return []
+    events = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if isinstance(item, dict):
+                events.append(item)
+    except Exception:
+        return []
+    return events
+
+
+def _canonical_replacement_executions(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    canonical: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if str(event.get("event") or "") != "execution_completed":
+            continue
+        check_id = str(event.get("replacement_check_id") or "").strip()
+        if check_id:
+            canonical[check_id] = event
+    return canonical
+
+
+def _replacement_reconciliation(checks: list[dict[str, Any]]) -> dict[str, Any]:
+    executed = [item for item in checks if isinstance(item.get("latest_execution"), dict)]
+    outcomes = {
+        str((item.get("latest_execution") or {}).get("mathematical_outcome") or "")
+        for item in executed
+    }
+    outcomes.discard("")
+    execution_statuses = {
+        str((item.get("latest_execution") or {}).get("execution_status") or "")
+        for item in executed
+    }
+    negative = outcomes & NEGATIVE_VERIFICATION_OUTCOMES
+    favorable = outcomes & {"no_counterexample_found", "check_satisfied"}
+    technical_failure = bool(
+        execution_statuses & {"runtime_error", "timeout", "parse_error", "unsafe", "skipped", "not_run"}
+    )
+    if negative and favorable:
+        status = "conflicting_replacement_results"
+        explanation = "Replacement checks disagree; the mathematical finding remains unresolved."
+    elif negative:
+        status = "counterexample_supported_by_replacement"
+        explanation = "A corrected or independent replacement check reports a counterexample or claim failure."
+    elif technical_failure:
+        status = "unresolved_replacement_failure"
+        explanation = "At least one replacement check failed or emitted unusable output; the finding remains unresolved."
+    elif "check_satisfied" in outcomes:
+        status = "provisionally_resolved_exact_check"
+        explanation = "A replacement exact check was satisfied; human review must confirm that its scope matches the claim."
+    elif "no_counterexample_found" in outcomes:
+        status = "provisionally_challenged_finite_check"
+        explanation = "No counterexample was found in the replacement check's stated scope; this is not a proof beyond that scope."
+    elif executed and execution_statuses <= {"completed"}:
+        status = "unresolved_no_structured_outcome"
+        explanation = "Replacement execution completed without a usable mathematical outcome."
+    elif executed:
+        status = "unresolved_replacement_failure"
+        explanation = "A replacement check failed, timed out, was unsafe, or emitted malformed output."
+    elif checks:
+        status = "awaiting_replacement_execution"
+        explanation = "Replacement scripts are proposed but have not been executed."
+    else:
+        status = "replacement_unavailable"
+        explanation = "No replacement script is available."
+    return {
+        "status": status,
+        "explanation": explanation,
+        "executed_check_count": len(executed),
+        "mathematical_outcomes": sorted(outcomes),
+        "execution_statuses": sorted(execution_statuses),
+        "human_review_required": True,
+    }
+
+
+def verification_replacement_check_inventory(session: dict[str, Any]) -> dict[str, Any]:
+    groups = []
+    for record in verification_finding_rechecks_for_session(session):
+        result = record.get("structured_result") if isinstance(record.get("structured_result"), dict) else {}
+        if str(result.get("recheck_outcome") or "") != "script_error":
+            continue
+        manifest, manifest_path = _replacement_manifest_for_record(session, record)
+        events = _replacement_execution_events(session, manifest)
+        canonical = _canonical_replacement_executions(events)
+        checks = []
+        for check in manifest.get("replacement_checks") or []:
+            if not isinstance(check, dict):
+                continue
+            item = dict(check)
+            latest_execution = canonical.get(str(item.get("check_id") or ""))
+            if isinstance(latest_execution, dict):
+                latest_execution = dict(latest_execution)
+                result_relative = str(latest_execution.get("result_path") or "").strip()
+                if result_relative:
+                    result_path = (Path(session["workdir"]).resolve() / result_relative).resolve()
+                    try:
+                        result_path.relative_to(Path(session["workdir"]).resolve())
+                        loaded_result = load_json(result_path) if result_path.is_file() else {}
+                    except Exception:
+                        loaded_result = {}
+                    if isinstance(loaded_result, dict):
+                        latest_execution["result"] = loaded_result
+            item["latest_execution"] = latest_execution
+            checks.append(item)
+        reconciliation = _replacement_reconciliation(checks)
+        groups.append(
+            {
+                "recheck_id": str(record.get("recheck_id") or ""),
+                "finding_ids": list(record.get("finding_ids") or result.get("finding_ids") or []),
+                "chunk_id": str(record.get("chunk_id") or result.get("chunk_id") or ""),
+                "script_error_explanation": str(
+                    manifest.get("script_error_explanation")
+                    or (result.get("script_assessment") or {}).get("error_explanation")
+                    or result.get("summary")
+                    or ""
+                ),
+                "manifest_path": str(record.get("replacement_manifest_path") or ""),
+                "manifest_available": bool(manifest_path and manifest),
+                "replacement_unavailable_explanation": str(
+                    manifest.get("replacement_unavailable_explanation")
+                    or result.get("replacement_unavailable_explanation")
+                    or ""
+                ),
+                "checks": checks,
+                "execution_history_count": len(events),
+                "execution_history": events,
+                "reconciliation": reconciliation,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "groups": groups,
+        "summary": {
+            "script_error_recheck_count": len(groups),
+            "replacement_check_count": sum(len(item.get("checks") or []) for item in groups),
+            "ready_check_count": sum(
+                1
+                for group in groups
+                for check in group.get("checks") or []
+                if (check.get("validation") or {}).get("status") == "ready"
+            ),
+            "executed_check_count": sum(
+                1
+                for group in groups
+                for check in group.get("checks") or []
+                if isinstance(check.get("latest_execution"), dict)
+            ),
+        },
+    }
+
+
+def run_verification_replacement_checks(
+    session: dict[str, Any],
+    recheck_id: str,
+    check_ids: Optional[list[str]] = None,
+    timeout: int = 120,
+    progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> dict[str, Any]:
+    record = next(
+        (
+            item
+            for item in verification_finding_rechecks_for_session(session)
+            if str(item.get("recheck_id") or "") == str(recheck_id or "")
+        ),
+        None,
+    )
+    if record is None:
+        raise ValueError(f"Canonical verification-finding recheck not found: {recheck_id}")
+    result = record.get("structured_result") if isinstance(record.get("structured_result"), dict) else {}
+    if str(result.get("recheck_outcome") or "") != "script_error":
+        raise ValueError("Replacement execution is only available for canonical script_error rechecks.")
+    manifest, manifest_path = _replacement_manifest_for_record(session, record)
+    if not manifest or manifest_path is None:
+        raise ValueError("This script-error recheck has no replacement manifest.")
+    requested = {str(item).strip() for item in (check_ids or []) if str(item).strip()}
+    checks = [item for item in manifest.get("replacement_checks") or [] if isinstance(item, dict)]
+    if requested:
+        checks = [item for item in checks if str(item.get("check_id") or "") in requested]
+        missing = requested - {str(item.get("check_id") or "") for item in checks}
+        if missing:
+            raise ValueError("Unknown replacement check ID(s): " + ", ".join(sorted(missing)))
+    if not checks:
+        raise ValueError("No replacement checks were selected.")
+    not_ready = [
+        str(item.get("check_id") or "")
+        for item in checks
+        if (item.get("validation") or {}).get("status") != "ready"
+    ]
+    if not_ready:
+        raise ValueError("Replacement checks are not safe/ready for execution: " + ", ".join(not_ready))
+
+    workdir = Path(session["workdir"]).resolve()
+    artifact_root = manifest_path.parent
+    workspace = artifact_root / "replacement_execution_workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    temp_session = dict(session)
+    temp_session["workdir"] = str(workspace)
+    event_path = (workdir / str(manifest.get("execution_events_path") or "")).resolve()
+    event_path.parent.mkdir(parents=True, exist_ok=True)
+    prior_events = _replacement_execution_events(session, manifest)
+    canonical_prior = _canonical_replacement_executions(prior_events)
+    attempts = []
+    for check in checks:
+        check_id = str(check.get("check_id") or "")
+        script_path = (workdir / str(check.get("script_path") or "")).resolve()
+        current_code = script_path.read_text(encoding="utf-8")
+        current_validation = validate_verification_replacement_code(current_code)
+        if current_validation.get("status") != "ready" or current_validation.get("code_sha256") != check.get("code_sha256"):
+            raise ValueError(f"Replacement check {check_id} changed or no longer passes safe validation.")
+        entry = {
+            "chunk_id": str(manifest.get("chunk_id") or ""),
+            "chunk_index": _chunk_index_from_chunk_id(str(manifest.get("chunk_id") or "")),
+            "script_name": script_path.name,
+            "script_path": str(script_path),
+            "purpose": str(check.get("purpose") or ""),
+            "description": str(check.get("correction_explanation") or ""),
+            "expected_outcome": str(check.get("expected_check_kind") or ""),
+        }
+        bundle = _run_verification_scripts(
+            temp_session,
+            [entry],
+            timeout=int(timeout),
+            safe_only=True,
+            progress_callback=progress_callback,
+            replace_all_results=True,
+        )
+        executed = dict((bundle.get("executed_results") or [{}])[0])
+        structured_execution = (
+            executed.get("structured_result")
+            if isinstance(executed.get("structured_result"), dict)
+            else {}
+        )
+        emitted_check_kind = str(structured_execution.get("check_kind") or "").strip()
+        expected_check_kind = str(check.get("expected_check_kind") or "").strip()
+        if (
+            executed.get("execution_status") == "completed"
+            and emitted_check_kind
+            and emitted_check_kind != expected_check_kind
+        ):
+            executed["execution_status"] = "parse_error"
+            executed["mathematical_outcome"] = "inconclusive"
+            executed["outcome_source"] = "replacement_contract_validation"
+            executed["structured_result_error"] = (
+                f"replacement emitted check_kind={emitted_check_kind!r}; expected {expected_check_kind!r}"
+            )
+            executed["status"] = _legacy_status_for_execution("parse_error")
+            executed["conclusion"] = _infer_verification_conclusion(executed)
+        attempt_id = f"replacement_attempt_{int(time.time() * 1000000)}_{check_id}"
+        result_path = artifact_root / "replacement_results" / f"{attempt_id}.result.json"
+        executed.update(
+            {
+                "origin": "verification_finding_recheck",
+                "recheck_id": str(recheck_id),
+                "replacement_attempt_id": attempt_id,
+                "replacement_check_id": check_id,
+                "relationship_to_original": check.get("relationship_to_original"),
+                "replaces_script_semantically": [
+                    str(item.get("script_name") or "") for item in manifest.get("originating_scripts") or []
+                ],
+                "tested_scope": check.get("tested_scope") or {},
+                "result_path": str(result_path.resolve().relative_to(workdir)),
+            }
+        )
+        save_json(result_path, executed)
+        previous = canonical_prior.get(check_id)
+        event = {
+            "schema_version": 1,
+            "time": utc_now(),
+            "event": "execution_completed",
+            "recheck_id": str(recheck_id),
+            "replacement_attempt_id": attempt_id,
+            "replacement_check_id": check_id,
+            "supersedes_attempt_id": str((previous or {}).get("replacement_attempt_id") or "") or None,
+            "result_path": str(result_path.resolve().relative_to(workdir)),
+            "execution_status": executed.get("execution_status"),
+            "mathematical_outcome": executed.get("mathematical_outcome"),
+            "tested_scope": check.get("tested_scope") or {},
+            "elapsed_seconds": executed.get("elapsed_seconds"),
+            "local_execution": True,
+            "api_cost_usd": 0.0,
+        }
+        append_jsonl(event_path, event)
+        canonical_prior[check_id] = event
+        attempts.append({"event": event, "result": executed})
+    return {
+        "workflow": "verification_replacement_execution",
+        "recheck_id": str(recheck_id),
+        "attempts": attempts,
+        "replacement_check_runtime": sum(
+            float((item.get("result") or {}).get("elapsed_seconds", 0.0) or 0.0) for item in attempts
+        ),
+        "replacement_check_execution_status": [
+            str((item.get("result") or {}).get("execution_status") or "") for item in attempts
+        ],
+        "inventory": verification_replacement_check_inventory(session),
+    }
+
+
 def show_verification_status(pdf_path: str | Path) -> dict[str, Any]:
     session = load_session_from_pdf(pdf_path)
     if session is None:
@@ -2133,6 +2796,8 @@ __all__ = [
     "verification_finding_recheck_summary",
     "verification_finding_recheck_schema_errors",
     "validate_verification_finding_recheck_response",
+    "validate_verification_replacement_code",
+    "persist_verification_replacement_proposals",
     "verification_finding_recheck_candidates",
     "build_verification_finding_recheck_evidence",
     "build_verification_finding_recheck_prompt",
@@ -2142,5 +2807,7 @@ __all__ = [
     "_run_verification_scripts",
     "run_verification_suite",
     "rerun_failed_verification_scripts",
+    "verification_replacement_check_inventory",
+    "run_verification_replacement_checks",
     "show_verification_status",
 ]

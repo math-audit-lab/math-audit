@@ -49,6 +49,7 @@ from audit_runtime import (
     rerun_failed_verification_chunks as runtime_rerun_failed_verification_chunks,
     rerun_selected_chunks as runtime_rerun_selected_chunks,
     run_verification_finding_rechecks,
+    run_verification_replacement_checks as runtime_run_verification_replacement_checks,
     resume_audit,
     run_issue_family_recheck_live,
     run_verification_suite_and_build_report,
@@ -956,6 +957,31 @@ class GuiController(QObject):
             rebuild_reports=True,
         )
 
+    def run_verification_replacement_checks(self, recheck_id: str, check_ids: list[str]) -> None:
+        if self.has_active_task():
+            self.log_message.emit("Replacement checks are only available when no local GUI task is active.")
+            return
+        if not self._require_session():
+            return
+        payload = self._load_status_payload()
+        session = payload.get("session") or {}
+        status = payload.get("status") or {}
+        if session.get("pending"):
+            self.log_message.emit("Cannot run replacement checks while the audit has a pending response.")
+            return
+        if str(status.get("status") or "") not in {"completed", "paused"}:
+            self.log_message.emit("Replacement checks are available only for completed or paused audits.")
+            return
+        self._run_backend_task(
+            "Run Safe Replacement Checks",
+            runtime_run_verification_replacement_checks,
+            self._handle_verification_replacement_result,
+            self.pdf_path,
+            recheck_id=str(recheck_id),
+            check_ids=list(check_ids),
+            rebuild_reports=True,
+        )
+
     def ask_about_paper(self, question: str) -> None:
         clean = str(question or "").strip()
         if not clean:
@@ -1418,6 +1444,35 @@ class GuiController(QObject):
         report_paths = result.get("report_paths") or {}
         if report_paths:
             self.report_output.emit(self._format_path_payload("Counterexample recheck report outputs", report_paths))
+        self.status_updated.emit(self._normalize_status_payload(result))
+        self._emit_current_status()
+
+    def _handle_verification_replacement_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected replacement-verification result.")
+            return
+        attempts = result.get("attempts") or []
+        lines = [f"Replacement verification finished: {len(attempts)} check(s)."]
+        for attempt in attempts:
+            if not isinstance(attempt, dict):
+                continue
+            event = attempt.get("event") or {}
+            lines.append(
+                f"- {event.get('replacement_check_id')}: "
+                f"{event.get('execution_status') or 'unknown'} / "
+                f"{event.get('mathematical_outcome') or 'outcome not reported'}"
+            )
+        lines.append(
+            f"Local runtime: {float(result.get('replacement_check_runtime', 0.0) or 0.0):.2f}s; API cost: $0.0000"
+        )
+        for warning in result.get("report_generation_warnings") or []:
+            lines.append(f"- Report warning: {warning}")
+        message = "\n".join(lines)
+        self.log_message.emit(message)
+        self.report_output.emit(message)
+        report_paths = result.get("report_paths") or {}
+        if report_paths:
+            self.report_output.emit(self._format_path_payload("Replacement verification report outputs", report_paths))
         self.status_updated.emit(self._normalize_status_payload(result))
         self._emit_current_status()
 

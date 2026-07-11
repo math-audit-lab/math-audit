@@ -28,6 +28,7 @@ from audit_verification import (
     verification_finding_recheck_summary,
     verification_finding_rechecks_for_session,
     verification_findings_for_session,
+    verification_replacement_check_inventory,
 )
 from audit_runtime import (
     AUDIT_CONTEXT_MODE_FRESH_EXPERIMENTAL,
@@ -3899,6 +3900,7 @@ def build_final_report(
             findings=verification_findings,
         ),
         "verification_finding_rechecks": verification_finding_rechecks_for_session(session),
+        "verification_replacement_checks": verification_replacement_check_inventory(session),
         "source_ingestion_diagnostics": source_diagnostics,
         "recheck_applied": bool(issue_recheck_overlay.get("recheck_applied")),
         "issue_recheck_summary": issue_recheck_overlay.get("issue_recheck_summary", {}),
@@ -4422,6 +4424,7 @@ def build_concise_report_json(
             findings=data["verification_findings"],
         ),
         "verification_finding_rechecks": verification_finding_rechecks_for_session(session),
+        "verification_replacement_checks": verification_replacement_check_inventory(session),
         "reference_status": _reference_report_status(session),
         "recheck_applied": bool(data["issue_recheck_overlay"].get("recheck_applied")),
         "issue_recheck_summary": data["issue_recheck_overlay"].get("issue_recheck_summary", {}),

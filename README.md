@@ -31,6 +31,7 @@ Use it cautiously. The app is not an automatic referee, proof assistant, or theo
 - Distinguish Python execution status from mathematical outcome; reported counterexamples are promoted as provisional findings in the full and concise reports.
 - Rerun selected chunks or chunks with failed/timed-out verification results.
 - Recheck completed counterexample/claim-failure findings with the full manuscript chunk, script, output, and structured counterexample evidence, without replacing the original chunk audit or deterministic finding.
+- When a recheck identifies a flawed verification script, review any proposed corrected or independent replacement checks before running them locally in safe mode; original scripts/results remain preserved and replacement outcomes remain provisional.
 - Ask post-audit questions in the Discussion pane, with saved thread history and rendered Markdown/math output.
 - Export a one-way ChatGPT context pack for continuing discussion in the regular ChatGPT app without making further API calls through the app.
 - Manage the shipped audit prompt and optional model-specific prompt overrides from the GUI.

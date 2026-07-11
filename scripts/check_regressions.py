@@ -86,13 +86,17 @@ from audit_verification import (
     append_verification_finding_recheck_event,
     build_verification_finding_recheck_evidence,
     build_verification_finding_recheck_prompt,
+    persist_verification_replacement_proposals,
+    run_verification_replacement_checks,
     supersede_verification_findings_for_chunks,
     validate_verification_finding_recheck_response,
+    validate_verification_replacement_code,
     verification_finding_recheck_candidates,
     verification_finding_recheck_map,
     verification_finding_recheck_schema_errors,
     verification_finding_rechecks_for_session,
     verification_findings_for_session,
+    verification_replacement_check_inventory,
     verification_result_needs_technical_retry,
 )
 from gui_controller import (
@@ -1392,6 +1396,7 @@ def test_counterexample_recheck_panel_helpers() -> None:
         _counterexample_recheck_action_state,
         _counterexample_recheck_selection_index,
         _counterexample_recheck_view,
+        _verification_replacement_view,
     )
 
     inventory = {
@@ -1482,6 +1487,44 @@ def test_counterexample_recheck_panel_helpers() -> None:
     _assert(no_candidates["reason"] == "No eligible counterexample findings.", str(no_candidates))
     empty_view = _counterexample_recheck_view({"candidates": []})
     _assert(empty_view["summary_text"] == "No active counterexample findings require recheck.", str(empty_view))
+    replacement_view = _verification_replacement_view(
+        {
+            "groups": [
+                {
+                    "recheck_id": "VR-003",
+                    "chunk_id": "chunk_003",
+                    "finding_ids": ["VF-SCRIPT-ERROR"],
+                    "script_error_explanation": "The original script used the wrong valuation formula.",
+                    "checks": [
+                        {
+                            "check_id": "corrected_primary",
+                            "relationship_to_original": "corrected_implementation",
+                            "purpose": "Check the corrected valuation.",
+                            "script_path": "verification_finding_rechecks/VR-003/replacement_corrected_primary.py",
+                            "validation": {"status": "ready"},
+                            "latest_execution": None,
+                        },
+                        {
+                            "check_id": "unsafe_secondary",
+                            "relationship_to_original": "independent_implementation",
+                            "purpose": "Unsafe synthetic check.",
+                            "script_path": "verification_finding_rechecks/VR-003/replacement_unsafe_secondary.py",
+                            "validation": {"status": "unsafe"},
+                            "latest_execution": None,
+                        },
+                    ],
+                    "reconciliation": {"status": "awaiting_replacement_execution"},
+                }
+            ]
+        }
+    )
+    _assert("Original script error" in replacement_view["summary_text"], str(replacement_view))
+    _assert(replacement_view["entries"][0]["ready"], str(replacement_view))
+    _assert(
+        replacement_view["entries"][0]["data"]["check_ids"] == ["corrected_primary"],
+        str(replacement_view),
+    )
+    _assert(not replacement_view["entries"][-1]["ready"], str(replacement_view))
 
 
 def test_review_summary_polling_feature_flag() -> None:
@@ -4628,6 +4671,35 @@ def test_verification_finding_recheck_workflow() -> None:
         confirmed = outcome in {"counterexample_confirmed", "claim_failure_confirmed"}
         script_error = outcome == "script_error"
         mismatch = outcome in {"scope_or_hypothesis_mismatch", "notation_or_interpretation_mismatch"}
+        replacement_code = (
+            "import json\n\n"
+            "payload = {\n"
+            "    'schema_version': 1,\n"
+            "    'check_kind': 'counterexample_search',\n"
+            "    'outcome': 'no_counterexample_found',\n"
+            "    'summary': 'No counterexample found in the tested range.',\n"
+            "    'counterexamples': [],\n"
+            "    'failed_cases': [],\n"
+            "    'tested_range': {'variable': 'a', 'minimum': 8, 'maximum': 85},\n"
+            "    'target': {'kind': 'theorem', 'label': 'Theorem 3'},\n"
+            "    'linked_issue_ids': ['I090'],\n"
+            "}\n"
+            "print('MATH_AUDIT_VERIFICATION_RESULT_JSON=' + json.dumps(payload, sort_keys=True))\n"
+        )
+        counterexample_code = (
+            "import json\n"
+            "payload = {'schema_version': 1, 'check_kind': 'counterexample_search', "
+            "'outcome': 'counterexample_found', 'summary': 'Independent counterexample.', "
+            "'counterexamples': [{'a': 11}], 'failed_cases': [], "
+            "'tested_range': {'variable': 'a', 'minimum': 8, 'maximum': 85}, "
+            "'target': {'kind': 'theorem', 'label': 'Theorem 3'}, 'linked_issue_ids': ['I090']}\n"
+            "print('MATH_AUDIT_VERIFICATION_RESULT_JSON=' + json.dumps(payload, sort_keys=True))\n"
+        )
+        malformed_code = "print('MATH_AUDIT_VERIFICATION_RESULT_JSON={not-json}')\n"
+        unsafe_code = (
+            "import subprocess\n"
+            "print('MATH_AUDIT_VERIFICATION_RESULT_JSON={}')\n"
+        )
         return {
             "schema_version": 1,
             "finding_ids": [finding_id],
@@ -4636,6 +4708,9 @@ def test_verification_finding_recheck_workflow() -> None:
             "script_assessment": {
                 "implements_intended_quantity": False if script_error else (None if outcome == "inconclusive" else True),
                 "script_correct": False if script_error else (None if outcome == "inconclusive" else True),
+                "error_type": "incorrect_formula" if script_error else "",
+                "error_explanation": "The original script evaluates the wrong formula." if script_error else "",
+                "affected_lines": ["predicted = t + 2"] if script_error else [],
                 "limitations": ["Human mathematical review remains required."],
             },
             "mathematical_assessment": {
@@ -4657,6 +4732,69 @@ def test_verification_finding_recheck_workflow() -> None:
                 "proposed_fix": "Correct the theorem and dependent arguments." if confirmed else "",
             },
             "downstream_dependencies": ["Results using Theorem 3"] if confirmed else [],
+            "replacement_recommended": script_error,
+            "replacement_unavailable_explanation": "",
+            "replacement_checks": (
+                [
+                    {
+                        "check_id": "corrected_primary",
+                        "relationship_to_original": "corrected_implementation",
+                        "purpose": "Test the original theorem over the stated finite range.",
+                        "correction_explanation": "Use the intended exact formula rather than the flawed prediction.",
+                        "independence_note": "Corrected implementation using direct exact arithmetic.",
+                        "python_code": replacement_code,
+                        "expected_check_kind": "counterexample_search",
+                        "tested_scope": {
+                            "description": "Integers 8 through 85.",
+                            "parameters": [
+                                {"name": "a_min", "value": "8"},
+                                {"name": "a_max", "value": "85"},
+                            ],
+                        },
+                    },
+                    {
+                        "check_id": "independent_secondary",
+                        "relationship_to_original": "independent_implementation",
+                        "purpose": "Independently test the same finite claim.",
+                        "correction_explanation": "Recompute the target without the original helper.",
+                        "independence_note": "Uses a separate direct implementation.",
+                        "python_code": counterexample_code,
+                        "expected_check_kind": "counterexample_search",
+                        "tested_scope": {
+                            "description": "Integers 8 through 85.",
+                            "parameters": [{"name": "a", "value": "8..85"}],
+                        },
+                    },
+                    {
+                        "check_id": "malformed_output",
+                        "relationship_to_original": "independent_implementation",
+                        "purpose": "Exercise malformed sentinel handling.",
+                        "correction_explanation": "Synthetic contract regression.",
+                        "independence_note": "Synthetic malformed-output case.",
+                        "python_code": malformed_code,
+                        "expected_check_kind": "counterexample_search",
+                        "tested_scope": {
+                            "description": "Synthetic malformed output.",
+                            "parameters": [],
+                        },
+                    },
+                    {
+                        "check_id": "unsafe_proposal",
+                        "relationship_to_original": "independent_implementation",
+                        "purpose": "Exercise safe-mode rejection.",
+                        "correction_explanation": "Synthetic unsafe regression.",
+                        "independence_note": "Synthetic unsafe case.",
+                        "python_code": unsafe_code,
+                        "expected_check_kind": "counterexample_search",
+                        "tested_scope": {
+                            "description": "Not executable in safe mode.",
+                            "parameters": [],
+                        },
+                    },
+                ]
+                if script_error
+                else []
+            ),
             "independent_check_recommended": True,
             "confidence": "high" if confirmed else "medium",
             "needs_human_review": True,
@@ -4678,6 +4816,20 @@ def test_verification_finding_recheck_workflow() -> None:
             pass
         else:
             raise AssertionError("malformed recheck response was accepted")
+    unavailable_replacement = recheck_payload("script_error", "VF-NO-REPLACEMENT")
+    unavailable_replacement["replacement_recommended"] = False
+    unavailable_replacement["replacement_checks"] = []
+    unavailable_replacement["replacement_unavailable_explanation"] = (
+        "A safe standalone replacement cannot be constructed from the supplied evidence."
+    )
+    validate_verification_finding_recheck_response(unavailable_replacement)
+    unavailable_replacement["replacement_unavailable_explanation"] = ""
+    try:
+        validate_verification_finding_recheck_response(unavailable_replacement)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("script_error without replacement or explanation was accepted")
 
     with tempfile.TemporaryDirectory(prefix="math_audit_verification_recheck_") as tmp:
         workdir = Path(tmp) / "paper_audit"
@@ -4861,6 +5013,35 @@ def test_verification_finding_recheck_workflow() -> None:
         _assert(len(findings) == 1, str(findings))
         finding = findings[0]
         _assert(finding["matched_issue_ids"] == ["I090"], str(finding))
+        legacy_result = recheck_payload("script_error", finding["finding_id"])
+        for legacy_key in (
+            "replacement_recommended",
+            "replacement_unavailable_explanation",
+            "replacement_checks",
+        ):
+            legacy_result.pop(legacy_key)
+        for legacy_key in ("error_type", "error_explanation", "affected_lines"):
+            legacy_result["script_assessment"].pop(legacy_key)
+        append_verification_finding_recheck_event(
+            session,
+            {
+                "time": OLD,
+                "recheck_id": "VR-LEGACY",
+                "status": "completed",
+                "event": "completed",
+                "finding_ids": [finding["finding_id"]],
+                "chunk_id": "chunk_008",
+                "structured_result": legacy_result,
+                "canonical": True,
+            },
+        )
+        legacy_map = verification_finding_recheck_map(session)
+        _assert(legacy_map[finding["finding_id"]]["recheck_id"] == "VR-LEGACY", str(legacy_map))
+        _assert(
+            legacy_map[finding["finding_id"]]["structured_result"]["replacement_unavailable_explanation"],
+            str(legacy_map),
+        )
+        session_paths(workdir)["verification_finding_rechecks"].unlink()
         append_verification_finding_recheck_event(
             session,
             {
@@ -5016,6 +5197,16 @@ def test_verification_finding_recheck_workflow() -> None:
         _assert("INCONCLUSIVE" in build_concise_report_markdown(session), "inconclusive finding disappeared")
 
         script_error = recheck_payload("script_error", finding["finding_id"])
+        replacement_root = workdir / "verification_finding_rechecks" / "VR-003"
+        replacement_info = persist_verification_replacement_proposals(
+            session,
+            recheck_id="VR-003",
+            artifact_root=replacement_root,
+            structured_result=script_error,
+            evidence=evidence,
+            model="gpt-5.6-sol",
+            reasoning_effort="max",
+        )
         append_verification_finding_recheck_event(
             session,
             {
@@ -5026,6 +5217,9 @@ def test_verification_finding_recheck_workflow() -> None:
                 "finding_ids": [finding["finding_id"]],
                 "chunk_id": "chunk_008",
                 "structured_result": script_error,
+                "replacement_manifest_path": replacement_info["manifest_path"],
+                "replacement_check_count": replacement_info["proposed_count"],
+                "replacement_ready_count": replacement_info["ready_count"],
                 "supersedes_recheck_ids": ["VR-002"],
                 "canonical": True,
                 "provisional": True,
@@ -5036,6 +5230,108 @@ def test_verification_finding_recheck_workflow() -> None:
         challenged_md = build_final_report_markdown(session)
         _assert("SCRIPT ERROR SUSPECTED" in challenged_md, challenged_md)
         _assert("original finding preserved" in challenged_md, challenged_md)
+        _assert(replacement_info["proposed_count"] == 4 and replacement_info["ready_count"] == 3, str(replacement_info))
+        replacement_manifest = json.loads(
+            (workdir / replacement_info["manifest_path"]).read_text(encoding="utf-8")
+        )
+        original_copy = workdir / replacement_manifest["originating_scripts"][0]["preserved_copy_path"]
+        _assert(original_copy.read_text(encoding="utf-8") == script_text, "original script copy changed")
+        _assert(script_path.read_text(encoding="utf-8") == script_text, "canonical original script changed")
+        validation_by_id = {
+            item["check_id"]: (item.get("validation") or {}).get("status")
+            for item in replacement_manifest["replacement_checks"]
+        }
+        _assert(validation_by_id["corrected_primary"] == "ready", str(validation_by_id))
+        _assert(validation_by_id["unsafe_proposal"] == "unsafe", str(validation_by_id))
+        _assert(validate_verification_replacement_code("print(\"no sentinel\")\n")["status"] == "invalid_contract", "contract accepted")
+
+        original_result_bytes = result_path.read_bytes()
+        primary_run = run_verification_replacement_checks(
+            session,
+            "VR-003",
+            check_ids=["corrected_primary"],
+            timeout=20,
+        )
+        _assert(primary_run["attempts"][0]["result"]["execution_status"] == "completed", str(primary_run))
+        _assert(
+            primary_run["attempts"][0]["result"]["mathematical_outcome"] == "no_counterexample_found",
+            str(primary_run),
+        )
+        _assert(primary_run["attempts"][0]["event"]["api_cost_usd"] == 0.0, str(primary_run))
+        _assert(primary_run["attempts"][0]["event"]["local_execution"] is True, str(primary_run))
+        primary_inventory = verification_replacement_check_inventory(session)
+        primary_group = primary_inventory["groups"][0]
+        _assert(
+            primary_group["reconciliation"]["status"] == "provisionally_challenged_finite_check",
+            str(primary_group),
+        )
+        _assert(result_path.read_bytes() == original_result_bytes, "original verification result changed")
+        first_attempt = primary_run["attempts"][0]["event"]["replacement_attempt_id"]
+        second_primary_run = run_verification_replacement_checks(
+            session,
+            "VR-003",
+            check_ids=["corrected_primary"],
+            timeout=20,
+        )
+        _assert(
+            second_primary_run["attempts"][0]["event"]["supersedes_attempt_id"] == first_attempt,
+            str(second_primary_run),
+        )
+
+        malformed_run = run_verification_replacement_checks(
+            session,
+            "VR-003",
+            check_ids=["malformed_output"],
+            timeout=20,
+        )
+        _assert(malformed_run["attempts"][0]["result"]["execution_status"] == "parse_error", str(malformed_run))
+        try:
+            run_verification_replacement_checks(
+                session,
+                "VR-003",
+                check_ids=["unsafe_proposal"],
+                timeout=20,
+            )
+        except ValueError as exc:
+            _assert("not safe/ready" in str(exc), str(exc))
+        else:
+            raise AssertionError("unsafe replacement was executed")
+
+        independent_run = run_verification_replacement_checks(
+            session,
+            "VR-003",
+            check_ids=["independent_secondary"],
+            timeout=20,
+        )
+        _assert(
+            independent_run["attempts"][0]["result"]["mathematical_outcome"] == "counterexample_found",
+            str(independent_run),
+        )
+        conflict_inventory = verification_replacement_check_inventory(session)
+        conflict_group = conflict_inventory["groups"][0]
+        _assert(conflict_group["reconciliation"]["status"] == "conflicting_replacement_results", str(conflict_group))
+        _assert(conflict_group["execution_history_count"] == 4, str(conflict_group))
+        _assert(len(conflict_group["execution_history"]) == 4, str(conflict_group))
+        replacement_report = build_final_report_markdown(session)
+        replacement_concise = build_concise_report_markdown(session)
+        replacement_verification_paths = runtime.build_verification_report(session)
+        replacement_verification = Path(replacement_verification_paths["markdown"]).read_text(encoding="utf-8")
+        for report_text in (replacement_report, replacement_concise, replacement_verification):
+            _assert("Original script error" in report_text, report_text)
+            _assert("Replacement check" in report_text, report_text)
+            _assert("counterexample_found" in report_text, report_text)
+        replacement_full_paths = policy_build_final_report(session, write_separate_verification_report=False)
+        replacement_full_json = json.loads(Path(replacement_full_paths["json"]).read_text(encoding="utf-8"))
+        replacement_concise_json = build_concise_report_json(session)
+        replacement_verification_json = json.loads(
+            Path(replacement_verification_paths["json"]).read_text(encoding="utf-8")
+        )
+        for report_json in (replacement_full_json, replacement_concise_json, replacement_verification_json):
+            _assert(report_json["verification_replacement_checks"]["summary"]["executed_check_count"] == 3, str(report_json))
+        _assert(
+            replacement_report.count("Original script error") == build_final_report_markdown(session).count("Original script error"),
+            "repeated report build duplicated replacement data",
+        )
 
         scope_mismatch = recheck_payload("scope_or_hypothesis_mismatch", finding["finding_id"])
         append_verification_finding_recheck_event(
