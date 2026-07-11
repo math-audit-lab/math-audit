@@ -829,6 +829,25 @@ class MainWindow(QMainWindow):
         failed_rerun_layout.addWidget(self.failed_verification_stack)
         self._set_failed_verification_rerun_compact(0)
 
+        counterexample_recheck_box = QGroupBox("Counterexample Finding Recheck")
+        counterexample_recheck_layout = QFormLayout(counterexample_recheck_box)
+        self.counterexample_recheck_summary_value = QLabel("No active counterexample findings require recheck.")
+        self.counterexample_recheck_summary_value.setWordWrap(True)
+        counterexample_recheck_layout.addRow("Candidates", self.counterexample_recheck_summary_value)
+        self.counterexample_recheck_input = QLineEdit()
+        self.counterexample_recheck_input.setPlaceholderText("blank = all; or VF-... / chunk_008")
+        counterexample_recheck_layout.addRow("Selection", self.counterexample_recheck_input)
+        counterexample_hint = QLabel(
+            "This sends the complete chunk, verification script, output, and counterexample evidence for focused review. "
+            "It does not replace the original chunk audit."
+        )
+        counterexample_hint.setWordWrap(True)
+        counterexample_hint.setStyleSheet("color: #555;")
+        counterexample_recheck_layout.addRow("", counterexample_hint)
+        self.recheck_counterexample_button = QPushButton("Recheck Counterexample Chunks")
+        self.recheck_counterexample_button.clicked.connect(self._recheck_counterexample_findings)
+        counterexample_recheck_layout.addRow("", self.recheck_counterexample_button)
+
         quick_buttons = QHBoxLayout()
         quick_buttons.addWidget(self.build_concise_button)
         quick_buttons.addWidget(self.open_concise_report_button)
@@ -863,6 +882,7 @@ class MainWindow(QMainWindow):
         self.verification_report_freshness_value.setWordWrap(True)
         verification_layout.addWidget(self.verification_report_freshness_value)
         verification_layout.addWidget(failed_rerun_box)
+        verification_layout.addWidget(counterexample_recheck_box)
         reports_layout.addWidget(verification_box)
 
         finalize_box, finalize_layout = self._build_reports_section(
@@ -1316,6 +1336,38 @@ class MainWindow(QMainWindow):
             rebuild_reports=self.failed_verification_rebuild_checkbox.isChecked(),
         )
 
+    def _recheck_counterexample_findings(self) -> None:
+        self._apply_api_key()
+        self._apply_pdf_path()
+        payload = self._last_status_payload or {}
+        inventory = payload.get("verification_finding_rechecks") or {}
+        summary = inventory.get("summary") or {}
+        eligible_chunks = int(summary.get("eligible_chunk_count", 0) or 0)
+        eligible_findings = int(summary.get("eligible_finding_count", 0) or 0)
+        selection = self.counterexample_recheck_input.text().strip()
+        session = payload.get("session") or {}
+        model = self.controller.model or session.get("model")
+        effort = self.controller.reasoning_effort or session.get("reasoning_effort")
+        scope_text = f"selection {selection}" if selection else f"all {eligible_chunks} eligible chunk(s) / {eligible_findings} finding(s)"
+        message = (
+            f"Recheck {scope_text}?\n\n"
+            "The complete manuscript chunk, verification script, exact execution output, parsed counterexample, "
+            "linked issues, labels, and compact neighboring context will be sent to the OpenAI API.\n\n"
+            f"Model/reasoning: {model or 'saved session model'} / {effort or 'saved session effort'}\n"
+            "This action incurs API cost. The result is provisional and will not erase the original deterministic finding."
+        )
+        choice = QMessageBox.question(
+            self,
+            "Recheck Counterexample Findings",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            self.controller.log_message.emit("Counterexample finding recheck cancelled.")
+            return
+        self.controller.recheck_counterexample_findings(selection)
+
     def _on_status_updated(self, payload: dict[str, Any]) -> None:
         self._last_status_payload = payload
         status = payload.get("status") or {}
@@ -1325,6 +1377,7 @@ class MainWindow(QMainWindow):
         pause = payload.get("pause") or {}
         failed_verification = payload.get("failed_verification") or {}
         verification_suite = payload.get("verification_suite") or {}
+        verification_finding_rechecks = payload.get("verification_finding_rechecks") or {}
         status_cost = status.get("cost_usd", None)
         totals_cost = float(totals.get("cost_usd", 0.0) or 0.0)
         if status_cost is None:
@@ -1396,6 +1449,45 @@ class MainWindow(QMainWindow):
             )
         else:
             _set_text_if_changed(self.verification_last_run_value, "Last run: none")
+        recheck_summary = verification_finding_rechecks.get("summary") or {}
+        recheck_candidates = verification_finding_rechecks.get("candidates") or []
+        recheck_history_summary = verification_suite.get("verification_finding_recheck_summary") or {}
+        eligible_recheck_chunks = int(recheck_summary.get("eligible_chunk_count", 0) or 0)
+        eligible_recheck_findings = int(recheck_summary.get("eligible_finding_count", 0) or 0)
+        history_text = (
+            f"Rechecks: confirmed {int(recheck_history_summary.get('confirmed_count', 0) or 0)}, "
+            f"challenged {int(recheck_history_summary.get('challenged_count', 0) or 0)}, "
+            f"inconclusive {int(recheck_history_summary.get('inconclusive_count', 0) or 0)}. "
+            if int(recheck_history_summary.get("rechecked_finding_count", 0) or 0)
+            else ""
+        )
+        if eligible_recheck_chunks:
+            previews = []
+            for candidate in recheck_candidates[:3]:
+                if not isinstance(candidate, dict) or not candidate.get("eligible"):
+                    continue
+                target_values = []
+                for target in candidate.get("targets") or []:
+                    if isinstance(target, dict):
+                        target_values.append(str(target.get("label") or target.get("name") or ""))
+                previews.append(
+                    f"{candidate.get('chunk_id')}: {', '.join(candidate.get('finding_ids') or [])}; "
+                    f"{', '.join(target_values) or 'target not reported'}; "
+                    f"{int(candidate.get('counterexample_count', 0) or 0)} case(s)"
+                )
+            suffix = " ..." if eligible_recheck_chunks > len(previews) else ""
+            _set_text_if_changed(
+                self.counterexample_recheck_summary_value,
+                history_text
+                + f"{eligible_recheck_chunks} eligible chunk(s), {eligible_recheck_findings} finding(s). "
+                + " | ".join(previews)
+                + suffix,
+            )
+        else:
+            _set_text_if_changed(
+                self.counterexample_recheck_summary_value,
+                history_text + "No active counterexample or claim-failure findings require recheck.",
+            )
         inventory_warning = verification_suite.get("inventory_warning") or {}
         if inventory_warning.get("has_invalidated_obligations"):
             affected_chunks = inventory_warning.get("affected_chunks") or []
@@ -1779,6 +1871,7 @@ class MainWindow(QMainWindow):
         session = payload.get("session") or {}
         pending = session.get("pending") or {}
         failed_verification = payload.get("failed_verification") or {}
+        verification_finding_rechecks = payload.get("verification_finding_rechecks") or {}
         session_available = bool(payload.get("session_available"))
         pdf_selected = bool(self.pdf_path_input.text().strip())
         status_name = str(status.get("status") or "")
@@ -1791,6 +1884,9 @@ class MainWindow(QMainWindow):
         )
         cancel_in_progress = self.controller.cancel_current_chunk_in_progress()
         failed_count = int((failed_verification.get("summary") or {}).get("failed_chunk_count", 0) or 0)
+        counterexample_recheck_count = int(
+            (verification_finding_rechecks.get("summary") or {}).get("eligible_chunk_count", 0) or 0
+        )
         resumable_statuses = {"paused", "initialized"}
 
         self.start_button.setEnabled(pdf_selected and not self._task_running and not running_status)
@@ -1828,6 +1924,14 @@ class MainWindow(QMainWindow):
             and status_name in {"completed", "paused"}
             and not pending_response
             and failed_count > 0
+        )
+        self.recheck_counterexample_button.setEnabled(
+            session_available
+            and not self._task_running
+            and status_name in {"completed", "paused"}
+            and not pending_response
+            and counterexample_recheck_count > 0
+            and self.controller.live_api_key_available()
         )
         self.ask_button.setEnabled(session_ready)
         self.new_discussion_thread_button.setEnabled(session_ready)

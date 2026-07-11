@@ -58,6 +58,7 @@ def session_paths(workdir: str | Path) -> dict[str, Path]:
         "audit_context_db": root / "state" / "audit_context_db.jsonl",
         "verification_state": root / "state" / "verification.json",
         "verification_findings": root / "state" / "verification_findings.json",
+        "verification_finding_rechecks": root / "state" / "verification_finding_rechecks.jsonl",
     }
 
 
@@ -371,6 +372,8 @@ def update_usage_from_usage_obj(
     usage_obj: dict[str, Any],
     model: Optional[str] = None,
     elapsed_seconds: float = 0.0,
+    activity_kind: str = "audit_chunk",
+    activity_id: Optional[str] = None,
 ) -> dict[str, Any]:
     usage_state = load_usage(session)
     usage_obj = usage_obj or {}
@@ -386,16 +389,45 @@ def update_usage_from_usage_obj(
     totals["cost_usd"] += float(cost["total_cost"])
     totals["audit_seconds"] = float(totals.get("audit_seconds", 0.0) or 0.0) + float(elapsed_seconds or 0.0)
 
-    usage_state["per_chunk"].append(
+    clean_activity_kind = str(activity_kind or "audit_chunk").strip() or "audit_chunk"
+    usage_entry = {
+        "time": utc_now(),
+        "chunk_id": chunk_id,
+        "activity_kind": clean_activity_kind,
+        "activity_id": str(activity_id or "").strip() or None,
+        "usage": usage_obj,
+        "cost": cost,
+        "usage_diagnostics": cache_diagnostics,
+        "elapsed_seconds": float(elapsed_seconds or 0.0),
+    }
+    usage_state["per_chunk"].append(usage_entry)
+
+    activity_totals = usage_state.setdefault("activity_totals", {})
+    activity_summary = activity_totals.setdefault(
+        clean_activity_kind,
         {
-            "time": utc_now(),
-            "chunk_id": chunk_id,
-            "usage": usage_obj,
-            "cost": cost,
-            "usage_diagnostics": cache_diagnostics,
-            "elapsed_seconds": float(elapsed_seconds or 0.0),
-        }
+            "calls": 0,
+            "input_tokens": 0,
+            "cached_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "elapsed_seconds": 0.0,
+        },
     )
+    activity_summary["calls"] += 1
+    activity_summary["input_tokens"] += int(usage_obj.get("input_tokens", 0) or 0)
+    activity_summary["cached_tokens"] += int(
+        ((usage_obj.get("input_tokens_details") or {}).get("cached_tokens", 0)) or 0
+    )
+    activity_summary["output_tokens"] += int(usage_obj.get("output_tokens", 0) or 0)
+    activity_summary["reasoning_tokens"] += int(
+        ((usage_obj.get("output_tokens_details") or {}).get("reasoning_tokens", 0)) or 0
+    )
+    activity_summary["total_tokens"] += int(usage_obj.get("total_tokens", 0) or 0)
+    activity_summary["cost_usd"] += float(cost["total_cost"])
+    activity_summary["elapsed_seconds"] += float(elapsed_seconds or 0.0)
     save_usage(session, usage_state)
     return {"usage": usage_obj, "cost": cost, "usage_diagnostics": cache_diagnostics, "usage_state": usage_state}
 

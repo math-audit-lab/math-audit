@@ -10,7 +10,17 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from audit_state import append_jsonl, load_issues, load_json, load_session_from_pdf, save_json, session_paths, utc_now
+from audit_state import (
+    append_jsonl,
+    load_issues,
+    load_json,
+    load_ledger,
+    load_manifest,
+    load_session_from_pdf,
+    save_json,
+    session_paths,
+    utc_now,
+)
 
 
 _VERIFICATION_SCRIPT_RE = re.compile(r"^(chunk_\d+)_check_\d+\.py$")
@@ -36,6 +46,113 @@ VERIFICATION_MATHEMATICAL_OUTCOMES = {
 }
 NEGATIVE_VERIFICATION_OUTCOMES = {"counterexample_found", "claim_failed"}
 TECHNICAL_VERIFICATION_FAILURE_STATUSES = {"runtime_error", "timeout", "parse_error"}
+VERIFICATION_FINDING_RECHECK_OUTCOMES = {
+    "counterexample_confirmed",
+    "claim_failure_confirmed",
+    "script_error",
+    "scope_or_hypothesis_mismatch",
+    "notation_or_interpretation_mismatch",
+    "inconclusive",
+}
+CONCLUSIVE_VERIFICATION_FINDING_RECHECK_OUTCOMES = (
+    VERIFICATION_FINDING_RECHECK_OUTCOMES - {"inconclusive"}
+)
+VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "schema_version": {"type": "integer", "enum": [1]},
+        "finding_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+        },
+        "chunk_id": {"type": "string"},
+        "recheck_outcome": {
+            "type": "string",
+            "enum": sorted(VERIFICATION_FINDING_RECHECK_OUTCOMES),
+        },
+        "script_assessment": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "implements_intended_quantity": {"type": ["boolean", "null"]},
+                "script_correct": {"type": ["boolean", "null"]},
+                "limitations": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["implements_intended_quantity", "script_correct", "limitations"],
+        },
+        "mathematical_assessment": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "candidate_satisfies_hypotheses": {"type": ["boolean", "null"]},
+                "counterexample_valid": {"type": ["boolean", "null"]},
+                "claim_contradicted": {"type": ["boolean", "null"]},
+                "affected_claim": {"type": "string"},
+                "explanation": {"type": "string"},
+                "exact_computation": {"type": "string"},
+            },
+            "required": [
+                "candidate_satisfies_hypotheses",
+                "counterexample_valid",
+                "claim_contradicted",
+                "affected_claim",
+                "explanation",
+                "exact_computation",
+            ],
+        },
+        "recommended_issue_action": {
+            "type": "string",
+            "enum": [
+                "strengthen_existing",
+                "link_existing",
+                "create_new",
+                "no_issue_change",
+                "human_review",
+            ],
+        },
+        "linked_issue_ids": {"type": "array", "items": {"type": "string"}},
+        "recommended_severity": {
+            "type": "string",
+            "enum": ["none", "low", "medium", "high", "critical"],
+        },
+        "proposed_issue": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "title": {"type": "string"},
+                "location": {"type": "string"},
+                "description": {"type": "string"},
+                "evidence": {"type": "string"},
+                "proposed_fix": {"type": "string"},
+            },
+            "required": ["title", "location", "description", "evidence", "proposed_fix"],
+        },
+        "downstream_dependencies": {"type": "array", "items": {"type": "string"}},
+        "independent_check_recommended": {"type": "boolean"},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "needs_human_review": {"type": "boolean"},
+        "summary": {"type": "string"},
+    },
+    "required": [
+        "schema_version",
+        "finding_ids",
+        "chunk_id",
+        "recheck_outcome",
+        "script_assessment",
+        "mathematical_assessment",
+        "recommended_issue_action",
+        "linked_issue_ids",
+        "recommended_severity",
+        "proposed_issue",
+        "downstream_dependencies",
+        "independent_check_recommended",
+        "confidence",
+        "needs_human_review",
+        "summary",
+    ],
+}
 _LEGACY_FAILURE_LIST_RE = re.compile(
     r"^\s*(?P<label>[^:\n]{0,160}?\b(?:counterexamples|(?:finite\s+)?failures|failed\s+cases))\s*:\s*(?P<value>\[.*\])\s*$",
     flags=re.IGNORECASE,
@@ -915,6 +1032,648 @@ def _verification_finding_from_result(session: dict[str, Any], raw_result: dict[
     }
 
 
+def _verification_finding_rechecks_path(session: dict[str, Any]) -> Path:
+    return session_paths(session["workdir"])["verification_finding_rechecks"]
+
+
+def append_verification_finding_recheck_event(
+    session: dict[str, Any],
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    payload = dict(event or {})
+    payload.setdefault("schema_version", 1)
+    payload.setdefault("time", utc_now())
+    append_jsonl(_verification_finding_rechecks_path(session), payload)
+    return payload
+
+
+def verification_finding_rechecks_for_session(
+    session: dict[str, Any],
+    include_superseded: bool = False,
+) -> list[dict[str, Any]]:
+    path = _verification_finding_rechecks_path(session)
+    if not path.exists():
+        return []
+    collapsed: dict[str, dict[str, Any]] = {}
+    order: dict[str, int] = {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                recheck_id = str(event.get("recheck_id") or "").strip()
+                if not recheck_id:
+                    continue
+                merged = dict(collapsed.get(recheck_id) or {})
+                merged.update(event)
+                collapsed[recheck_id] = merged
+                order[recheck_id] = index
+    except OSError:
+        return []
+
+    records = sorted(
+        collapsed.values(),
+        key=lambda item: (str(item.get("time") or ""), order.get(str(item.get("recheck_id") or ""), 0)),
+    )
+    if include_superseded:
+        return records
+
+    latest_by_finding: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if str(record.get("status") or "").strip().lower() != "completed":
+            continue
+        if record.get("canonical") is False:
+            continue
+        result = record.get("structured_result")
+        if not isinstance(result, dict):
+            continue
+        try:
+            result = validate_verification_finding_recheck_response(result)
+        except (TypeError, ValueError):
+            continue
+        for finding_id in record.get("finding_ids") or result.get("finding_ids") or []:
+            clean = str(finding_id or "").strip()
+            if clean:
+                latest_by_finding[clean] = record
+    unique: dict[str, dict[str, Any]] = {}
+    for record in latest_by_finding.values():
+        unique[str(record.get("recheck_id") or "")] = record
+    return sorted(unique.values(), key=lambda item: str(item.get("time") or ""))
+
+
+def verification_finding_recheck_map(session: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    mapping: dict[str, dict[str, Any]] = {}
+    for record in verification_finding_rechecks_for_session(session):
+        result = record.get("structured_result") if isinstance(record.get("structured_result"), dict) else {}
+        for finding_id in record.get("finding_ids") or result.get("finding_ids") or []:
+            clean = str(finding_id or "").strip()
+            if clean:
+                mapping[clean] = record
+    return mapping
+
+
+def _verification_finding_recheck_display_state(record: Optional[dict[str, Any]]) -> str:
+    if not isinstance(record, dict):
+        return "not_rechecked"
+    result = record.get("structured_result") if isinstance(record.get("structured_result"), dict) else {}
+    outcome = str(result.get("recheck_outcome") or "").strip().lower()
+    if outcome in {"counterexample_confirmed", "claim_failure_confirmed"}:
+        return "confirmed"
+    if outcome in {"script_error", "scope_or_hypothesis_mismatch", "notation_or_interpretation_mismatch"}:
+        return "challenged"
+    if outcome == "inconclusive":
+        return "inconclusive"
+    return "not_rechecked"
+
+
+def apply_verification_finding_rechecks(
+    session: dict[str, Any],
+    findings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    recheck_map = verification_finding_recheck_map(session)
+    applied = []
+    for finding in findings:
+        item = dict(finding)
+        finding_id = str(item.get("finding_id") or "").strip()
+        latest = recheck_map.get(finding_id)
+        state = _verification_finding_recheck_display_state(latest)
+        item["recheck_state"] = state
+        item["recheck_confirmed"] = state == "confirmed"
+        item["recheck_challenged"] = state == "challenged"
+        item["recheck_inconclusive"] = state == "inconclusive"
+        if latest is not None:
+            item["latest_recheck"] = latest
+        applied.append(item)
+    return applied
+
+
+def verification_finding_recheck_summary(
+    session: dict[str, Any],
+    findings: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    current = findings if findings is not None else verification_findings_for_session(session)
+    states = {"confirmed": 0, "challenged": 0, "inconclusive": 0, "not_rechecked": 0}
+    for finding in current:
+        state = str(finding.get("recheck_state") or "not_rechecked")
+        states[state if state in states else "not_rechecked"] += 1
+    return {
+        "active_finding_count": len(current),
+        "rechecked_finding_count": len(current) - states["not_rechecked"],
+        "confirmed_count": states["confirmed"],
+        "challenged_count": states["challenged"],
+        "inconclusive_count": states["inconclusive"],
+        "not_rechecked_count": states["not_rechecked"],
+        "canonical_recheck_count": len(verification_finding_rechecks_for_session(session)),
+    }
+
+
+def verification_finding_recheck_schema_errors(schema: Optional[dict[str, Any]] = None) -> list[str]:
+    root = VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA if schema is None else schema
+    errors: list[str] = []
+
+    def visit(node: Any, path: str) -> None:
+        if not isinstance(node, dict):
+            return
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            required = node.get("required")
+            if not isinstance(required, list):
+                errors.append(f"{path}: object schema is missing required")
+            else:
+                missing = sorted(set(properties) - set(required))
+                extra = sorted(set(required) - set(properties))
+                if missing:
+                    errors.append(f"{path}: properties missing from required: {', '.join(missing)}")
+                if extra:
+                    errors.append(f"{path}: required keys missing from properties: {', '.join(extra)}")
+            for key, child in properties.items():
+                visit(child, f"{path}.{key}")
+        items = node.get("items")
+        if isinstance(items, dict):
+            visit(items, f"{path}[]")
+
+    visit(root, "$")
+    return errors
+
+
+def validate_verification_finding_recheck_response(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Verification-finding recheck response must be a JSON object.")
+    required = set(VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA["required"])
+    missing = sorted(required - set(payload))
+    extra = sorted(set(payload) - set(VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA["properties"]))
+    if missing:
+        raise ValueError("Missing verification-finding recheck fields: " + ", ".join(missing))
+    if extra:
+        raise ValueError("Unexpected verification-finding recheck fields: " + ", ".join(extra))
+    if int(payload.get("schema_version") or 0) != 1:
+        raise ValueError("Unsupported verification-finding recheck schema_version.")
+    outcome = str(payload.get("recheck_outcome") or "").strip()
+    if outcome not in VERIFICATION_FINDING_RECHECK_OUTCOMES:
+        raise ValueError(f"Unsupported verification-finding recheck outcome: {outcome!r}")
+    finding_ids = [str(item).strip() for item in payload.get("finding_ids") or [] if str(item).strip()]
+    if not finding_ids:
+        raise ValueError("Verification-finding recheck response must contain finding_ids.")
+    if not str(payload.get("chunk_id") or "").strip():
+        raise ValueError("Verification-finding recheck response must contain chunk_id.")
+    for key in ("script_assessment", "mathematical_assessment", "proposed_issue"):
+        if not isinstance(payload.get(key), dict):
+            raise ValueError(f"Verification-finding recheck field {key!r} must be an object.")
+        nested_schema = VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA["properties"][key]
+        expected = set(nested_schema["required"])
+        missing_nested = sorted(expected - set(payload[key]))
+        extra_nested = sorted(set(payload[key]) - set(nested_schema["properties"]))
+        if missing_nested:
+            raise ValueError(f"Verification-finding recheck field {key!r} is missing: {', '.join(missing_nested)}")
+        if extra_nested:
+            raise ValueError(f"Verification-finding recheck field {key!r} has unexpected keys: {', '.join(extra_nested)}")
+    for key in ("finding_ids", "linked_issue_ids", "downstream_dependencies"):
+        if not isinstance(payload.get(key), list) or any(not isinstance(item, str) for item in payload[key]):
+            raise ValueError(f"Verification-finding recheck field {key!r} must be an array of strings.")
+    for key in ("independent_check_recommended", "needs_human_review"):
+        if not isinstance(payload.get(key), bool):
+            raise ValueError(f"Verification-finding recheck field {key!r} must be boolean.")
+    for key, allowed in (
+        ("recommended_issue_action", {"strengthen_existing", "link_existing", "create_new", "no_issue_change", "human_review"}),
+        ("recommended_severity", {"none", "low", "medium", "high", "critical"}),
+        ("confidence", {"low", "medium", "high"}),
+    ):
+        if payload.get(key) not in allowed:
+            raise ValueError(f"Verification-finding recheck field {key!r} has unsupported value {payload.get(key)!r}.")
+    return dict(payload)
+
+
+def _relative_audit_path(session: dict[str, Any], path_value: Any) -> str:
+    raw = str(path_value or "").strip()
+    if not raw:
+        return ""
+    root = Path(session["workdir"]).resolve()
+    path = Path(raw)
+    try:
+        return str(path.resolve().relative_to(root))
+    except Exception:
+        return raw
+
+
+def _verification_counterexample_summary(counterexample: dict[str, Any], script_text: str = "") -> str:
+    if not isinstance(counterexample, dict):
+        return str(counterexample)
+    a_value = counterexample.get("a")
+    factorization = counterexample.get("factorization")
+    factor_text = ""
+    if isinstance(factorization, dict):
+        factors = []
+        for prime, exponent in sorted(
+            factorization.items(),
+            key=lambda item: (0, int(item[0])) if str(item[0]).isdigit() else (1, str(item[0])),
+        ):
+            try:
+                clean_exponent = int(exponent)
+            except Exception:
+                clean_exponent = exponent
+            factors.append(str(prime) if clean_exponent == 1 else f"{prime}^{clean_exponent}")
+        factor_text = " * ".join(factors)
+    base_match = re.search(r"sigma\((\d+)\^a\)", script_text, flags=re.IGNORECASE)
+    base = base_match.group(1) if base_match else "n"
+    parts = []
+    if a_value is not None:
+        parts.append(f"a = {a_value}")
+    if factor_text:
+        if a_value is not None and base != "n":
+            parts.append(f"sigma({base}^{a_value}) = {factor_text}")
+        else:
+            parts.append(f"factorization = {factor_text}")
+    if counterexample.get("omega_sigma") is not None:
+        target = f"sigma({base}^{a_value})" if a_value is not None and base != "n" else "sigma(input)"
+        parts.append(f"Omega({target}) = {counterexample.get('omega_sigma')}")
+    if counterexample.get("omega_input") is not None:
+        target = f"{base}^{a_value}" if a_value is not None and base != "n" else "input"
+        parts.append(f"Omega({target}) = {counterexample.get('omega_input')}")
+    return "; ".join(parts) or json.dumps(counterexample, ensure_ascii=False, sort_keys=True)
+
+
+def _bounded_verification_output(text: Any, limit: int = 30000) -> dict[str, Any]:
+    raw = str(text or "")
+    if len(raw) <= limit:
+        return {"text": raw, "truncated": False, "original_chars": len(raw)}
+    keep = max(1000, limit // 3)
+    result_lines = [
+        line
+        for line in raw.splitlines()
+        if any(token in line.lower() for token in ("counterexample", "failure", "failed", "claim", "math_audit_verification_result_json="))
+    ]
+    middle = "\n".join(result_lines)
+    bounded = raw[:keep] + "\n... [unrelated output omitted] ...\n"
+    if middle:
+        bounded += middle + "\n... [end preserved mathematical-result lines] ...\n"
+    bounded += raw[-keep:]
+    return {"text": bounded, "truncated": True, "original_chars": len(raw)}
+
+
+def verification_finding_recheck_candidates(
+    session: dict[str, Any],
+    findings: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    current_findings = verification_findings_for_session(session) if findings is None else list(findings)
+    manifest = load_manifest(session)
+    chunk_ids = {
+        str(item.get("chunk_id") or "").strip()
+        for item in manifest.get("chunks") or []
+        if isinstance(item, dict)
+    }
+    latest_map = verification_finding_recheck_map(session)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    excluded: list[dict[str, Any]] = []
+    for finding in current_findings:
+        finding_id = str(finding.get("finding_id") or "").strip()
+        chunk_id = str(finding.get("chunk_id") or "").strip()
+        outcome = str(finding.get("mathematical_outcome") or "").strip()
+        latest = latest_map.get(finding_id)
+        latest_result = latest.get("structured_result") if isinstance(latest, dict) else {}
+        latest_outcome = str((latest_result or {}).get("recheck_outcome") or "").strip()
+        reason = ""
+        if not finding.get("active", True) or finding.get("superseded"):
+            reason = "finding is inactive or superseded"
+        elif outcome not in NEGATIVE_VERIFICATION_OUTCOMES:
+            reason = f"mathematical outcome {outcome or 'unknown'} is not a counterexample/claim failure"
+        elif latest_outcome in CONCLUSIVE_VERIFICATION_FINDING_RECHECK_OUTCOMES:
+            reason = f"latest canonical recheck is conclusive ({latest_outcome})"
+        if reason:
+            excluded.append({"finding_id": finding_id, "chunk_id": chunk_id, "reason": reason})
+            continue
+        grouped.setdefault(chunk_id, []).append(finding)
+
+    candidates = []
+    for chunk_id, chunk_findings in sorted(grouped.items(), key=lambda item: _chunk_index_from_chunk_id(item[0])):
+        scripts = []
+        linked_issue_ids: set[str] = set()
+        targets = []
+        counterexample_count = 0
+        unavailable_reasons = []
+        for finding in chunk_findings:
+            script_name = str(finding.get("script_name") or "").strip()
+            script_path = _resolve_verification_script_path(session, finding.get("script_path") or script_name)
+            if script_path is None:
+                unavailable_reasons.append(f"missing script {script_name or '(unnamed)'}")
+            scripts.append(
+                {
+                    "script_name": script_name,
+                    "script_path": _relative_audit_path(session, script_path or finding.get("script_path")),
+                    "available": script_path is not None,
+                }
+            )
+            linked_issue_ids.update(str(item) for item in (finding.get("linked_issue_ids") or []) if str(item).strip())
+            linked_issue_ids.update(str(item) for item in (finding.get("matched_issue_ids") or []) if str(item).strip())
+            if finding.get("target"):
+                targets.append(finding.get("target"))
+            counterexample_count += len(finding.get("counterexamples") or []) + len(finding.get("failed_cases") or [])
+        if chunk_id not in chunk_ids:
+            unavailable_reasons.append(f"missing canonical chunk {chunk_id or '(unknown)'}")
+        finding_ids = [str(item.get("finding_id") or "") for item in chunk_findings]
+        candidates.append(
+            {
+                "candidate_id": f"verification_finding_recheck:{chunk_id or 'unknown'}",
+                "workflow": "verification_finding_recheck",
+                "chunk_id": chunk_id,
+                "finding_ids": finding_ids,
+                "finding_count": len(finding_ids),
+                "scripts": scripts,
+                "linked_issue_ids": sorted(linked_issue_ids),
+                "targets": targets,
+                "mathematical_outcomes": sorted({str(item.get("mathematical_outcome") or "") for item in chunk_findings}),
+                "counterexample_count": counterexample_count,
+                "latest_recheck_status": "inconclusive" if any(
+                    str(((latest_map.get(finding_id) or {}).get("structured_result") or {}).get("recheck_outcome") or "") == "inconclusive"
+                    for finding_id in finding_ids
+                ) else "not_rechecked",
+                "eligible": not unavailable_reasons,
+                "availability_issues": unavailable_reasons,
+                "eligibility_reason": (
+                    "active counterexample/claim-failure finding requires an evidence-rich issue-level recheck"
+                    if not unavailable_reasons
+                    else "candidate is visible but unavailable: " + "; ".join(unavailable_reasons)
+                ),
+            }
+        )
+    eligible = [item for item in candidates if item.get("eligible")]
+    return {
+        "workflow": "verification_finding_recheck",
+        "candidates": candidates,
+        "excluded_findings": excluded,
+        "summary": {
+            "candidate_chunk_count": len(candidates),
+            "eligible_chunk_count": len(eligible),
+            "eligible_finding_count": sum(int(item.get("finding_count") or 0) for item in eligible),
+            "unavailable_chunk_count": len(candidates) - len(eligible),
+        },
+    }
+
+
+def build_verification_finding_recheck_evidence(
+    session: dict[str, Any],
+    candidate: dict[str, Any],
+    max_context_chars: int = 12000,
+) -> dict[str, Any]:
+    chunk_id = str(candidate.get("chunk_id") or "").strip()
+    finding_ids = {str(item).strip() for item in candidate.get("finding_ids") or [] if str(item).strip()}
+    findings = [
+        item
+        for item in verification_findings_for_session(session)
+        if str(item.get("finding_id") or "") in finding_ids
+    ]
+    manifest = load_manifest(session)
+    chunks = [item for item in manifest.get("chunks") or [] if isinstance(item, dict)]
+    chunk_position = next((index for index, item in enumerate(chunks) if str(item.get("chunk_id") or "") == chunk_id), -1)
+    if chunk_position < 0:
+        raise ValueError(f"Canonical chunk {chunk_id!r} is not available.")
+    chunk = dict(chunks[chunk_position])
+    chunk_text = str(chunk.get("chunk_text") or "")
+    records = [item for item in _read_chunk_records_for_verification(session) if str(item.get("chunk_id") or "") == chunk_id]
+    chunk_record = dict(records[-1]) if records else {}
+
+    structured_response = None
+    structured_path_value = chunk_record.get("structured_response_path")
+    structured_candidates = []
+    if structured_path_value:
+        structured_candidates.append(Path(str(structured_path_value)))
+        structured_candidates.append(Path(session["workdir"]) / str(structured_path_value))
+    structured_candidates.append(Path(session["workdir"]) / "responses" / f"{chunk_id}.structured.json")
+    for path in structured_candidates:
+        if path.exists():
+            try:
+                structured_response = load_json(path)
+                break
+            except Exception:
+                continue
+
+    results = {
+        str(item.get("script_name") or ""): item
+        for item in _load_verification_results(session)
+        if str(item.get("chunk_id") or "") == chunk_id
+    }
+    verification_evidence = []
+    evidence_hashes = {"chunk_text_sha256": hashlib.sha256(chunk_text.encode("utf-8")).hexdigest(), "scripts": {}, "results": {}}
+    for finding in findings:
+        script_name = str(finding.get("script_name") or "").strip()
+        script_path = _resolve_verification_script_path(session, finding.get("script_path") or script_name)
+        if script_path is None:
+            raise FileNotFoundError(f"Verification script is unavailable: {script_name}")
+        script_text = script_path.read_text(encoding="utf-8")
+        result = dict(results.get(script_name) or {})
+        if not result:
+            result_path_value = str(finding.get("result_path") or "").strip()
+            result_path = Path(result_path_value) if result_path_value else None
+            if result_path is not None and result_path.is_file():
+                result = load_json(result_path)
+        stdout = str(result.get("stdout") or "")
+        stderr = str(result.get("stderr") or "")
+        structured_result = result.get("structured_result") if isinstance(result.get("structured_result"), dict) else {}
+        counterexamples = list(result.get("counterexamples") or finding.get("counterexamples") or [])
+        failed_cases = list(result.get("failed_cases") or finding.get("failed_cases") or [])
+        sentinel_lines = [
+            line for line in str(result.get("stdout") or "").splitlines()
+            if line.strip().startswith(VERIFICATION_RESULT_SENTINEL)
+        ]
+        verification_evidence.append(
+            {
+                "finding_id": finding.get("finding_id"),
+                "script_name": script_name,
+                "script_path": _relative_audit_path(session, script_path),
+                "complete_python_script": script_text,
+                "purpose": result.get("purpose"),
+                "description": result.get("description"),
+                "expected_outcome": result.get("expected_outcome"),
+                "execution_status": result.get("execution_status"),
+                "mathematical_outcome": result.get("mathematical_outcome"),
+                "outcome_source": result.get("outcome_source"),
+                "returncode": result.get("returncode"),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "python_executable": result.get("python_executable"),
+                "safe_only": result.get("safe_only"),
+                "tested_range": result.get("tested_range"),
+                "target": result.get("target") or finding.get("target") or {},
+                "linked_issue_ids": sorted(set(result.get("linked_issue_ids") or []) | set(finding.get("matched_issue_ids") or [])),
+                "structured_result_sentinel_lines": sentinel_lines,
+                "complete_structured_result": structured_result,
+                "complete_counterexamples": counterexamples,
+                "complete_failed_cases": failed_cases,
+                "counterexample_summaries": [
+                    _verification_counterexample_summary(item, script_text)
+                    for item in counterexamples
+                    if isinstance(item, dict)
+                ],
+                "stdout": stdout,
+                "stdout_truncated": False,
+                "stdout_original_chars": len(stdout),
+                "stderr": stderr,
+                "stderr_truncated": False,
+                "stderr_original_chars": len(stderr),
+                "result_path": _relative_audit_path(session, result.get("result_path") or finding.get("result_path")),
+            }
+        )
+        evidence_hashes["scripts"][script_name] = hashlib.sha256(script_text.encode("utf-8")).hexdigest()
+        evidence_hashes["results"][script_name] = hashlib.sha256(
+            json.dumps(result, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+
+    issues = [item for item in (load_issues(session).get("issues") or []) if isinstance(item, dict)]
+    linked_ids = {
+        str(issue_id)
+        for finding in findings
+        for issue_id in (finding.get("linked_issue_ids") or []) + (finding.get("matched_issue_ids") or [])
+        if str(issue_id).strip()
+    }
+    current_issues = [
+        item for item in issues
+        if str(item.get("chunk_id") or "") == chunk_id or str(item.get("issue_id") or "") in linked_ids
+    ]
+
+    reference_labels = []
+    reference_path = Path(session["workdir"]) / "state" / "reference_map.json"
+    if reference_path.exists():
+        try:
+            reference_state = load_json(reference_path)
+        except Exception:
+            reference_state = {}
+        label_map = reference_state.get("label_map") if isinstance(reference_state, dict) else {}
+        if isinstance(label_map, dict):
+            targets_text = " ".join(
+                str((finding.get("target") or {}).get("label") or (finding.get("target") or {}).get("name") or "")
+                for finding in findings
+                if isinstance(finding.get("target"), dict)
+            )
+            for source_label, info in label_map.items():
+                info_dict = dict(info) if isinstance(info, dict) else {"printed_label": info}
+                printed = str(info_dict.get("printed_label") or info_dict.get("number") or "")
+                if str(source_label) in chunk_text or str(source_label) in targets_text or (printed and printed in targets_text):
+                    reference_labels.append({"source_label": source_label, **info_dict})
+
+    neighbors = []
+    for index in (chunk_position - 1, chunk_position + 1):
+        if 0 <= index < len(chunks):
+            neighbor = chunks[index]
+            neighbor_text = str(neighbor.get("chunk_text") or "")
+            excerpt = _bounded_verification_output(neighbor_text, limit=max(1500, int(max_context_chars) // 4))
+            neighbors.append(
+                {
+                    "chunk_id": neighbor.get("chunk_id"),
+                    "label": neighbor.get("display_label") or neighbor.get("label"),
+                    "boundary": neighbor.get("boundary"),
+                    "page_start": neighbor.get("page_start"),
+                    "page_end": neighbor.get("page_end"),
+                    "text_excerpt": excerpt["text"],
+                    "excerpt_truncated": excerpt["truncated"],
+                }
+            )
+    ledger = load_ledger(session)
+    ledger_text = json.dumps(ledger, ensure_ascii=False, sort_keys=True, default=str)
+    ledger_excerpt = _bounded_verification_output(ledger_text, limit=max(2000, int(max_context_chars) // 2))
+
+    return {
+        "schema_version": 1,
+        "workflow": "verification_finding_recheck",
+        "candidate": candidate,
+        "manuscript": {
+            "chunk_id": chunk_id,
+            "chunk_index": chunk.get("chunk_index"),
+            "title": chunk.get("display_label") or chunk.get("label"),
+            "label": chunk.get("label"),
+            "boundary": chunk.get("boundary"),
+            "page_start": chunk.get("page_start"),
+            "page_end": chunk.get("page_end"),
+            "source_kind": chunk.get("source_kind"),
+            "source_label": chunk.get("source_label"),
+            "printed_label": chunk.get("printed_label"),
+            "complete_canonical_chunk_text": chunk_text,
+            "chunk_record": chunk_record,
+            "original_structured_chunk_audit_response": structured_response,
+            "current_canonical_issues": current_issues,
+            "relevant_reference_labels": reference_labels,
+            "neighboring_context": neighbors,
+            "global_ledger_context": ledger_excerpt["text"],
+            "global_ledger_context_truncated": ledger_excerpt["truncated"],
+        },
+        "verification_findings": findings,
+        "verification_evidence": verification_evidence,
+        "input_evidence_hashes": evidence_hashes,
+        "evidence_policy": {
+            "complete_chunk_included": True,
+            "complete_scripts_included": True,
+            "complete_structured_counterexamples_included": True,
+            "complete_stdout_stderr_included": True,
+            "large_output_policy": "execution stdout/stderr are complete; only ancillary neighbor and ledger context is bounded",
+        },
+    }
+
+
+def build_verification_finding_recheck_prompt(evidence: dict[str, Any]) -> str:
+    parts = [
+        "Verification-finding recheck task",
+        (
+            "Review the supplied manuscript chunk and verification evidence as a focused reconciliation task. "
+            "Do not redo the whole audit and do not replace the original chunk findings. The original verification "
+            "finding is deterministic evidence that must remain visible unless later verification supersedes it."
+        ),
+        (
+            "Determine whether each negative result is a genuine counterexample/claim failure, a generated-script "
+            "error, a theorem-scope or hypothesis mismatch, a notation/interpretation mismatch, or inconclusive. "
+            "Do not discard a counterexample merely because the Python process returned exit code zero."
+        ),
+        "Answer all of these questions in the structured response:",
+        "1. Does each script compute the intended mathematical quantity?",
+        "2. Does it implement the theorem or claim as stated?",
+        "3. Does each candidate input satisfy every hypothesis?",
+        "4. Are the exact arithmetic, factorization, and derived quantities correct?",
+        "5. Does the observed result truly contradict the claim?",
+        "6. Is there a scope, indexing, normalization, or notation mismatch?",
+        "7. Is the problem in the theorem, proof, script, or interpretation?",
+        "8. Which current issue should be strengthened or linked?",
+        "9. Is a new verification-derived issue needed?",
+        "10. Which downstream results depend on the contradicted claim?",
+        "11. Would an independently implemented second check be useful?",
+    ]
+    for item in evidence.get("verification_evidence") or []:
+        if not isinstance(item, dict):
+            continue
+        script_name = str(item.get("script_name") or "verification script")
+        parts.extend(
+            [
+                f"Complete Python script: {script_name}",
+                "```python\n" + str(item.get("complete_python_script") or "") + "\n```",
+                f"Exact stdout for {script_name}",
+                "```text\n" + str(item.get("stdout") or "") + "\n```",
+                f"Exact stderr for {script_name}",
+                "```text\n" + str(item.get("stderr") or "") + "\n```",
+                f"Complete structured counterexample/result data for {script_name}",
+                json.dumps(
+                    {
+                        "structured_result": item.get("complete_structured_result") or {},
+                        "counterexamples": item.get("complete_counterexamples") or [],
+                        "failed_cases": item.get("complete_failed_cases") or [],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                ),
+            ]
+        )
+    parts.extend(
+        [
+            "Complete evidence package (JSON):",
+            json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True, default=str),
+        ]
+    )
+    return "\n\n".join(parts).strip() + "\n"
+
+
 def verification_findings_for_session(
     session: dict[str, Any],
     results: Optional[list[dict[str, Any]]] = None,
@@ -927,7 +1686,7 @@ def verification_findings_for_session(
         if finding is not None
     ]
     findings.sort(key=lambda item: (_chunk_index_from_chunk_id(str(item.get("chunk_id") or "")), str(item.get("script_name") or "")))
-    return findings
+    return apply_verification_finding_rechecks(session, findings)
 
 
 def _persist_verification_findings(
@@ -1344,6 +2103,9 @@ __all__ = [
     "VERIFICATION_MATHEMATICAL_OUTCOMES",
     "NEGATIVE_VERIFICATION_OUTCOMES",
     "TECHNICAL_VERIFICATION_FAILURE_STATUSES",
+    "VERIFICATION_FINDING_RECHECK_OUTCOMES",
+    "CONCLUSIVE_VERIFICATION_FINDING_RECHECK_OUTCOMES",
+    "VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA",
     "load_verification_state",
     "save_verification_state",
     "_verification_results_path",
@@ -1364,6 +2126,16 @@ __all__ = [
     "_normalize_verification_result",
     "_verification_summary_counts",
     "verification_findings_for_session",
+    "append_verification_finding_recheck_event",
+    "verification_finding_rechecks_for_session",
+    "verification_finding_recheck_map",
+    "apply_verification_finding_rechecks",
+    "verification_finding_recheck_summary",
+    "verification_finding_recheck_schema_errors",
+    "validate_verification_finding_recheck_response",
+    "verification_finding_recheck_candidates",
+    "build_verification_finding_recheck_evidence",
+    "build_verification_finding_recheck_prompt",
     "supersede_verification_findings_for_chunks",
     "verification_result_needs_technical_retry",
     "_load_verification_results",

@@ -58,6 +58,7 @@ from audit_state import (
 from audit_verification import (
     NEGATIVE_VERIFICATION_OUTCOMES,
     TECHNICAL_VERIFICATION_FAILURE_STATUSES,
+    VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA,
     _chunk_id_from_script_name,
     _chunk_index_from_chunk_id,
     _collect_verification_scripts,
@@ -65,10 +66,18 @@ from audit_verification import (
     _truncate_text,
     _normalize_verification_result,
     _verification_summary_counts,
+    append_verification_finding_recheck_event,
+    build_verification_finding_recheck_evidence,
+    build_verification_finding_recheck_prompt,
     load_verification_state,
     run_verification_suite,
     save_verification_state,
     supersede_verification_findings_for_chunks,
+    validate_verification_finding_recheck_response,
+    verification_finding_recheck_candidates,
+    verification_finding_recheck_map,
+    verification_finding_recheck_summary,
+    verification_finding_rechecks_for_session,
     verification_findings_for_session,
     verification_result_needs_technical_retry,
 )
@@ -1172,6 +1181,11 @@ def _report_freshness_sources(session: dict[str, Any], kind: str) -> list[dict[s
                     paths["verification_state"],
                 ),
                 (
+                    "verification-finding recheck state",
+                    _jsonl_event_timestamp(paths["verification_finding_rechecks"]),
+                    paths["verification_finding_rechecks"],
+                ),
+                (
                     "selected chunk rerun log",
                     _jsonl_event_timestamp(root / "logs" / "selected_chunk_reruns.jsonl"),
                     root / "logs" / "selected_chunk_reruns.jsonl",
@@ -1200,6 +1214,11 @@ def _report_freshness_sources(session: dict[str, Any], kind: str) -> list[dict[s
                     "verification state",
                     _verification_content_timestamp(session),
                     paths["verification_state"],
+                ),
+                (
+                    "verification-finding recheck state",
+                    _jsonl_event_timestamp(paths["verification_finding_rechecks"]),
+                    paths["verification_finding_rechecks"],
                 ),
                 (
                     "selected chunk rerun log",
@@ -1364,6 +1383,8 @@ def get_audit_status(
     if not status.get("last_chunk_usage_diagnostics"):
         for entry in reversed(usage.get("per_chunk", []) or []):
             if not isinstance(entry, dict) or not entry.get("usage"):
+                continue
+            if str(entry.get("activity_kind") or "audit_chunk") != "audit_chunk":
                 continue
             diagnostics = entry.get("usage_diagnostics") or usage_cache_diagnostics(entry.get("usage") or {})
             status["last_chunk_usage_diagnostics"] = {
@@ -2765,6 +2786,403 @@ def rerun_failed_verification_chunks(
     return result
 
 
+def _normalize_verification_finding_recheck_selection(selection: Any) -> set[str]:
+    if selection is None:
+        return set()
+    if isinstance(selection, str):
+        raw_items = re.split(r"[,\s]+", selection.strip()) if selection.strip() else []
+    elif isinstance(selection, (list, tuple, set)):
+        raw_items = [str(item) for item in selection]
+    else:
+        raw_items = [str(selection)]
+    normalized = set()
+    for raw in raw_items:
+        clean = str(raw or "").strip()
+        if not clean:
+            continue
+        if clean.isdigit():
+            clean = f"chunk_{int(clean):03d}"
+        normalized.add(clean)
+    return normalized
+
+
+def _select_verification_finding_recheck_candidates(
+    session: dict[str, Any],
+    selection: Any = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    inventory = verification_finding_recheck_candidates(session)
+    candidates = [item for item in inventory.get("candidates") or [] if item.get("eligible")]
+    requested = _normalize_verification_finding_recheck_selection(selection)
+    if requested:
+        candidates = [
+            item for item in candidates
+            if str(item.get("chunk_id") or "") in requested
+            or requested.intersection({str(finding_id) for finding_id in item.get("finding_ids") or []})
+        ]
+        matched = {
+            requested_id
+            for requested_id in requested
+            if any(
+                requested_id == str(item.get("chunk_id") or "")
+                or requested_id in {str(finding_id) for finding_id in item.get("finding_ids") or []}
+                for item in candidates
+            )
+        }
+        unmatched = sorted(requested - matched)
+        if unmatched:
+            raise ValueError(
+                "No eligible verification-finding recheck candidate matched: " + ", ".join(unmatched)
+            )
+    if not candidates:
+        raise RuntimeError("No active counterexample or claim-failure findings are eligible for recheck.")
+    return inventory, candidates
+
+
+def resolve_verification_finding_recheck_settings(
+    session: dict[str, Any],
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+) -> tuple[str, str]:
+    selected_model = model if model is not None else session.get("model") or DEFAULT_MODEL
+    selected_effort = reasoning_effort if reasoning_effort is not None else session.get("reasoning_effort")
+    return normalize_model_and_reasoning_effort(selected_model, selected_effort)
+
+
+def prepare_verification_finding_recheck_preview(
+    session_or_pdf: dict[str, Any] | str | Path,
+    selection: Any = None,
+    output_dir: Optional[str | Path] = None,
+    max_context_chars: int = 12000,
+) -> dict[str, Any]:
+    session = _resolve_session(session_or_pdf)
+    inventory, candidates = _select_verification_finding_recheck_candidates(session, selection)
+    model, reasoning_effort = resolve_verification_finding_recheck_settings(session)
+    output_root: Optional[Path] = None
+    if output_dir is not None:
+        output_root = Path(output_dir).expanduser().resolve()
+        workdir = Path(session["workdir"]).resolve()
+        try:
+            output_root.relative_to(workdir)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Preview output directory must be outside the source audit workdir.")
+        output_root.mkdir(parents=True, exist_ok=True)
+
+    previews = []
+    for candidate in candidates:
+        evidence = build_verification_finding_recheck_evidence(
+            session,
+            candidate,
+            max_context_chars=max_context_chars,
+        )
+        prompt = build_verification_finding_recheck_prompt(evidence)
+        artifacts: dict[str, str] = {}
+        if output_root is not None:
+            chunk_id = str(candidate.get("chunk_id") or "candidate")
+            evidence_path = output_root / f"{chunk_id}.evidence.json"
+            prompt_path = output_root / f"{chunk_id}.prompt.txt"
+            save_json(evidence_path, evidence)
+            prompt_path.write_text(prompt, encoding="utf-8")
+            artifacts = {"evidence": str(evidence_path), "prompt": str(prompt_path)}
+        previews.append(
+            {
+                "candidate": candidate,
+                "evidence": evidence,
+                "prompt": prompt,
+                "artifacts": artifacts,
+            }
+        )
+    manifest = {
+        "schema_version": 1,
+        "workflow": "verification_finding_recheck",
+        "dry_run": True,
+        "generated_at": utc_now(),
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "candidate_count": len(previews),
+        "selection": sorted(_normalize_verification_finding_recheck_selection(selection)),
+    }
+    if output_root is not None:
+        manifest_path = output_root / "verification_finding_recheck_preview_manifest.json"
+        save_json(manifest_path, manifest)
+        manifest["path"] = str(manifest_path)
+    return {"manifest": manifest, "inventory": inventory, "previews": previews}
+
+
+def _extract_verification_finding_recheck_response(resp: Any) -> dict[str, Any]:
+    parsed = getattr(resp, "output_parsed", None)
+    if isinstance(parsed, dict):
+        return validate_verification_finding_recheck_response(parsed)
+    raw_text = str(getattr(resp, "output_text", None) or "").strip()
+    if not raw_text:
+        raw = to_jsonable(resp)
+        for item in raw.get("output", []) or []:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for content in item.get("content", []) or []:
+                if isinstance(content, dict) and content.get("type") == "output_text":
+                    raw_text = str(content.get("text") or "").strip()
+                    if raw_text:
+                        break
+            if raw_text:
+                break
+    if not raw_text:
+        raise ValueError("Could not locate structured verification-finding recheck output.")
+    return validate_verification_finding_recheck_response(extract_json_object(raw_text))
+
+
+def run_verification_finding_rechecks(
+    session_or_pdf: dict[str, Any] | str | Path,
+    selection: Any = None,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    rebuild_reports: bool = True,
+    max_context_chars: int = 12000,
+    poll_every: float = 2.0,
+    max_wait_seconds: Optional[float] = None,
+) -> dict[str, Any]:
+    session = _resolve_session(session_or_pdf)
+    status = load_status(session)
+    if session.get("pending"):
+        raise RuntimeError("Cannot recheck verification findings while the audit has a pending response.")
+    if str(status.get("status") or "").strip().lower() not in {"completed", "paused"}:
+        raise RuntimeError("Verification-finding rechecks are available only for completed or paused audits.")
+    inventory, candidates = _select_verification_finding_recheck_candidates(session, selection)
+    selected_model, selected_effort = resolve_verification_finding_recheck_settings(
+        session,
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
+    root = Path(session["workdir"])
+    rechecks_root = root / "verification_finding_rechecks"
+    rechecks_root.mkdir(parents=True, exist_ok=True)
+    log_path = root / "logs" / "verification_finding_rechecks.jsonl"
+    client = _get_client()
+    outcomes = []
+    completed_count = 0
+
+    for candidate in candidates:
+        chunk_id = str(candidate.get("chunk_id") or "unknown")
+        recheck_id = f"verification_recheck_{_artifact_timestamp_token()}_{chunk_id}"
+        artifact_root = rechecks_root / recheck_id
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        evidence = build_verification_finding_recheck_evidence(
+            session,
+            candidate,
+            max_context_chars=max_context_chars,
+        )
+        prompt = build_verification_finding_recheck_prompt(evidence)
+        evidence_path = artifact_root / "evidence.json"
+        prompt_path = artifact_root / "prompt.txt"
+        request_path = artifact_root / "request.json"
+        raw_response_path = artifact_root / "raw_response.json"
+        raw_text_path = artifact_root / "raw_response.txt"
+        result_path = artifact_root / "result.json"
+        save_json(evidence_path, evidence)
+        prompt_path.write_text(prompt, encoding="utf-8")
+        finding_ids = [str(item) for item in candidate.get("finding_ids") or []]
+        prior_map = verification_finding_recheck_map(session)
+        supersedes = sorted(
+            {
+                str(prior_map[finding_id].get("recheck_id") or "")
+                for finding_id in finding_ids
+                if finding_id in prior_map and prior_map[finding_id].get("recheck_id")
+            }
+        )
+        request_input = [
+            {
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "You are performing a focused mathematical verification-finding recheck. "
+                            "Use only the supplied manuscript and verification evidence, preserve the original finding, "
+                            "and return the required structured assessment."
+                        ),
+                    }
+                ],
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+        ]
+        request_kwargs = {
+            "model": selected_model,
+            "reasoning": {"effort": selected_effort},
+            "input": request_input,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "verification_finding_recheck",
+                    "strict": True,
+                    "schema": VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA,
+                }
+            },
+            "background": bool(session.get("background", True)),
+            "store": bool(session.get("store", True)),
+        }
+        save_json(
+            request_path,
+            {
+                "time": utc_now(),
+                "workflow": "verification_finding_recheck",
+                "recheck_id": recheck_id,
+                "chunk_id": chunk_id,
+                "finding_ids": finding_ids,
+                "request": request_kwargs,
+            },
+        )
+        started = append_verification_finding_recheck_event(
+            session,
+            {
+                "event": "started",
+                "status": "started",
+                "recheck_id": recheck_id,
+                "finding_ids": finding_ids,
+                "chunk_id": chunk_id,
+                "model": selected_model,
+                "reasoning_effort": selected_effort,
+                "artifact_root": str(artifact_root.relative_to(root)),
+                "request_path": str(request_path.relative_to(root)),
+                "input_evidence_hashes": evidence.get("input_evidence_hashes") or {},
+                "supersedes_recheck_ids": supersedes,
+            },
+        )
+        append_jsonl(log_path, started)
+        response_id = None
+        usage_info: dict[str, Any] = {}
+        started_monotonic = time.time()
+        try:
+            resp = client.responses.create(**request_kwargs)
+            response_id = getattr(resp, "id", None)
+            if getattr(resp, "status", None) in WORKING_STATUSES:
+                resp = wait_for_response(
+                    resp.id,
+                    poll_every=poll_every,
+                    max_wait_seconds=max_wait_seconds,
+                )
+            elapsed_seconds = max(0.0, time.time() - started_monotonic)
+            save_json(raw_response_path, to_jsonable(resp))
+            raw_text = str(getattr(resp, "output_text", None) or "")
+            if raw_text:
+                raw_text_path.write_text(raw_text, encoding="utf-8")
+            usage_obj = to_jsonable(getattr(resp, "usage", {}) or {})
+            if not isinstance(usage_obj, dict):
+                usage_obj = {}
+            usage_info = update_usage_from_usage_obj(
+                session,
+                chunk_id,
+                usage_obj,
+                model=selected_model,
+                elapsed_seconds=elapsed_seconds,
+                activity_kind="verification_finding_recheck",
+                activity_id=recheck_id,
+            )
+            if getattr(resp, "status", None) != "completed":
+                raise RuntimeError(
+                    f"Verification-finding recheck response ended with status={getattr(resp, 'status', None)!r}."
+                )
+            structured_result = _extract_verification_finding_recheck_response(resp)
+            if set(structured_result.get("finding_ids") or []) != set(finding_ids):
+                raise ValueError("Recheck response finding_ids do not match the requested evidence package.")
+            if str(structured_result.get("chunk_id") or "") != chunk_id:
+                raise ValueError("Recheck response chunk_id does not match the requested evidence package.")
+            save_json(result_path, structured_result)
+            completed_event = append_verification_finding_recheck_event(
+                session,
+                {
+                    "event": "completed",
+                    "status": "completed",
+                    "recheck_id": recheck_id,
+                    "finding_ids": finding_ids,
+                    "chunk_id": chunk_id,
+                    "model": selected_model,
+                    "reasoning_effort": selected_effort,
+                    "response_id": response_id,
+                    "request_path": str(request_path.relative_to(root)),
+                    "response_path": str(raw_response_path.relative_to(root)),
+                    "result_path": str(result_path.relative_to(root)),
+                    "artifact_root": str(artifact_root.relative_to(root)),
+                    "input_evidence_hashes": evidence.get("input_evidence_hashes") or {},
+                    "structured_result": structured_result,
+                    "usage": usage_info.get("usage") or {},
+                    "cost": usage_info.get("cost") or {},
+                    "runtime_seconds": elapsed_seconds,
+                    "supersedes_recheck_ids": supersedes,
+                    "provisional": True,
+                    "canonical": True,
+                },
+            )
+            append_jsonl(log_path, completed_event)
+            outcomes.append(completed_event)
+            completed_count += 1
+        except Exception as exc:
+            failed_elapsed_seconds = max(0.0, time.time() - started_monotonic)
+            failed_event = append_verification_finding_recheck_event(
+                session,
+                {
+                    "event": "failed",
+                    "status": "failed",
+                    "recheck_id": recheck_id,
+                    "finding_ids": finding_ids,
+                    "chunk_id": chunk_id,
+                    "model": selected_model,
+                    "reasoning_effort": selected_effort,
+                    "response_id": response_id,
+                    "artifact_root": str(artifact_root.relative_to(root)),
+                    "request_path": str(request_path.relative_to(root)),
+                    "response_path": str(raw_response_path.relative_to(root)) if raw_response_path.exists() else None,
+                    "input_evidence_hashes": evidence.get("input_evidence_hashes") or {},
+                    "usage": usage_info.get("usage") or {},
+                    "cost": usage_info.get("cost") or {},
+                    "runtime_seconds": failed_elapsed_seconds,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "supersedes_recheck_ids": supersedes,
+                    "canonical": False,
+                },
+            )
+            append_jsonl(log_path, failed_event)
+            outcomes.append(failed_event)
+
+    report_paths: dict[str, Any] = {}
+    report_warnings = []
+    if rebuild_reports and completed_count:
+        try:
+            report_paths["verification"] = build_verification_report(session)
+        except Exception as exc:
+            report_warnings.append(f"Verification report rebuild failed: {type(exc).__name__}: {exc}")
+        if _FINAL_REPORT_BUILDER_HOOK is not None:
+            try:
+                report_paths["full"] = build_final_report(
+                    session,
+                    write_separate_verification_report=False,
+                )
+            except Exception as exc:
+                report_warnings.append(f"Full report rebuild failed: {type(exc).__name__}: {exc}")
+        try:
+            report_paths["concise"] = build_concise_report(session)
+        except Exception as exc:
+            report_warnings.append(f"Concise report rebuild failed: {type(exc).__name__}: {exc}")
+
+    return {
+        "workflow": "verification_finding_recheck",
+        "session": load_session_from_pdf(session["pdf_path"]) or session,
+        "status": load_status(session),
+        "usage": load_usage(session),
+        "model": selected_model,
+        "reasoning_effort": selected_effort,
+        "candidate_inventory": inventory,
+        "selected_candidates": candidates,
+        "rechecks": outcomes,
+        "completed_count": completed_count,
+        "failed_count": len(outcomes) - completed_count,
+        "report_paths": report_paths,
+        "report_generation_warnings": report_warnings,
+        "recheck_state_path": str(session_paths(session["workdir"])["verification_finding_rechecks"]),
+        "log_path": str(log_path),
+    }
+
+
 def build_final_report(
     session_or_pdf: dict[str, Any] | str | Path,
     report_title: Optional[str] = None,
@@ -2876,14 +3294,67 @@ def _verification_outcome_display(outcome: Any) -> str:
     return labels.get(clean, clean.replace("_", " ").title())
 
 
+def _verification_finding_recheck_outcome_display(outcome: Any) -> str:
+    labels = {
+        "counterexample_confirmed": "COUNTEREXAMPLE CONFIRMED",
+        "claim_failure_confirmed": "CLAIM FAILURE CONFIRMED",
+        "script_error": "SCRIPT ERROR SUSPECTED",
+        "scope_or_hypothesis_mismatch": "SCOPE OR HYPOTHESIS MISMATCH",
+        "notation_or_interpretation_mismatch": "NOTATION OR INTERPRETATION MISMATCH",
+        "inconclusive": "INCONCLUSIVE",
+    }
+    clean = str(outcome or "").strip().lower()
+    return labels.get(clean, clean.replace("_", " ").upper() or "NOT RECHECKED")
+
+
+def _verification_finding_recheck_markdown_lines(finding: dict[str, Any]) -> list[str]:
+    latest = finding.get("latest_recheck") if isinstance(finding.get("latest_recheck"), dict) else None
+    if latest is None:
+        return []
+    result = latest.get("structured_result") if isinstance(latest.get("structured_result"), dict) else {}
+    outcome = str(result.get("recheck_outcome") or "")
+    assessment = result.get("mathematical_assessment") if isinstance(result.get("mathematical_assessment"), dict) else {}
+    proposed = result.get("proposed_issue") if isinstance(result.get("proposed_issue"), dict) else {}
+    state = str(finding.get("recheck_state") or "not_rechecked")
+    status_text = {
+        "confirmed": "recheck-confirmed; still provisional pending human mathematical review",
+        "challenged": "unresolved; original finding preserved and human review required",
+        "inconclusive": "unresolved; original finding remains active",
+    }.get(state, "provisional")
+    lines = [
+        f"- Chunk recheck: {_verification_finding_recheck_outcome_display(outcome)}",
+        f"- Recheck status: {status_text}",
+        f"- Recheck explanation: {normalize_math_delimiters(str(assessment.get('explanation') or result.get('summary') or ''))}",
+        f"- Recommended severity: {result.get('recommended_severity') or 'not specified'}",
+        f"- Recheck linked issues: {', '.join(result.get('linked_issue_ids') or []) or 'none'}",
+    ]
+    if str(proposed.get("title") or "").strip():
+        lines.append(f"- Proposed verification-derived issue: {normalize_math_delimiters(str(proposed.get('title')))}")
+    if result.get("downstream_dependencies"):
+        lines.append(
+            "- Downstream dependencies: "
+            + normalize_math_delimiters("; ".join(str(item) for item in result.get("downstream_dependencies") or []))
+        )
+    lines.append(
+        "- Human review required: " + ("yes" if result.get("needs_human_review", True) else "recommended")
+    )
+    return lines
+
+
 def _verification_findings_markdown(findings: list[dict[str, Any]]) -> str:
     if not findings:
         return ""
     lines = ["## Verification findings requiring attention", ""]
     for finding in findings:
+        state = str(finding.get("recheck_state") or "not_rechecked")
+        qualifier = {
+            "confirmed": "high-priority, recheck-confirmed, provisional",
+            "challenged": "high-priority, challenged, provisional",
+            "inconclusive": "high-priority, recheck-inconclusive, provisional",
+        }.get(state, "high-priority, provisional")
         lines.extend(
             [
-                f"### {finding.get('finding_id')} — {normalize_math_delimiters(str(finding.get('title') or 'Verification finding'))} [high-priority, provisional]",
+                f"### {finding.get('finding_id')} — {normalize_math_delimiters(str(finding.get('title') or 'Verification finding'))} [{qualifier}]",
                 f"- Script: `{finding.get('script_name')}`",
                 f"- Chunk: {finding.get('chunk_id') or 'unknown'}",
                 f"- Location/target: {normalize_math_delimiters(str(finding.get('location') or 'unknown'))}",
@@ -2894,9 +3365,10 @@ def _verification_findings_markdown(findings: list[dict[str, Any]]) -> str:
                 f"- Evidence: {normalize_math_delimiters(str(finding.get('evidence') or ''))}",
                 f"- Matched audit issues: {', '.join(finding.get('matched_issue_ids') or []) or 'none'}",
                 f"- Recommended action: {normalize_math_delimiters(str(finding.get('recommended_action') or 'Human review required.'))}",
-                "",
             ]
         )
+        lines.extend(_verification_finding_recheck_markdown_lines(finding))
+        lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -2905,8 +3377,14 @@ def _verification_findings_tex(findings: list[dict[str, Any]]) -> str:
         return ""
     parts = [r"\section*{Verification findings requiring attention}" + "\n"]
     for finding in findings:
+        state = str(finding.get("recheck_state") or "not_rechecked")
+        qualifier = {
+            "confirmed": "high-priority, recheck-confirmed, provisional",
+            "challenged": "high-priority, challenged, provisional",
+            "inconclusive": "high-priority, recheck-inconclusive, provisional",
+        }.get(state, "high-priority, provisional")
         heading = report_latex_paragraph(
-            f"{finding.get('finding_id')} -- {finding.get('title') or 'Verification finding'} [high-priority, provisional]"
+            f"{finding.get('finding_id')} -- {finding.get('title') or 'Verification finding'} [{qualifier}]"
         )
         parts.append(r"\subsection*{" + heading + "}" + "\n")
         parts.append(r"\begin{itemize}" + "\n")
@@ -2929,6 +3407,30 @@ def _verification_findings_tex(findings: list[dict[str, Any]]) -> str:
         ]
         for label, value in items:
             parts.append(r"\item " + report_latex_paragraph(f"{label}: {value}") + "\n")
+        latest = finding.get("latest_recheck") if isinstance(finding.get("latest_recheck"), dict) else None
+        if latest is not None:
+            result = latest.get("structured_result") if isinstance(latest.get("structured_result"), dict) else {}
+            assessment = result.get("mathematical_assessment") if isinstance(result.get("mathematical_assessment"), dict) else {}
+            proposed = result.get("proposed_issue") if isinstance(result.get("proposed_issue"), dict) else {}
+            status_text = {
+                "confirmed": "recheck-confirmed; still provisional pending human mathematical review",
+                "challenged": "unresolved; original finding preserved and human review required",
+                "inconclusive": "unresolved; original finding remains active",
+            }.get(state, "provisional")
+            recheck_items = [
+                ("Chunk recheck", _verification_finding_recheck_outcome_display(result.get("recheck_outcome"))),
+                ("Recheck status", status_text),
+                ("Recheck explanation", assessment.get("explanation") or result.get("summary") or ""),
+                ("Recommended severity", result.get("recommended_severity") or "not specified"),
+                ("Recheck linked issues", ", ".join(result.get("linked_issue_ids") or []) or "none"),
+            ]
+            if str(proposed.get("title") or "").strip():
+                recheck_items.append(("Proposed verification-derived issue", proposed.get("title")))
+            if result.get("downstream_dependencies"):
+                recheck_items.append(("Downstream dependencies", "; ".join(str(item) for item in result.get("downstream_dependencies") or [])))
+            recheck_items.append(("Human review required", "yes" if result.get("needs_human_review", True) else "recommended"))
+            for label, value in recheck_items:
+                parts.append(r"\item " + report_latex_paragraph(f"{label}: {value}") + "\n")
         parts.append(r"\end{itemize}" + "\n")
     return "".join(parts)
 
@@ -3142,6 +3644,8 @@ def build_verification_report(session_or_pdf: dict[str, Any] | str | Path) -> di
                 "counterexample_found": sum(1 for item in findings if item.get("mathematical_outcome") == "counterexample_found"),
                 "claim_failed": sum(1 for item in findings if item.get("mathematical_outcome") == "claim_failed"),
             },
+            "verification_finding_recheck_summary": verification_finding_recheck_summary(session, findings=findings),
+            "verification_finding_rechecks": verification_finding_rechecks_for_session(session),
             "inventory_warning": inventory_warning,
             "generated_at": utc_now(),
         },
@@ -3241,6 +3745,7 @@ def get_verification_suite_status(session_or_pdf: dict[str, Any] | str | Path) -
         }
     if last_run is not None and summary:
         last_run.update(summary)
+    findings = verification_findings_for_session(session, results=results)
     return {
         "scripts_total": len(scripts),
         "scripts": [
@@ -3254,7 +3759,15 @@ def get_verification_suite_status(session_or_pdf: dict[str, Any] | str | Path) -
         ],
         "last_run": last_run,
         "summary": summary,
-        "verification_findings": verification_findings_for_session(session, results=results),
+        "verification_findings": findings,
+        "verification_finding_recheck_summary": verification_finding_recheck_summary(
+            session,
+            findings=findings,
+        ),
+        "verification_finding_recheck_candidates": verification_finding_recheck_candidates(
+            session,
+            findings=findings,
+        ),
         "inventory_warning": inventory_warning,
     }
 
@@ -8609,6 +9122,8 @@ __all__ = [
     "finalize_chunk",
     "get_failed_verification_chunks",
     "get_audit_status",
+    "prepare_verification_finding_recheck_preview",
+    "resolve_verification_finding_recheck_settings",
     "import_accepted_issue_family_recheck",
     "load_post_audit_review_summary",
     "prepare_issue_family_recheck_dry_run",
@@ -8637,6 +9152,8 @@ __all__ = [
     "rerun_selected_chunks",
     "resume_audit",
     "run_verification_suite_and_build_report",
+    "run_verification_finding_rechecks",
+    "verification_finding_recheck_candidates",
     "set_display_audit_hook",
     "set_final_report_builder",
     "set_active_qa_thread",

@@ -25,6 +25,8 @@ from audit_verification import (
     _truncate_text,
     _verification_summary_counts,
     load_verification_state,
+    verification_finding_recheck_summary,
+    verification_finding_rechecks_for_session,
     verification_findings_for_session,
 )
 from audit_runtime import (
@@ -2778,12 +2780,27 @@ def _timing_summary_markdown(session: dict[str, Any]) -> str:
         f"- Total active audit time: {format_duration(usage['totals'].get('audit_seconds', 0.0))}",
         "",
     ]
-    per_chunk = usage.get("per_chunk", [])
+    per_chunk = [
+        entry for entry in usage.get("per_chunk", [])
+        if str(entry.get("activity_kind") or "audit_chunk") == "audit_chunk"
+    ]
     if per_chunk:
         for entry in per_chunk:
             lines.append(f"- {entry.get('chunk_id','chunk')}: {format_duration(entry.get('elapsed_seconds', 0.0))}")
     else:
         lines.append("- No completed chunks yet.")
+    recheck_usage = (usage.get("activity_totals") or {}).get("verification_finding_recheck") or {}
+    if recheck_usage:
+        lines.extend(
+            [
+                "",
+                "### Counterexample chunk rechecks",
+                f"- Calls: {int(recheck_usage.get('calls', 0) or 0)}",
+                f"- Runtime: {format_duration(recheck_usage.get('elapsed_seconds', 0.0))}",
+                f"- Tokens: {int(recheck_usage.get('total_tokens', 0) or 0)}",
+                f"- Cost (USD): {float(recheck_usage.get('cost_usd', 0.0) or 0.0):.4f}",
+            ]
+        )
     lines.append("")
     return "\n".join(lines)
 
@@ -2796,7 +2813,10 @@ def _timing_summary_tex(session: dict[str, Any]) -> str:
         r"\begin{itemize}",
         r"\item Total active audit time: " + _report_latex_paragraph_local(format_duration(usage["totals"].get("audit_seconds", 0.0))),
     ]
-    per_chunk = usage.get("per_chunk", [])
+    per_chunk = [
+        entry for entry in usage.get("per_chunk", [])
+        if str(entry.get("activity_kind") or "audit_chunk") == "audit_chunk"
+    ]
     if per_chunk:
         for entry in per_chunk:
             parts.append(
@@ -2808,6 +2828,19 @@ def _timing_summary_tex(session: dict[str, Any]) -> str:
     else:
         parts.append(r"\item No completed chunks yet.")
     parts.append(r"\end{itemize}")
+    recheck_usage = (usage.get("activity_totals") or {}).get("verification_finding_recheck") or {}
+    if recheck_usage:
+        parts.extend(
+            [
+                r"\subsection*{Counterexample chunk rechecks}",
+                r"\begin{itemize}",
+                r"\item Calls: " + str(int(recheck_usage.get("calls", 0) or 0)),
+                r"\item Runtime: " + _report_latex_paragraph_local(format_duration(recheck_usage.get("elapsed_seconds", 0.0))),
+                r"\item Tokens: " + str(int(recheck_usage.get("total_tokens", 0) or 0)),
+                r"\item Cost (USD): " + f"{float(recheck_usage.get('cost_usd', 0.0) or 0.0):.4f}",
+                r"\end{itemize}",
+            ]
+        )
     return "\n".join(parts) + "\n"
 
 
@@ -3073,6 +3106,18 @@ def _audit_summary_items(
         findings = verification_findings_for_session(session)
         if findings:
             items.append(("High-priority provisional verification findings", str(len(findings))))
+            recheck_summary = verification_finding_recheck_summary(session, findings=findings)
+            if recheck_summary.get("rechecked_finding_count"):
+                items.append(
+                    (
+                        "Counterexample finding rechecks",
+                        (
+                            f"confirmed {recheck_summary.get('confirmed_count', 0)}, "
+                            f"challenged {recheck_summary.get('challenged_count', 0)}, "
+                            f"inconclusive {recheck_summary.get('inconclusive_count', 0)}"
+                        ),
+                    )
+                )
         verification_warning = _verification_inventory_warning(session)
         if verification_warning.get("has_invalidated_obligations"):
             items.append(("Verification inventory warning", str(verification_warning.get("message") or "")))
@@ -3849,6 +3894,11 @@ def build_final_report(
             "counterexample_found": sum(1 for item in verification_findings if item.get("mathematical_outcome") == "counterexample_found"),
             "claim_failed": sum(1 for item in verification_findings if item.get("mathematical_outcome") == "claim_failed"),
         },
+        "verification_finding_recheck_summary": verification_finding_recheck_summary(
+            session,
+            findings=verification_findings,
+        ),
+        "verification_finding_rechecks": verification_finding_rechecks_for_session(session),
         "source_ingestion_diagnostics": source_diagnostics,
         "recheck_applied": bool(issue_recheck_overlay.get("recheck_applied")),
         "issue_recheck_summary": issue_recheck_overlay.get("issue_recheck_summary", {}),
@@ -4367,6 +4417,11 @@ def build_concise_report_json(
             "counterexample_found": sum(1 for item in data["verification_findings"] if item.get("mathematical_outcome") == "counterexample_found"),
             "claim_failed": sum(1 for item in data["verification_findings"] if item.get("mathematical_outcome") == "claim_failed"),
         },
+        "verification_finding_recheck_summary": verification_finding_recheck_summary(
+            session,
+            findings=data["verification_findings"],
+        ),
+        "verification_finding_rechecks": verification_finding_rechecks_for_session(session),
         "reference_status": _reference_report_status(session),
         "recheck_applied": bool(data["issue_recheck_overlay"].get("recheck_applied")),
         "issue_recheck_summary": data["issue_recheck_overlay"].get("issue_recheck_summary", {}),

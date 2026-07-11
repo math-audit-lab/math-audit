@@ -111,7 +111,7 @@ The PySide6 app is the primary maintained frontend for this public preview.
 5. Monitor progress, cost, chunks, pages, and status in the GUI.
 6. Use **Quick review** to build/open a concise report.
 7. Run the verification suite and inspect verification progress/results.
-8. Rerun failed-verification chunks if needed.
+8. Rerun failed-verification chunks when scripts failed technically, or use **Recheck Counterexample Chunks** when a completed script found a counterexample/claim failure.
 9. Rebuild/open final reports after verification and repairs.
 10. Optionally export a ChatGPT context pack for manual handoff outside the app.
 
@@ -132,6 +132,8 @@ The GUI can open the generated TeX report files and the reports folder. To compi
 The audit can generate local Python verification scripts. The GUI distinguishes execution status (completed, runtime error, timeout, skipped) from mathematical outcome (for example, counterexample found, no counterexample found in the tested range, check satisfied, or inconclusive).
 
 Successful Python execution does not mean the paper's claim succeeded: a completed script may find a counterexample. Likewise, a finite search with no counterexample does not prove an unrestricted theorem. Verification-derived findings are provisional supporting evidence, are surfaced in the main reports, and still require mathematical judgment.
+
+Technical failed-verification reruns are for timeouts, runtime/parse errors, and similar execution problems. **Recheck Counterexample Chunks** is a separate API-backed review for scripts that completed and reported `counterexample_found` or `claim_failed`. It sends the full affected chunk, complete script, exact output, structured counterexample data, linked issues, labels, and compact surrounding context to the audit session's saved model/effort by default. The original script, result, and finding remain preserved. Possible advisory outcomes include confirmed counterexample/claim failure, script error, scope/hypothesis mismatch, notation/interpretation mismatch, or inconclusive. Rechecks incur API cost and still require human mathematical review.
 
 ## Experimental Context Modes
 

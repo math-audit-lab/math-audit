@@ -61,19 +61,37 @@ from audit_runtime import (
     get_audit_status,
     get_report_freshness,
     get_verification_suite_status,
+    prepare_verification_finding_recheck_preview,
     refresh_report_latex_compile_health_sidecar,
+    resolve_verification_finding_recheck_settings,
     report_latex_paragraph,
     report_latex_compile_health,
 )
-from audit_state import compute_usage_cost, pricing_for_model, save_json, session_paths, usage_cache_diagnostics
+from audit_state import (
+    compute_usage_cost,
+    pricing_for_model,
+    save_json,
+    session_paths,
+    update_usage_from_usage_obj,
+    usage_cache_diagnostics,
+)
 from audit_verification import (
+    VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA,
     VERIFICATION_RESULT_SENTINEL,
     _check_verification_script_safety,
     _load_verification_results,
     _normalize_verification_result,
     _run_verification_scripts,
     _verification_summary_counts,
+    append_verification_finding_recheck_event,
+    build_verification_finding_recheck_evidence,
+    build_verification_finding_recheck_prompt,
     supersede_verification_findings_for_chunks,
+    validate_verification_finding_recheck_response,
+    verification_finding_recheck_candidates,
+    verification_finding_recheck_map,
+    verification_finding_recheck_schema_errors,
+    verification_finding_rechecks_for_session,
     verification_findings_for_session,
     verification_result_needs_technical_retry,
 )
@@ -4508,6 +4526,522 @@ def test_verification_execution_and_mathematical_outcomes() -> None:
         _assert("verification_finding_superseded" in history, history)
 
 
+def test_verification_finding_recheck_workflow() -> None:
+    def recheck_payload(outcome: str, finding_id: str, chunk_id: str = "chunk_008") -> dict[str, Any]:
+        confirmed = outcome in {"counterexample_confirmed", "claim_failure_confirmed"}
+        script_error = outcome == "script_error"
+        mismatch = outcome in {"scope_or_hypothesis_mismatch", "notation_or_interpretation_mismatch"}
+        return {
+            "schema_version": 1,
+            "finding_ids": [finding_id],
+            "chunk_id": chunk_id,
+            "recheck_outcome": outcome,
+            "script_assessment": {
+                "implements_intended_quantity": False if script_error else (None if outcome == "inconclusive" else True),
+                "script_correct": False if script_error else (None if outcome == "inconclusive" else True),
+                "limitations": ["Human mathematical review remains required."],
+            },
+            "mathematical_assessment": {
+                "candidate_satisfies_hypotheses": False if mismatch else (None if outcome == "inconclusive" else True),
+                "counterexample_valid": True if confirmed else (False if script_error or mismatch else None),
+                "claim_contradicted": True if confirmed else (False if script_error or mismatch else None),
+                "affected_claim": "Theorem 3",
+                "explanation": "The a=11 computation is exact." if confirmed else "The finding remains unresolved.",
+                "exact_computation": "sigma(7^11)=2^4 * 3 * 5^2 * 13 * 19 * 43 * 181.",
+            },
+            "recommended_issue_action": "strengthen_existing" if confirmed else "human_review",
+            "linked_issue_ids": ["I090"],
+            "recommended_severity": "high" if confirmed else "none",
+            "proposed_issue": {
+                "title": "Theorem 3 has a finite counterexample" if confirmed else "",
+                "location": "Theorem 3",
+                "description": "The case a=11 gives equality rather than the claimed strict inequality." if confirmed else "",
+                "evidence": "Both Omega values equal 11." if confirmed else "",
+                "proposed_fix": "Correct the theorem and dependent arguments." if confirmed else "",
+            },
+            "downstream_dependencies": ["Results using Theorem 3"] if confirmed else [],
+            "independent_check_recommended": True,
+            "confidence": "high" if confirmed else "medium",
+            "needs_human_review": True,
+            "summary": "Counterexample confirmed." if confirmed else "Further review is required.",
+        }
+
+    _assert(not verification_finding_recheck_schema_errors(), str(VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA))
+    for outcome in (
+        "counterexample_confirmed",
+        "script_error",
+        "scope_or_hypothesis_mismatch",
+        "inconclusive",
+    ):
+        validated = validate_verification_finding_recheck_response(recheck_payload(outcome, "VF-SYNTHETIC"))
+        _assert(validated["recheck_outcome"] == outcome, str(validated))
+        try:
+            validate_verification_finding_recheck_response({"schema_version": 1})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("malformed recheck response was accepted")
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_verification_recheck_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        session["model"] = "gpt-5.6-sol"
+        session["reasoning_effort"] = "max"
+        _write_json(session_paths(workdir)["session"], session)
+        chunk_text = (
+            "Theorem 3. The integer 7^a belongs to S_sigma^+ for every a >= 8.\n"
+            "The proof says the finite range can be checked computationally."
+        )
+        chunks = [
+            {
+                "chunk_id": "chunk_007",
+                "chunk_index": 7,
+                "label": "PDF page 7",
+                "display_label": "PDF page 7: preparation for Theorem 3",
+                "boundary": "Page 7",
+                "page_start": 7,
+                "page_end": 7,
+                "source_kind": "pdf",
+                "chunk_text": "Definitions and hypotheses used before Theorem 3.",
+            },
+            {
+                "chunk_id": "chunk_008",
+                "chunk_index": 8,
+                "label": "PDF page 8",
+                "display_label": "PDF page 8: Theorem 3",
+                "boundary": "Page 8",
+                "page_start": 8,
+                "page_end": 8,
+                "source_kind": "pdf",
+                "chunk_text": chunk_text,
+            },
+            {
+                "chunk_id": "chunk_009",
+                "chunk_index": 9,
+                "label": "PDF page 9",
+                "display_label": "PDF page 9: consequences",
+                "boundary": "Page 9",
+                "page_start": 9,
+                "page_end": 9,
+                "source_kind": "pdf",
+                "chunk_text": "Later results invoke Theorem 3.",
+            },
+        ]
+        _write_json(session_paths(workdir)["manifest"], {"chunks": chunks, "chunking_mode": "pdf_pages", "pdf_page_count": 9})
+        _write_json(
+            session_paths(workdir)["issues"],
+            {
+                "next_issue_id": 91,
+                "updated_at": OLD,
+                "issues": [
+                    {
+                        "issue_id": "I090",
+                        "chunk_id": "chunk_008",
+                        "severity": "low",
+                        "status": "open",
+                        "title": "Finite checks in Theorem 3 are undocumented",
+                        "location": "Theorem 3 proof",
+                        "description": "The finite computation is not supplied.",
+                        "evidence": "The proof cites a computation.",
+                        "proposed_fix": "Supply reproducible data.",
+                        "tags": ["verification"],
+                    }
+                ],
+            },
+        )
+        _write_json(session_paths(workdir)["ledger"], {"assumptions": ["a is an integer"], "notes": ["Theorem 3 uses a finite check"]})
+        structured_path = workdir / "responses" / "chunk_008.structured.json"
+        _write_json(
+            structured_path,
+            {
+                "label": "PDF page 8: Theorem 3",
+                "issues": [],
+                "verified_steps": [],
+                "python_checks": [],
+                "confidence": "high",
+            },
+        )
+        script_text = (
+            "from sympy import factorint\n\n"
+            "def big_omega(n):\n"
+            "    return sum(factorint(n).values())\n\n"
+            "for a in range(8, 86):\n"
+            "    sigma_value = (7 ** (a + 1) - 1) // 6\n"
+            "    if not (big_omega(sigma_value) < a):\n"
+            "        print(a, big_omega(sigma_value), factorint(sigma_value))\n"
+            "print('Omega(sigma(7^a)) finite check complete')\n"
+        )
+        script_path = workdir / "python_checks" / "chunk_008_check_01.py"
+        _write_text(script_path, script_text)
+        sentinel_payload = {
+            "schema_version": 1,
+            "check_kind": "counterexample_search",
+            "outcome": "counterexample_found",
+            "summary": "Theorem 3 fails at a=11.",
+            "counterexamples": [
+                {
+                    "a": 11,
+                    "omega_sigma": 11,
+                    "omega_input": 11,
+                    "factorization": {"2": 4, "3": 1, "5": 2, "13": 1, "19": 1, "43": 1, "181": 1},
+                }
+            ],
+            "failed_cases": [],
+            "tested_range": {"variable": "a", "minimum": 8, "maximum": 85},
+            "target": {"kind": "theorem", "label": "Theorem 3"},
+            "linked_issue_ids": ["I090"],
+        }
+        stdout = (
+            "x" * 31000
+            + "\n"
+            + VERIFICATION_RESULT_SENTINEL
+            + json.dumps(sentinel_payload)
+            + "\nFULL_STDOUT_TAIL\n"
+        )
+        stderr = "y" * 31000 + "\nFULL_STDERR_TAIL\n"
+        result = _normalize_verification_result(
+            {
+                "time": OLD,
+                "chunk_id": "chunk_008",
+                "chunk_index": 8,
+                "script_name": script_path.name,
+                "script_path": str(script_path),
+                "status": "passed",
+                "returncode": 0,
+                "stdout": stdout,
+                "stderr": stderr,
+                "elapsed_seconds": 1.25,
+                "safe_only": True,
+                "purpose": "Check Theorem 3 for 8 <= a <= 85.",
+                "description": "Compute Omega(sigma(7^a)) exactly.",
+                "expected_outcome": "No failures.",
+            }
+        )
+        result_path = workdir / "verification_results" / "chunk_008_check_01.result.json"
+        result["result_path"] = str(result_path)
+        _write_json(result_path, result)
+        _write_text(
+            session_paths(workdir)["chunk_records"],
+            json.dumps(
+                {
+                    "chunk_id": "chunk_008",
+                    "chunk_index": 8,
+                    "label": "PDF page 8: Theorem 3",
+                    "boundary": "Page 8",
+                    "page_start": 8,
+                    "page_end": 8,
+                    "elapsed_seconds": 1.0,
+                    "cost_usd": 0.0,
+                    "usage": {},
+                    "structured_response_path": str(structured_path),
+                    "python_paths": [str(script_path)],
+                    "audit": {"issues": [], "python_checks": []},
+                }
+            )
+            + "\n",
+        )
+        _write_json(
+            session_paths(workdir)["verification_state"],
+            {
+                "updated_at": OLD,
+                "last_run": {"started_at": OLD, "finished_at": OLD, "scripts_total": 1},
+                "results": [
+                    {
+                        "chunk_id": "chunk_008",
+                        "chunk_index": 8,
+                        "script_name": script_path.name,
+                        "script_path": str(script_path),
+                        "result_path": str(result_path),
+                        "status": "passed",
+                    }
+                ],
+                "report_paths": {},
+            },
+        )
+
+        _assert(verification_finding_recheck_candidates(session, findings=[])["summary"]["eligible_chunk_count"] == 0, "empty inventory")
+        findings = verification_findings_for_session(session)
+        _assert(len(findings) == 1, str(findings))
+        finding = findings[0]
+        _assert(finding["matched_issue_ids"] == ["I090"], str(finding))
+        append_verification_finding_recheck_event(
+            session,
+            {
+                "time": OLD,
+                "recheck_id": "VR-MALFORMED",
+                "status": "completed",
+                "event": "completed",
+                "finding_ids": [finding["finding_id"]],
+                "chunk_id": "chunk_008",
+                "structured_result": {
+                    "finding_ids": [finding["finding_id"]],
+                    "chunk_id": "chunk_008",
+                    "recheck_outcome": "script_error",
+                },
+                "canonical": True,
+            },
+        )
+        _assert(verification_finding_recheck_map(session) == {}, "malformed sidecar suppressed original finding")
+        session_paths(workdir)["verification_finding_rechecks"].unlink()
+        one = verification_finding_recheck_candidates(session)
+        _assert(one["summary"]["eligible_chunk_count"] == 1, str(one))
+        _assert(one["summary"]["eligible_finding_count"] == 1, str(one))
+        _assert(not runtime.get_failed_verification_chunks(session)["chunk_ids"], "counterexample entered technical queue")
+
+        second_script = workdir / "python_checks" / "chunk_008_check_02.py"
+        third_script = workdir / "python_checks" / "chunk_009_check_01.py"
+        _write_text(second_script, "print('second finding')\n")
+        _write_text(third_script, "print('different chunk')\n")
+        second_finding = {**finding, "finding_id": "VF-SAME-CHUNK", "script_name": second_script.name, "script_path": str(second_script)}
+        different_finding = {**finding, "finding_id": "VF-DIFFERENT", "chunk_id": "chunk_009", "script_name": third_script.name, "script_path": str(third_script)}
+        grouped = verification_finding_recheck_candidates(session, findings=[finding, second_finding, different_finding])
+        _assert(grouped["summary"]["eligible_chunk_count"] == 2, str(grouped))
+        grouped_chunk_8 = next(item for item in grouped["candidates"] if item["chunk_id"] == "chunk_008")
+        _assert(grouped_chunk_8["finding_count"] == 2, str(grouped_chunk_8))
+        inactive = {**finding, "active": False, "superseded": True}
+        excluded = verification_finding_recheck_candidates(session, findings=[inactive])
+        _assert(excluded["summary"]["eligible_chunk_count"] == 0, str(excluded))
+
+        candidate = one["candidates"][0]
+        evidence = build_verification_finding_recheck_evidence(session, candidate)
+        prompt = build_verification_finding_recheck_prompt(evidence)
+        _assert(script_text in prompt, "complete verification script missing from prompt")
+        for expected in (
+            "a = 11",
+            "2^4 * 3 * 5^2 * 13 * 19 * 43 * 181",
+            "Omega(sigma(7^11)) = 11",
+            "Omega(7^11) = 11",
+            "The integer 7^a belongs to S_sigma^+ for every a >= 8",
+            "I090",
+        ):
+            _assert(expected in prompt, f"missing prompt evidence: {expected}")
+        _assert(evidence["verification_evidence"][0]["complete_python_script"] == script_text, "script truncated")
+        _assert(evidence["verification_evidence"][0]["complete_counterexamples"][0]["a"] == 11, str(evidence))
+        _assert(evidence["verification_evidence"][0]["stdout"] == stdout, "stdout truncated or changed")
+        _assert(evidence["verification_evidence"][0]["stderr"] == stderr, "stderr truncated or changed")
+        _assert("FULL_STDOUT_TAIL" in prompt and "FULL_STDERR_TAIL" in prompt, "full process output missing")
+
+        preview_dir = Path(tmp) / "preview"
+        preview = prepare_verification_finding_recheck_preview(session, selection=finding["finding_id"], output_dir=preview_dir)
+        _assert(preview["manifest"]["dry_run"] is True, str(preview))
+        _assert(Path(preview["previews"][0]["artifacts"]["prompt"]).exists(), str(preview))
+        _assert(resolve_verification_finding_recheck_settings(session) == ("gpt-5.6-sol", "max"), str(session))
+
+        usage_state = json.loads(session_paths(workdir)["usage"].read_text(encoding="utf-8"))
+        usage_state["totals"] = {
+            "input_tokens": 0,
+            "cached_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "audit_seconds": 0.0,
+        }
+        _write_json(session_paths(workdir)["usage"], usage_state)
+        usage_update = update_usage_from_usage_obj(
+            session,
+            "chunk_008",
+            {
+                "input_tokens": 1000,
+                "input_tokens_details": {"cached_tokens": 100},
+                "output_tokens": 200,
+                "output_tokens_details": {"reasoning_tokens": 50},
+                "total_tokens": 1200,
+            },
+            model="gpt-5.6-sol",
+            elapsed_seconds=2.5,
+            activity_kind="verification_finding_recheck",
+            activity_id="VR-001",
+        )
+        recheck_usage = usage_update["usage_state"]["activity_totals"]["verification_finding_recheck"]
+        _assert(recheck_usage["calls"] == 1 and recheck_usage["total_tokens"] == 1200, str(recheck_usage))
+        _assert(usage_update["usage_state"]["totals"]["total_tokens"] == 1200, str(usage_update))
+
+        confirmed = recheck_payload("counterexample_confirmed", finding["finding_id"])
+        append_verification_finding_recheck_event(
+            session,
+            {
+                "time": MID,
+                "recheck_id": "VR-001",
+                "status": "completed",
+                "event": "completed",
+                "finding_ids": [finding["finding_id"]],
+                "chunk_id": "chunk_008",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "max",
+                "structured_result": confirmed,
+                "canonical": True,
+                "provisional": True,
+            },
+        )
+        overlaid = verification_findings_for_session(session)
+        _assert(overlaid[0]["recheck_state"] == "confirmed", str(overlaid))
+        _assert(verification_finding_recheck_candidates(session)["summary"]["eligible_chunk_count"] == 0, "confirmed recheck stayed eligible")
+
+        full_md = build_final_report_markdown(session)
+        concise_md = build_concise_report_markdown(session)
+        verification_paths = runtime.build_verification_report(session)
+        verification_md = Path(verification_paths["markdown"]).read_text(encoding="utf-8")
+        for report_text in (full_md, concise_md, verification_md):
+            _assert("COUNTEREXAMPLE CONFIRMED" in report_text, report_text)
+            _assert("I090" in report_text, report_text)
+        full_paths = policy_build_final_report(session, write_separate_verification_report=False)
+        full_json = json.loads(Path(full_paths["json"]).read_text(encoding="utf-8"))
+        concise_json = build_concise_report_json(session)
+        _assert(full_json["verification_finding_recheck_summary"]["confirmed_count"] == 1, str(full_json))
+        _assert(concise_json["verification_finding_recheck_summary"]["confirmed_count"] == 1, str(concise_json))
+        _assert(full_md.count("COUNTEREXAMPLE CONFIRMED") == 1, "recheck duplicated in full report")
+
+        inconclusive = recheck_payload("inconclusive", finding["finding_id"])
+        append_verification_finding_recheck_event(
+            session,
+            {
+                "time": NEW,
+                "recheck_id": "VR-002",
+                "status": "completed",
+                "event": "completed",
+                "finding_ids": [finding["finding_id"]],
+                "chunk_id": "chunk_008",
+                "structured_result": inconclusive,
+                "supersedes_recheck_ids": ["VR-001"],
+                "canonical": True,
+                "provisional": True,
+            },
+        )
+        historical = verification_finding_rechecks_for_session(session, include_superseded=True)
+        canonical = verification_finding_rechecks_for_session(session)
+        _assert(len(historical) == 2, str(historical))
+        _assert(len(canonical) == 1 and canonical[0]["recheck_id"] == "VR-002", str(canonical))
+        _assert(verification_finding_recheck_map(session)[finding["finding_id"]]["recheck_id"] == "VR-002", str(canonical))
+        inconclusive_findings = verification_findings_for_session(session)
+        _assert(inconclusive_findings[0]["recheck_state"] == "inconclusive", str(inconclusive_findings))
+        _assert(verification_finding_recheck_candidates(session)["summary"]["eligible_chunk_count"] == 1, "inconclusive recheck should remain eligible")
+        _assert("INCONCLUSIVE" in build_concise_report_markdown(session), "inconclusive finding disappeared")
+
+        script_error = recheck_payload("script_error", finding["finding_id"])
+        append_verification_finding_recheck_event(
+            session,
+            {
+                "time": LATEST,
+                "recheck_id": "VR-003",
+                "status": "completed",
+                "event": "completed",
+                "finding_ids": [finding["finding_id"]],
+                "chunk_id": "chunk_008",
+                "structured_result": script_error,
+                "supersedes_recheck_ids": ["VR-002"],
+                "canonical": True,
+                "provisional": True,
+            },
+        )
+        challenged = verification_findings_for_session(session)
+        _assert(challenged[0]["recheck_state"] == "challenged", str(challenged))
+        challenged_md = build_final_report_markdown(session)
+        _assert("SCRIPT ERROR SUSPECTED" in challenged_md, challenged_md)
+        _assert("original finding preserved" in challenged_md, challenged_md)
+
+        scope_mismatch = recheck_payload("scope_or_hypothesis_mismatch", finding["finding_id"])
+        append_verification_finding_recheck_event(
+            session,
+            {
+                "time": "2026-01-05T00:00:00+00:00",
+                "recheck_id": "VR-004",
+                "status": "completed",
+                "event": "completed",
+                "finding_ids": [finding["finding_id"]],
+                "chunk_id": "chunk_008",
+                "structured_result": scope_mismatch,
+                "supersedes_recheck_ids": ["VR-003"],
+                "canonical": True,
+                "provisional": True,
+            },
+        )
+        scope_findings = verification_findings_for_session(session)
+        _assert(scope_findings[0]["recheck_state"] == "challenged", str(scope_findings))
+        _assert("SCOPE OR HYPOTHESIS MISMATCH" in build_concise_report_markdown(session), "scope mismatch disappeared")
+
+        recheck_state_path = session_paths(workdir)["verification_finding_rechecks"]
+        recheck_state_path.unlink()
+        context_path = session_paths(workdir)["audit_context_db"]
+        _write_text(context_path, json.dumps({"entry_id": "CTX-1", "chunk_id": "chunk_008", "text": "original context"}) + "\n")
+        protected_paths = {
+            "issues": session_paths(workdir)["issues"],
+            "chunks": session_paths(workdir)["chunk_records"],
+            "ledger": session_paths(workdir)["ledger"],
+            "context": context_path,
+            "verification": session_paths(workdir)["verification_state"],
+            "script": script_path,
+            "result": result_path,
+        }
+        protected_before = {key: path.read_bytes() for key, path in protected_paths.items()}
+        fake_payload = recheck_payload("inconclusive", finding["finding_id"])
+
+        class FakeResponse:
+            id = "resp_fake_verification_recheck"
+            status = "completed"
+            output_parsed = fake_payload
+            output_text = json.dumps(fake_payload)
+            usage = {
+                "input_tokens": 3000,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 500,
+                "output_tokens_details": {"reasoning_tokens": 300},
+                "total_tokens": 3500,
+            }
+
+        class FakeResponses:
+            def __init__(self) -> None:
+                self.request: dict[str, Any] = {}
+
+            def create(self, **kwargs: Any) -> FakeResponse:
+                self.request = kwargs
+                return FakeResponse()
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.responses = FakeResponses()
+
+        fake_client = FakeClient()
+        previous_client = runtime._OPENAI_CLIENT
+        try:
+            runtime.set_openai_client(fake_client)
+            live_result = runtime.run_verification_finding_rechecks(
+                session,
+                selection=finding["finding_id"],
+                rebuild_reports=False,
+            )
+        finally:
+            runtime.set_openai_client(previous_client)
+        _assert(live_result["completed_count"] == 1 and live_result["failed_count"] == 0, str(live_result))
+        _assert(live_result["model"] == "gpt-5.6-sol" and live_result["reasoning_effort"] == "max", str(live_result))
+        _assert(not live_result["report_paths"], str(live_result))
+        request = fake_client.responses.request
+        _assert(request.get("model") == "gpt-5.6-sol", str(request))
+        _assert((request.get("reasoning") or {}).get("effort") == "max", str(request))
+        request_text = json.dumps(request.get("input") or [], ensure_ascii=False)
+        _assert(script_text in request_text.replace("\\n", "\n"), "live request omitted complete script")
+        _assert((request.get("text") or {}).get("format", {}).get("name") == "verification_finding_recheck", str(request))
+        for key, path in protected_paths.items():
+            _assert(path.read_bytes() == protected_before[key], f"specialized recheck mutated protected {key} artifact")
+        canonical_live = verification_finding_rechecks_for_session(session)
+        _assert(len(canonical_live) == 1, str(canonical_live))
+        _assert(canonical_live[0]["structured_result"]["recheck_outcome"] == "inconclusive", str(canonical_live))
+        _assert(canonical_live[0]["response_id"] == "resp_fake_verification_recheck", str(canonical_live))
+        _assert((workdir / canonical_live[0]["request_path"]).is_file(), str(canonical_live))
+        _assert((workdir / canonical_live[0]["response_path"]).is_file(), str(canonical_live))
+        _assert((workdir / canonical_live[0]["result_path"]).is_file(), str(canonical_live))
+        final_usage = json.loads(session_paths(workdir)["usage"].read_text(encoding="utf-8"))
+        activity = (final_usage.get("activity_totals") or {}).get("verification_finding_recheck") or {}
+        _assert(int(activity.get("calls", 0) or 0) >= 2, str(activity))
+        _assert(int(activity.get("total_tokens", 0) or 0) >= 4700, str(activity))
+        _assert(not runtime.get_failed_verification_chunks(session)["chunk_ids"], "rechecked counterexample entered technical queue")
+        suite_status = get_verification_suite_status(session)
+        _assert(
+            suite_status["verification_finding_recheck_summary"]["inconclusive_count"] == 1,
+            str(suite_status),
+        )
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -4563,6 +5097,7 @@ def main() -> int:
         ("python check trailing JSON artifact repair", test_python_check_trailing_json_artifact_repair),
         ("verification safety allows narrow string replace", test_verification_safety_allows_narrow_string_replace),
         ("verification execution and mathematical outcomes", test_verification_execution_and_mathematical_outcomes),
+        ("verification finding recheck workflow", test_verification_finding_recheck_workflow),
     ]
     results = [_run_case(name, func) for name, func in cases]
 

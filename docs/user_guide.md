@@ -245,14 +245,20 @@ Successful execution does not mean that the paper's claim passed. A script may e
 
 ## 11. Rerunning Failed Verification Chunks
 
-If a verification script has a technical execution failure or times out, the GUI can help rerun chunks associated with those scripts. A script that executes successfully and finds a counterexample is not a technical rerun failure. Use reruns selectively. A technical failure may indicate:
+If a verification script has a technical execution failure or times out, the GUI can help rerun chunks associated with those scripts. This technical workflow is for timeouts, runtime/parse errors, unsafe or skipped scripts, and missing/malformed execution. A script that executes successfully and finds a counterexample is not a technical rerun failure.
+
+For an active `counterexample_found` or `claim_failed` finding, use **Recheck Counterexample Chunks** instead. This focused API action sends the complete manuscript chunk, full Python script, exact stdout/stderr and execution metadata, complete structured counterexample/failed cases, linked issues, source/printed labels when available, and compact neighboring/global context. It uses the audit session's saved model and reasoning effort by default and may incur additional API cost.
+
+The recheck can classify the result as a confirmed counterexample/claim failure, script error, scope or hypothesis mismatch, notation or interpretation mismatch, or inconclusive. It does not replace the original chunk audit, verification script, result, or deterministic finding. Challenged and inconclusive findings remain visible for human review, and every recheck conclusion is provisional.
+
+Use either workflow selectively. A technical failure or negative result may indicate:
 
 - The script is wrong.
 - The paper claim is wrong.
 - The audit misunderstood the claim.
 - The test needs a different numerical or symbolic setup.
 
-Reruns can consume API budget. Confirm that a rerun is useful before starting it.
+Reruns and counterexample rechecks can consume API budget. Confirm that an action is useful before starting it, and inspect the evidence and recheck explanation mathematically afterward.
 
 ## 12. Discussion and ChatGPT Context Export
 

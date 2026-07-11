@@ -48,6 +48,7 @@ from audit_runtime import (
     request_pause,
     rerun_failed_verification_chunks as runtime_rerun_failed_verification_chunks,
     rerun_selected_chunks as runtime_rerun_selected_chunks,
+    run_verification_finding_rechecks,
     resume_audit,
     run_issue_family_recheck_live,
     run_verification_suite_and_build_report,
@@ -920,6 +921,41 @@ class GuiController(QObject):
             rebuild_reports=bool(rebuild_reports),
         )
 
+    def recheck_counterexample_findings(self, selection: str = "") -> None:
+        if self.has_active_task():
+            self.log_message.emit("Counterexample recheck is only available when no local GUI task is active.")
+            return
+        if not self._require_session():
+            return
+        if not self._require_api_key_for_live_calls():
+            return
+        payload = self._load_status_payload()
+        session = payload.get("session") or {}
+        status = payload.get("status") or {}
+        candidates = payload.get("verification_finding_rechecks") or {}
+        eligible_count = int((candidates.get("summary") or {}).get("eligible_chunk_count", 0) or 0)
+        if session.get("pending"):
+            self.log_message.emit("Cannot recheck counterexample findings while the audit has a pending response.")
+            return
+        if str(status.get("status") or "") not in {"completed", "paused"}:
+            self.log_message.emit("Counterexample rechecks are available only for completed or paused audits.")
+            return
+        if eligible_count <= 0:
+            self.log_message.emit("No active counterexample or claim-failure findings are eligible for recheck.")
+            return
+        model = self.model if self._model_effort_override_active else None
+        reasoning_effort = self.reasoning_effort if self._model_effort_override_active else None
+        self._run_backend_task(
+            "Recheck Counterexample Findings",
+            run_verification_finding_rechecks,
+            self._handle_counterexample_recheck_result,
+            self.pdf_path,
+            selection=str(selection or "").strip() or None,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            rebuild_reports=True,
+        )
+
     def ask_about_paper(self, question: str) -> None:
         clean = str(question or "").strip()
         if not clean:
@@ -1350,6 +1386,41 @@ class GuiController(QObject):
         self.status_updated.emit(self._normalize_status_payload(result))
         self._emit_current_status()
 
+    def _handle_counterexample_recheck_result(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self.report_output.emit("Unexpected counterexample-recheck result.")
+            return
+        completed = int(result.get("completed_count", 0) or 0)
+        failed = int(result.get("failed_count", 0) or 0)
+        model = str(result.get("model") or "unknown")
+        effort = str(result.get("reasoning_effort") or "unknown")
+        lines = [
+            f"Counterexample recheck finished: {completed} completed, {failed} failed.",
+            f"Model/reasoning: {model} / {effort}",
+        ]
+        for record in result.get("rechecks") or []:
+            if not isinstance(record, dict):
+                continue
+            chunk_id = str(record.get("chunk_id") or "unknown")
+            if record.get("status") == "completed":
+                structured = record.get("structured_result") if isinstance(record.get("structured_result"), dict) else {}
+                outcome = str(structured.get("recheck_outcome") or "completed").replace("_", " ").upper()
+                cost = float((record.get("cost") or {}).get("total_cost", 0.0) or 0.0)
+                lines.append(f"- {chunk_id}: {outcome} | Cost: ${cost:.4f}")
+            else:
+                lines.append(f"- {chunk_id}: FAILED | {record.get('error') or 'unknown error'}")
+        warnings = result.get("report_generation_warnings") or []
+        for warning in warnings:
+            lines.append(f"- Report warning: {warning}")
+        message = "\n".join(lines)
+        self.log_message.emit(message)
+        self.report_output.emit(message)
+        report_paths = result.get("report_paths") or {}
+        if report_paths:
+            self.report_output.emit(self._format_path_payload("Counterexample recheck report outputs", report_paths))
+        self.status_updated.emit(self._normalize_status_payload(result))
+        self._emit_current_status()
+
     def _handle_discussion_result(self, result: Any) -> None:
         if not isinstance(result, dict):
             self.discussion_output.emit("Unexpected discussion result.")
@@ -1411,7 +1482,7 @@ class GuiController(QObject):
     def _require_api_key_for_live_calls(self) -> bool:
         if self.live_api_key_available():
             return True
-        self.log_message.emit("Enter an API key before starting/resuming an audit or using discussion.")
+        self.log_message.emit("Enter an API key before starting a live API action.")
         return False
 
     def live_api_key_available(self) -> bool:
@@ -1445,6 +1516,13 @@ class GuiController(QObject):
                 "inventory_warning": {"has_invalidated_obligations": False},
                 "error": f"{type(exc).__name__}: {exc}",
             }
+        info["verification_finding_rechecks"] = (
+            (info.get("verification_suite") or {}).get("verification_finding_recheck_candidates")
+            or {
+                "candidates": [],
+                "summary": {"eligible_chunk_count": 0, "eligible_finding_count": 0},
+            }
+        )
         if review_summary_polling_enabled():
             try:
                 info["review_summary"] = load_post_audit_review_summary(self.pdf_path)
@@ -1498,6 +1576,10 @@ class GuiController(QObject):
                 "last_run": None,
                 "inventory_warning": {"has_invalidated_obligations": False},
             },
+            "verification_finding_rechecks": {
+                "candidates": [],
+                "summary": {"eligible_chunk_count": 0, "eligible_finding_count": 0},
+            },
             "report_freshness": {
                 "reports": {
                     "full": {"status": "missing"},
@@ -1544,7 +1626,7 @@ class GuiController(QObject):
         except Exception:
             return
         for entry in usage.get("per_chunk", []) or []:
-            if isinstance(entry, dict):
+            if isinstance(entry, dict) and str(entry.get("activity_kind") or "audit_chunk") == "audit_chunk":
                 self._logged_chunk_completion_signatures.add(self._chunk_completion_signature(entry))
 
     def _log_new_chunk_completions(self, payload: dict[str, Any]) -> set[str]:
@@ -1558,6 +1640,8 @@ class GuiController(QObject):
         logged_chunk_ids: set[str] = set()
         for entry in entries:
             if not isinstance(entry, dict):
+                continue
+            if str(entry.get("activity_kind") or "audit_chunk") != "audit_chunk":
                 continue
             signature = self._chunk_completion_signature(entry)
             if signature in self._logged_chunk_completion_signatures:
