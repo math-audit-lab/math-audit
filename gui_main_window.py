@@ -88,6 +88,129 @@ def _set_plain_text_preserving_scroll(widget: QPlainTextEdit, text: str) -> bool
     return True
 
 
+def _counterexample_recheck_view(
+    inventory: dict[str, Any],
+    history_summary: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    candidates = [
+        item
+        for item in (inventory.get("candidates") or [])
+        if isinstance(item, dict) and item.get("eligible")
+    ]
+    if not candidates:
+        return {
+            "summary_text": "No active counterexample findings require recheck.",
+            "entries": [],
+            "eligible_chunk_count": 0,
+            "eligible_finding_count": 0,
+        }
+
+    finding_count = sum(int(item.get("finding_count", 0) or 0) for item in candidates)
+    chunk_word = "chunk" if len(candidates) == 1 else "chunks"
+    finding_word = "finding" if finding_count == 1 else "findings"
+    lines = [f"{len(candidates)} eligible {chunk_word}, {finding_count} {finding_word}"]
+    entries = [{"label": f"All eligible chunks ({len(candidates)})", "selection": "all"}]
+
+    for candidate in candidates:
+        chunk_id = str(candidate.get("chunk_id") or "unknown chunk").strip()
+        finding_ids = [str(item).strip() for item in candidate.get("finding_ids") or [] if str(item).strip()]
+        targets = []
+        for target in candidate.get("targets") or []:
+            if isinstance(target, dict):
+                label = str(target.get("label") or target.get("name") or "").strip()
+            else:
+                label = str(target or "").strip()
+            if label and label not in targets:
+                targets.append(label)
+        target_text = ", ".join(targets) or "target not reported"
+        counterexample_count = int(candidate.get("counterexample_count", 0) or 0)
+        finding_label = "Finding" if len(finding_ids) == 1 else "Findings"
+        case_label = "case" if counterexample_count == 1 else "cases"
+        lines.extend(
+            [
+                "",
+                f"{chunk_id} - {target_text}",
+                f"  {finding_label}: {', '.join(finding_ids) or 'not reported'}",
+                f"  Counterexamples: {counterexample_count} {case_label}",
+            ]
+        )
+        combo_finding_text = ", ".join(finding_ids) or "finding not reported"
+        entries.append(
+            {
+                "label": f"{chunk_id} - {target_text} - {combo_finding_text}",
+                "selection": chunk_id,
+            }
+        )
+
+    history = history_summary if isinstance(history_summary, dict) else {}
+    if int(history.get("rechecked_finding_count", 0) or 0):
+        lines.extend(
+            [
+                "",
+                (
+                    "Previous rechecks: "
+                    f"confirmed {int(history.get('confirmed_count', 0) or 0)}, "
+                    f"challenged {int(history.get('challenged_count', 0) or 0)}, "
+                    f"inconclusive {int(history.get('inconclusive_count', 0) or 0)}"
+                ),
+            ]
+        )
+    return {
+        "summary_text": "\n".join(lines),
+        "entries": entries,
+        "eligible_chunk_count": len(candidates),
+        "eligible_finding_count": finding_count,
+    }
+
+
+def _counterexample_recheck_selection_index(entries: list[dict[str, Any]], previous_selection: Any) -> int:
+    clean_previous = str(previous_selection or "").strip()
+    for index, entry in enumerate(entries):
+        if str(entry.get("selection") or "").strip() == clean_previous:
+            return index
+    return 0 if entries else -1
+
+
+def _counterexample_recheck_action_state(
+    *,
+    session_available: bool,
+    status_name: str,
+    pending_response: bool,
+    task_running: bool,
+    api_key_available: bool,
+    entries: list[dict[str, Any]],
+    selected_token: Any,
+) -> dict[str, Any]:
+    candidate_count = max(0, len(entries) - 1) if entries else 0
+    clean_selection = str(selected_token or "").strip()
+    valid_selections = {str(item.get("selection") or "").strip() for item in entries}
+    if clean_selection == "all" and candidate_count:
+        chunk_word = "Chunk" if candidate_count == 1 else "Chunks"
+        button_text = f"Recheck {candidate_count} Counterexample {chunk_word}"
+    elif clean_selection:
+        button_text = "Recheck Selected Counterexample"
+    else:
+        button_text = "Recheck Counterexample Findings"
+
+    reason = "Ready to run a focused counterexample recheck."
+    enabled = True
+    if not session_available:
+        enabled, reason = False, "Audit state unavailable. Select a completed or paused audit."
+    elif task_running:
+        enabled, reason = False, "Another audit action is currently running."
+    elif status_name not in {"completed", "paused"}:
+        enabled, reason = False, "The audit must be completed or paused before rechecking findings."
+    elif pending_response:
+        enabled, reason = False, "A chunk request is currently pending."
+    elif candidate_count <= 0:
+        enabled, reason = False, "No eligible counterexample findings."
+    elif clean_selection not in valid_selections:
+        enabled, reason = False, "The selected candidate is no longer active."
+    elif not api_key_available:
+        enabled, reason = False, "API key required to run the recheck."
+    return {"enabled": enabled, "reason": reason, "button_text": button_text}
+
+
 class AuditPromptDialog(QDialog):
     def __init__(self, controller: GuiController, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -473,6 +596,7 @@ class MainWindow(QMainWindow):
         self._latest_chatgpt_context_pack: dict[str, Any] = {}
         self._discussion_transcript_parts: list[str] = []
         self._review_family_ids: list[str] = []
+        self._counterexample_recheck_inventory_signature: Optional[tuple[Any, ...]] = None
 
         self.setWindowTitle("Math Audit Control Panel (V1)")
         self.resize(980, 820)
@@ -830,23 +954,41 @@ class MainWindow(QMainWindow):
         self._set_failed_verification_rerun_compact(0)
 
         counterexample_recheck_box = QGroupBox("Counterexample Finding Recheck")
-        counterexample_recheck_layout = QFormLayout(counterexample_recheck_box)
-        self.counterexample_recheck_summary_value = QLabel("No active counterexample findings require recheck.")
-        self.counterexample_recheck_summary_value.setWordWrap(True)
-        counterexample_recheck_layout.addRow("Candidates", self.counterexample_recheck_summary_value)
-        self.counterexample_recheck_input = QLineEdit()
-        self.counterexample_recheck_input.setPlaceholderText("blank = all; or VF-... / chunk_008")
-        counterexample_recheck_layout.addRow("Selection", self.counterexample_recheck_input)
+        counterexample_recheck_layout = QVBoxLayout(counterexample_recheck_box)
+        counterexample_recheck_layout.setContentsMargins(8, 8, 8, 8)
+        counterexample_recheck_layout.setSpacing(6)
+        self.counterexample_recheck_summary_value = QPlainTextEdit()
+        self.counterexample_recheck_summary_value.setReadOnly(True)
+        self.counterexample_recheck_summary_value.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.counterexample_recheck_summary_value.setMinimumHeight(92)
+        self.counterexample_recheck_summary_value.setMaximumHeight(220)
+        self.counterexample_recheck_summary_value.setPlainText(
+            "No active counterexample findings require recheck."
+        )
+        counterexample_recheck_layout.addWidget(self.counterexample_recheck_summary_value)
+        selection_row = QHBoxLayout()
+        selection_row.setContentsMargins(0, 0, 0, 0)
+        selection_row.addWidget(QLabel("Selection"))
+        self.counterexample_recheck_combo = QComboBox()
+        self.counterexample_recheck_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.counterexample_recheck_combo.setMinimumContentsLength(34)
+        self.counterexample_recheck_combo.currentIndexChanged.connect(self._apply_button_states)
+        selection_row.addWidget(self.counterexample_recheck_combo, 1)
+        counterexample_recheck_layout.addLayout(selection_row)
         counterexample_hint = QLabel(
-            "This sends the complete chunk, verification script, output, and counterexample evidence for focused review. "
-            "It does not replace the original chunk audit."
+            "The recheck sends the complete manuscript chunk, verification script, output, and counterexample "
+            "evidence for focused review. It preserves the original audit and incurs API cost."
         )
         counterexample_hint.setWordWrap(True)
         counterexample_hint.setStyleSheet("color: #555;")
-        counterexample_recheck_layout.addRow("", counterexample_hint)
-        self.recheck_counterexample_button = QPushButton("Recheck Counterexample Chunks")
+        counterexample_recheck_layout.addWidget(counterexample_hint)
+        self.counterexample_recheck_status_value = QLabel("No eligible counterexample findings.")
+        self.counterexample_recheck_status_value.setWordWrap(True)
+        self.counterexample_recheck_status_value.setStyleSheet("color: #8a4b00; font-weight: 600;")
+        counterexample_recheck_layout.addWidget(self.counterexample_recheck_status_value)
+        self.recheck_counterexample_button = QPushButton("Recheck Counterexample Findings")
         self.recheck_counterexample_button.clicked.connect(self._recheck_counterexample_findings)
-        counterexample_recheck_layout.addRow("", self.recheck_counterexample_button)
+        counterexample_recheck_layout.addWidget(self.recheck_counterexample_button, 0, Qt.AlignmentFlag.AlignLeft)
 
         quick_buttons = QHBoxLayout()
         quick_buttons.addWidget(self.build_concise_button)
@@ -1145,6 +1287,7 @@ class MainWindow(QMainWindow):
 
     def _apply_api_key(self) -> None:
         self.controller.set_api_key(self.api_key_input.text())
+        self._apply_button_states()
 
     def _apply_pdf_path(self) -> None:
         self.controller.set_pdf_path(self.pdf_path_input.text())
@@ -1336,6 +1479,49 @@ class MainWindow(QMainWindow):
             rebuild_reports=self.failed_verification_rebuild_checkbox.isChecked(),
         )
 
+    def _selected_counterexample_recheck_token(self) -> str:
+        token = str(self.counterexample_recheck_combo.currentData() or "").strip()
+        return "" if token == "all" else token
+
+    def _update_counterexample_recheck_inventory(
+        self,
+        inventory: dict[str, Any],
+        history_summary: Optional[dict[str, Any]] = None,
+    ) -> None:
+        view = _counterexample_recheck_view(inventory, history_summary)
+        entries = view.get("entries") or []
+        signature = (
+            str(view.get("summary_text") or ""),
+            tuple(
+                (str(item.get("label") or ""), str(item.get("selection") or ""))
+                for item in entries
+                if isinstance(item, dict)
+            ),
+        )
+        if signature == self._counterexample_recheck_inventory_signature:
+            return
+
+        previous_selection = self.counterexample_recheck_combo.currentData()
+        _set_plain_text_preserving_scroll(
+            self.counterexample_recheck_summary_value,
+            str(view.get("summary_text") or ""),
+        )
+        self.counterexample_recheck_combo.blockSignals(True)
+        try:
+            self.counterexample_recheck_combo.clear()
+            for entry in entries:
+                self.counterexample_recheck_combo.addItem(
+                    str(entry.get("label") or ""),
+                    str(entry.get("selection") or ""),
+                )
+            selected_index = _counterexample_recheck_selection_index(entries, previous_selection)
+            if selected_index >= 0:
+                self.counterexample_recheck_combo.setCurrentIndex(selected_index)
+        finally:
+            self.counterexample_recheck_combo.blockSignals(False)
+        self.counterexample_recheck_combo.setEnabled(bool(entries))
+        self._counterexample_recheck_inventory_signature = signature
+
     def _recheck_counterexample_findings(self) -> None:
         self._apply_api_key()
         self._apply_pdf_path()
@@ -1344,11 +1530,15 @@ class MainWindow(QMainWindow):
         summary = inventory.get("summary") or {}
         eligible_chunks = int(summary.get("eligible_chunk_count", 0) or 0)
         eligible_findings = int(summary.get("eligible_finding_count", 0) or 0)
-        selection = self.counterexample_recheck_input.text().strip()
+        selection = self._selected_counterexample_recheck_token()
         session = payload.get("session") or {}
         model = self.controller.model or session.get("model")
         effort = self.controller.reasoning_effort or session.get("reasoning_effort")
-        scope_text = f"selection {selection}" if selection else f"all {eligible_chunks} eligible chunk(s) / {eligible_findings} finding(s)"
+        scope_text = (
+            f"selected candidate {selection}"
+            if selection
+            else f"all {eligible_chunks} eligible chunk(s) / {eligible_findings} finding(s)"
+        )
         message = (
             f"Recheck {scope_text}?\n\n"
             "The complete manuscript chunk, verification script, exact execution output, parsed counterexample, "
@@ -1449,45 +1639,11 @@ class MainWindow(QMainWindow):
             )
         else:
             _set_text_if_changed(self.verification_last_run_value, "Last run: none")
-        recheck_summary = verification_finding_rechecks.get("summary") or {}
-        recheck_candidates = verification_finding_rechecks.get("candidates") or []
         recheck_history_summary = verification_suite.get("verification_finding_recheck_summary") or {}
-        eligible_recheck_chunks = int(recheck_summary.get("eligible_chunk_count", 0) or 0)
-        eligible_recheck_findings = int(recheck_summary.get("eligible_finding_count", 0) or 0)
-        history_text = (
-            f"Rechecks: confirmed {int(recheck_history_summary.get('confirmed_count', 0) or 0)}, "
-            f"challenged {int(recheck_history_summary.get('challenged_count', 0) or 0)}, "
-            f"inconclusive {int(recheck_history_summary.get('inconclusive_count', 0) or 0)}. "
-            if int(recheck_history_summary.get("rechecked_finding_count", 0) or 0)
-            else ""
+        self._update_counterexample_recheck_inventory(
+            verification_finding_rechecks,
+            recheck_history_summary,
         )
-        if eligible_recheck_chunks:
-            previews = []
-            for candidate in recheck_candidates[:3]:
-                if not isinstance(candidate, dict) or not candidate.get("eligible"):
-                    continue
-                target_values = []
-                for target in candidate.get("targets") or []:
-                    if isinstance(target, dict):
-                        target_values.append(str(target.get("label") or target.get("name") or ""))
-                previews.append(
-                    f"{candidate.get('chunk_id')}: {', '.join(candidate.get('finding_ids') or [])}; "
-                    f"{', '.join(target_values) or 'target not reported'}; "
-                    f"{int(candidate.get('counterexample_count', 0) or 0)} case(s)"
-                )
-            suffix = " ..." if eligible_recheck_chunks > len(previews) else ""
-            _set_text_if_changed(
-                self.counterexample_recheck_summary_value,
-                history_text
-                + f"{eligible_recheck_chunks} eligible chunk(s), {eligible_recheck_findings} finding(s). "
-                + " | ".join(previews)
-                + suffix,
-            )
-        else:
-            _set_text_if_changed(
-                self.counterexample_recheck_summary_value,
-                history_text + "No active counterexample or claim-failure findings require recheck.",
-            )
         inventory_warning = verification_suite.get("inventory_warning") or {}
         if inventory_warning.get("has_invalidated_obligations"):
             affected_chunks = inventory_warning.get("affected_chunks") or []
@@ -1871,7 +2027,6 @@ class MainWindow(QMainWindow):
         session = payload.get("session") or {}
         pending = session.get("pending") or {}
         failed_verification = payload.get("failed_verification") or {}
-        verification_finding_rechecks = payload.get("verification_finding_rechecks") or {}
         session_available = bool(payload.get("session_available"))
         pdf_selected = bool(self.pdf_path_input.text().strip())
         status_name = str(status.get("status") or "")
@@ -1884,9 +2039,6 @@ class MainWindow(QMainWindow):
         )
         cancel_in_progress = self.controller.cancel_current_chunk_in_progress()
         failed_count = int((failed_verification.get("summary") or {}).get("failed_chunk_count", 0) or 0)
-        counterexample_recheck_count = int(
-            (verification_finding_rechecks.get("summary") or {}).get("eligible_chunk_count", 0) or 0
-        )
         resumable_statuses = {"paused", "initialized"}
 
         self.start_button.setEnabled(pdf_selected and not self._task_running and not running_status)
@@ -1925,13 +2077,30 @@ class MainWindow(QMainWindow):
             and not pending_response
             and failed_count > 0
         )
-        self.recheck_counterexample_button.setEnabled(
-            session_available
-            and not self._task_running
-            and status_name in {"completed", "paused"}
-            and not pending_response
-            and counterexample_recheck_count > 0
-            and self.controller.live_api_key_available()
+        recheck_entries = [
+            {
+                "label": self.counterexample_recheck_combo.itemText(index),
+                "selection": self.counterexample_recheck_combo.itemData(index),
+            }
+            for index in range(self.counterexample_recheck_combo.count())
+        ]
+        recheck_action = _counterexample_recheck_action_state(
+            session_available=session_available,
+            status_name=status_name,
+            pending_response=pending_response,
+            task_running=self._task_running,
+            api_key_available=self.controller.live_api_key_available(),
+            entries=recheck_entries,
+            selected_token=self.counterexample_recheck_combo.currentData(),
+        )
+        self.recheck_counterexample_button.setEnabled(bool(recheck_action["enabled"]))
+        _set_text_if_changed(self.recheck_counterexample_button, str(recheck_action["button_text"]))
+        _set_text_if_changed(self.counterexample_recheck_status_value, str(recheck_action["reason"]))
+        _set_stylesheet_if_changed(
+            self.counterexample_recheck_status_value,
+            "color: #2f6b3a; font-weight: 600;"
+            if recheck_action["enabled"]
+            else "color: #8a4b00; font-weight: 600;",
         )
         self.ask_button.setEnabled(session_ready)
         self.new_discussion_thread_button.setEnabled(session_ready)

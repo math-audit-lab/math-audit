@@ -1387,6 +1387,103 @@ def test_plain_text_scroll_preservation_helper() -> None:
     _assert(_set_stylesheet_if_changed(fake, "new style"), "changed style was not written")
 
 
+def test_counterexample_recheck_panel_helpers() -> None:
+    from gui_main_window import (
+        _counterexample_recheck_action_state,
+        _counterexample_recheck_selection_index,
+        _counterexample_recheck_view,
+    )
+
+    inventory = {
+        "candidates": [
+            {
+                "eligible": True,
+                "chunk_id": "chunk_003",
+                "finding_ids": ["VF-ECB7CB443641"],
+                "finding_count": 1,
+                "targets": [{"label": "Lemma 1"}],
+                "counterexample_count": 93,
+            },
+            {
+                "eligible": True,
+                "chunk_id": "chunk_008",
+                "finding_ids": ["VF-7AA74E51F7A6"],
+                "finding_count": 1,
+                "targets": [{"label": "Theorem 3"}],
+                "counterexample_count": 1,
+            },
+            {
+                "eligible": False,
+                "chunk_id": "chunk_999",
+                "finding_ids": ["VF-INACTIVE"],
+                "finding_count": 1,
+                "targets": [{"label": "Inactive"}],
+                "counterexample_count": 5,
+            },
+        ]
+    }
+    view = _counterexample_recheck_view(inventory)
+    summary = view["summary_text"]
+    entries = view["entries"]
+    _assert(summary.startswith("2 eligible chunks, 2 findings"), summary)
+    _assert("chunk_003 - Lemma 1\n  Finding: VF-ECB7CB443641" in summary, summary)
+    _assert("Counterexamples: 93 cases" in summary, summary)
+    _assert("chunk_008 - Theorem 3\n  Finding: VF-7AA74E51F7A6" in summary, summary)
+    _assert("Counterexamples: 1 case" in summary, summary)
+    _assert("VF-INACTIVE" not in summary, summary)
+    _assert(entries[0] == {"label": "All eligible chunks (2)", "selection": "all"}, str(entries))
+    _assert(entries[1]["selection"] == "chunk_003" and "VF-ECB7CB443641" in entries[1]["label"], str(entries))
+    _assert(entries[2]["selection"] == "chunk_008" and "VF-7AA74E51F7A6" in entries[2]["label"], str(entries))
+
+    _assert(_counterexample_recheck_selection_index(entries, None) == 0, "all was not default")
+    _assert(_counterexample_recheck_selection_index(entries, "chunk_008") == 2, "polling lost selection")
+    reduced_entries = _counterexample_recheck_view(
+        {"candidates": [inventory["candidates"][0]]}
+    )["entries"]
+    _assert(
+        _counterexample_recheck_selection_index(reduced_entries, "chunk_008") == 0,
+        "removed candidate did not fall back to all",
+    )
+
+    common = {
+        "session_available": True,
+        "status_name": "completed",
+        "pending_response": False,
+        "task_running": False,
+        "entries": entries,
+        "selected_token": "all",
+    }
+    missing_key = _counterexample_recheck_action_state(api_key_available=False, **common)
+    _assert(not missing_key["enabled"], str(missing_key))
+    _assert(missing_key["reason"] == "API key required to run the recheck.", str(missing_key))
+    enabled = _counterexample_recheck_action_state(api_key_available=True, **common)
+    _assert(enabled["enabled"], str(enabled))
+    _assert(enabled["button_text"] == "Recheck 2 Counterexample Chunks", str(enabled))
+    selected = _counterexample_recheck_action_state(
+        api_key_available=True,
+        **{**common, "selected_token": "chunk_008"},
+    )
+    _assert(selected["button_text"] == "Recheck Selected Counterexample", str(selected))
+    busy = _counterexample_recheck_action_state(
+        api_key_available=True,
+        **{**common, "task_running": True},
+    )
+    _assert(not busy["enabled"] and "currently running" in busy["reason"], str(busy))
+    no_candidates = _counterexample_recheck_action_state(
+        session_available=True,
+        status_name="completed",
+        pending_response=False,
+        task_running=False,
+        api_key_available=True,
+        entries=[],
+        selected_token=None,
+    )
+    _assert(not no_candidates["enabled"], str(no_candidates))
+    _assert(no_candidates["reason"] == "No eligible counterexample findings.", str(no_candidates))
+    empty_view = _counterexample_recheck_view({"candidates": []})
+    _assert(empty_view["summary_text"] == "No active counterexample findings require recheck.", str(empty_view))
+
+
 def test_review_summary_polling_feature_flag() -> None:
     _assert(not review_summary_polling_enabled({}), "Review summary polling should be disabled by default")
     _assert(
@@ -5068,6 +5165,7 @@ def main() -> int:
         ("context mode mixing guardrails", test_context_mode_mixing_guardrails),
         ("chunk completion log line formatting", test_chunk_completion_log_line_formatting),
         ("plain text scroll preservation helper", test_plain_text_scroll_preservation_helper),
+        ("counterexample recheck panel helpers", test_counterexample_recheck_panel_helpers),
         ("review summary polling feature flag", test_review_summary_polling_feature_flag),
         ("review tab feature flag", test_review_tab_feature_flag),
         ("completed status reconciliation", test_completed_status_reconciles_from_chunk_records),
