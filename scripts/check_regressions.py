@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import audit_runtime as runtime
+import scripts.check_setup as setup_check
 from audit_chunking import ensure_chunk_display_labels, pdf_chunk_display_label
 from audit_policy_hooks import (
     CONTINUOUS_RUNNING_CONTEXT_MAX_CHARS,
@@ -124,6 +125,17 @@ from scripts.prepare_rerun_recheck_candidates import prepare_rerun_recheck_candi
 from scripts.import_issue_family_recheck import import_issue_family_recheck
 from scripts.run_issue_family_recheck import RESULT_SCHEMA, run_issue_family_recheck, validate_result_schema
 from scripts.run_context_mode_ab_test import run_context_mode_ab_test
+from scripts.check_windows_qt import (
+    PREFLIGHT_DLL_LOAD_FAILED,
+    PREFLIGHT_IMPORT_FAILED,
+    PREFLIGHT_OK,
+    PREFLIGHT_VERSION_MISMATCH,
+    WINDOWS_QT_PACKAGES,
+    WINDOWS_TESTED_PYSIDE6_VERSION,
+    format_windows_qt_preflight,
+    run_windows_qt_preflight,
+    windows_qt_repair_command,
+)
 
 
 OLD = "2026-01-01T00:00:00+00:00"
@@ -5720,6 +5732,145 @@ def test_verification_technical_repair_workflow() -> None:
         _assert(unsafe["status"] == "unsafe", str(unsafe))
 
 
+def test_windows_qt_installation_contract() -> None:
+    environment_text = (PROJECT_ROOT / "environment.yml").read_text(encoding="utf-8")
+    _assert(
+        'PySide6==6.9.3; sys_platform == "win32"' in environment_text,
+        "Windows PySide6 requirement is not pinned to the tested version",
+    )
+    _assert(
+        'PySide6>=6.7; sys_platform != "win32"' in environment_text,
+        "non-Windows PySide6 range was not preserved",
+    )
+    _assert(
+        environment_text.count("PySide6>=6.7") == 1
+        and 'sys_platform != "win32"' in environment_text,
+        "an unbounded PySide6 requirement can still select latest on Windows",
+    )
+
+    class FakeQtCore:
+        @staticmethod
+        def qVersion() -> str:
+            return WINDOWS_TESTED_PYSIDE6_VERSION
+
+    class FakeQtWidgets:
+        QApplication = object
+
+    class FakeQtWebEngineWidgets:
+        QWebEngineView = object
+
+    modules = {
+        "PySide6.QtCore": FakeQtCore,
+        "PySide6.QtWidgets": FakeQtWidgets,
+        "PySide6.QtWebEngineWidgets": FakeQtWebEngineWidgets,
+    }
+
+    def fake_import(module_name: str) -> Any:
+        return modules[module_name]
+
+    def version_getter(version: str) -> Callable[[str], str]:
+        return lambda package: version if package in WINDOWS_QT_PACKAGES else ""
+
+    healthy = run_windows_qt_preflight(
+        import_module=fake_import,
+        version_getter=version_getter("6.9.3"),
+        machine="AMD64",
+        python_bits=64,
+    )
+    _assert(healthy["exit_code"] == PREFLIGHT_OK, str(healthy))
+    _assert(not healthy["repair_recommended"], str(healthy))
+    healthy_text = format_windows_qt_preflight(healthy)
+    _assert(
+        "Windows Qt preflight passed: PySide6 6.9.3 / Qt 6.9.3." in healthy_text,
+        healthy_text,
+    )
+
+    def dll_failure(_module_name: str) -> Any:
+        raise ImportError("DLL load failed while importing QtCore: The specified procedure could not be found.")
+
+    broken_latest = run_windows_qt_preflight(
+        import_module=dll_failure,
+        version_getter=version_getter("6.11.1"),
+        machine="AMD64",
+        python_bits=64,
+    )
+    _assert(broken_latest["exit_code"] == PREFLIGHT_DLL_LOAD_FAILED, str(broken_latest))
+    _assert(broken_latest["repair_recommended"], str(broken_latest))
+    _assert(set(broken_latest["imports"]) == {"QtCore", "QtWidgets", "QtWebEngineWidgets"}, str(broken_latest))
+    broken_text = format_windows_qt_preflight(broken_latest)
+    _assert("tested recovery path is PySide6 6.9.3" in broken_text, broken_text)
+    original_setup_preflight = setup_check.run_windows_qt_preflight
+    try:
+        setup_check.run_windows_qt_preflight = lambda: broken_latest
+        setup_failure = setup_check._check_windows_qt()
+    finally:
+        setup_check.run_windows_qt_preflight = original_setup_preflight
+    _assert(setup_failure.status == "FAIL", str(setup_failure))
+    _assert("Microsoft Visual C++ Redistributable x64 may be required" in setup_failure.detail, setup_failure.detail)
+    _assert("PySide6 6.9.3" in setup_failure.detail, setup_failure.detail)
+    _assert("PySide6==6.9.3" in setup_failure.detail, setup_failure.detail)
+
+    mixed_versions = {
+        "PySide6": "6.9.3",
+        "PySide6_Addons": "6.9.3",
+        "PySide6_Essentials": "6.11.1",
+        "shiboken6": "6.9.3",
+    }
+    mixed = run_windows_qt_preflight(
+        import_module=fake_import,
+        version_getter=lambda package: mixed_versions[package],
+    )
+    _assert(mixed["exit_code"] == PREFLIGHT_VERSION_MISMATCH, str(mixed))
+    _assert("versions are missing or do not match" in format_windows_qt_preflight(mixed), str(mixed))
+
+    def generic_failure(_module_name: str) -> Any:
+        raise RuntimeError("synthetic non-DLL import failure")
+
+    generic = run_windows_qt_preflight(
+        import_module=generic_failure,
+        version_getter=version_getter("6.9.3"),
+    )
+    _assert(generic["exit_code"] == PREFLIGHT_IMPORT_FAILED, str(generic))
+    _assert(not generic["repair_recommended"], str(generic))
+
+    repair_command = windows_qt_repair_command("conda.exe", "math-audit")
+    _assert(
+        repair_command
+        == [
+            "conda.exe", "run", "-n", "math-audit", "python", "-m", "pip", "install",
+            "--upgrade", "--force-reinstall", "PySide6==6.9.3",
+        ],
+        str(repair_command),
+    )
+
+    batch_text = (PROJECT_ROOT / "run_math_audit.bat").read_text(encoding="utf-8")
+    _assert(batch_text.count("python scripts\\check_windows_qt.py") == 2, batch_text)
+    _assert(
+        batch_text.index("call :windows_qt_preflight")
+        < batch_text.index("python scripts\\check_setup.py")
+        < batch_text.index("python audit_gui.py"),
+        "Windows launcher preflight/setup/GUI order is incorrect",
+    )
+    _assert(
+        'python -m pip install --upgrade --force-reinstall "PySide6==%WINDOWS_PYSIDE6_VERSION%"'
+        in batch_text,
+        "Windows launcher repair command is missing",
+    )
+    _assert(
+        "if errorlevel 1 goto :qt_repair_failed" in batch_text
+        and "GUI will not be started" in batch_text,
+        "failed Windows repair does not block GUI launch clearly",
+    )
+
+    setup_text = (PROJECT_ROOT / "scripts" / "check_setup.py").read_text(encoding="utf-8")
+    _assert("Microsoft Visual C++ Redistributable x64 may be required" in setup_text, setup_text)
+    _assert("must have matching versions" in setup_text, setup_text)
+
+    mac_launcher = (PROJECT_ROOT / "run_math_audit.command").read_text(encoding="utf-8")
+    _assert("check_windows_qt.py" not in mac_launcher, "macOS launcher invokes Windows preflight")
+    _assert("PySide6==6.9.3" not in mac_launcher, "macOS launcher invokes Windows repair")
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -5778,6 +5929,7 @@ def main() -> int:
         ("verification execution and mathematical outcomes", test_verification_execution_and_mathematical_outcomes),
         ("verification finding recheck workflow", test_verification_finding_recheck_workflow),
         ("verification technical repair workflow", test_verification_technical_repair_workflow),
+        ("Windows Qt installation contract", test_windows_qt_installation_contract),
     ]
     results = [_run_case(name, func) for name, func in cases]
 

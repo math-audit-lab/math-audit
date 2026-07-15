@@ -76,7 +76,7 @@ Then download Math Paper Audit:
 6. On Windows, double-click `run_math_audit.bat`.
 7. The launcher creates or reuses the `math-audit` environment from `environment.yml`, runs a setup check, and starts the GUI.
 
-Required Python/GUI packages are installed into the `math-audit` Conda environment from `environment.yml`. They are not supposed to be included in Miniforge itself. You should not manually install PySide6, Qt WebEngine, the OpenAI SDK, PDF parsing packages, NumPy, SymPy, Markdown, or similar app dependencies one by one.
+Required Python/GUI packages are installed into the `math-audit` Conda environment from `environment.yml`. They are not supposed to be included in Miniforge itself. You should not manually install PySide6, Qt WebEngine, the OpenAI SDK, PDF parsing packages, NumPy, SymPy, Markdown, or similar app dependencies one by one. Windows currently uses the tested PySide6 6.9.3 package set; the Windows launcher checks QtCore, QtWidgets, and QtWebEngineWidgets before it opens the GUI. The current Microsoft Visual C++ Redistributable x64 is recommended.
 
 If the setup check reports a missing required package, the environment may be incomplete or stale. Nontechnical users can try rerunning the launcher or ask a technical colleague for help. Advanced users can refresh the environment from the project root:
 
@@ -338,6 +338,22 @@ If PySide6 or Qt WebEngine is missing, refresh the environment:
 ```bash
 conda env update -f environment.yml --prune
 ```
+
+On Windows, the launcher automatically tries the tested PySide6 6.9.3 recovery when the dedicated `math-audit` environment reports a Qt DLL-load failure or mismatched PySide6 companion-package versions. It checks Qt again after repair and does not start the GUI if imports still fail. This repair affects only the app environment, not Conda's base environment.
+
+A Windows DLL-load error can have more than one cause. Install the current [Microsoft Visual C++ Redistributable x64](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist) if needed. If it is already installed, inspect Qt with the following command, replacing the placeholder path if your Conda installation is elsewhere:
+
+```bat
+"C:\Users\<USER>\miniforge3\Scripts\conda.exe" run -n math-audit python -c "from PySide6.QtCore import qVersion; print(qVersion())"
+```
+
+The manual tested-package repair is:
+
+```bat
+"C:\Users\<USER>\miniforge3\Scripts\conda.exe" run -n math-audit python -m pip install --upgrade --force-reinstall "PySide6==6.9.3"
+```
+
+PySide6 should resolve matching Addons, Essentials, and shiboken6 packages. The app's setup check reports all four installed versions when the Windows preflight fails. `pdflatex` is optional and is not installed by the launcher.
 
 ### The App Logs an API-Key Warning
 

@@ -13,6 +13,8 @@ dependencies:
   - numpy
   - sympy
   - pip:
-      # PySide6 provides the Qt modules used by the GUI, including Qt WebEngine
-      # on current wheels. If QWebEngine imports fail, reinstall/update PySide6.
-      - PySide6>=6.7
+      # Windows uses the tested Qt-for-Python build. PySide6 resolves matching
+      # Addons, Essentials, and shiboken6 versions from this exact requirement.
+      - 'PySide6==6.9.3; sys_platform == "win32"'
+      # Keep the existing supported range on non-Windows platforms.
+      - 'PySide6>=6.7; sys_platform != "win32"'

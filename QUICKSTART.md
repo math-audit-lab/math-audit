@@ -25,7 +25,7 @@ Then use the easiest startup path:
 4. Wait while the launcher creates or reuses the `math-audit` Conda environment.
 5. Paste your OpenAI API key into the GUI, then select a paper PDF.
 
-The launcher runs `python scripts/check_setup.py` before opening the GUI. It does not store or request your API key and does not run an audit by itself.
+The launcher runs `python scripts/check_setup.py` before opening the GUI. On Windows it first checks the installed PySide6 version and imports QtCore, QtWidgets, and QtWebEngineWidgets. It does not store or request your API key and does not run an audit by itself; an API key is needed only for live model calls.
 
 Required Python/GUI packages such as PySide6, Qt WebEngine, the OpenAI SDK, and PDF packages are installed automatically into the `math-audit` environment from `environment.yml`; they are not part of Miniforge itself. If setup reports a missing required package, rerun the launcher or use the manual update command below.
 
@@ -178,6 +178,24 @@ conda env update -f environment.yml --prune
 ```
 
 The environment uses the PySide6 wheel because the GUI needs Qt WebEngine for rendered discussion output.
+
+On Windows, Math Paper Audit currently uses the tested PySide6 6.9.3 package set. The launcher checks Qt imports before opening the GUI. If an existing dedicated `math-audit` environment has a Qt DLL-load failure or mismatched PySide6 companion packages, the launcher attempts a one-time repair to 6.9.3 and checks the imports again. It does not modify the base environment or unrelated Conda environments.
+
+The current [Microsoft Visual C++ Redistributable x64](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist) is recommended. A DLL-load error can have more than one cause; if the runtime is already installed, the tested PySide6 repair is the next recovery step.
+
+To inspect the Qt version manually, adjust the Conda path if needed and run:
+
+```bat
+"C:\Users\<USER>\miniforge3\Scripts\conda.exe" run -n math-audit python -c "from PySide6.QtCore import qVersion; print(qVersion())"
+```
+
+To apply the same repair manually:
+
+```bat
+"C:\Users\<USER>\miniforge3\Scripts\conda.exe" run -n math-audit python -m pip install --upgrade --force-reinstall "PySide6==6.9.3"
+```
+
+PySide6 resolves matching Addons, Essentials, and shiboken6 packages. If diagnostics still show mixed versions, rerun the repair or recreate only the dedicated `math-audit` environment. `pdflatex` remains optional and separate from this Qt setup.
 
 ### Missing API Key
 

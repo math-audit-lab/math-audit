@@ -13,6 +13,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts.check_windows_qt import (  # noqa: E402
+    WINDOWS_TESTED_PYSIDE6_VERSION,
+    format_windows_qt_preflight,
+    run_windows_qt_preflight,
+    windows_qt_repair_command_text,
+)
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -56,6 +63,28 @@ def _check_import(name: str, module: str, required: bool = True) -> CheckResult:
     if version:
         detail += f" ({version})"
     return _ok(name, detail, required=required)
+
+
+def _check_windows_qt() -> CheckResult:
+    result = run_windows_qt_preflight()
+    if result["ok"]:
+        versions = result["installed_versions"]
+        return _ok(
+            "Windows Qt preflight",
+            f"PySide6 {versions.get('PySide6')} / Qt {result.get('qt_version')}; "
+            f"Windows {result.get('windows_architecture')}, Python {result.get('python_architecture')}",
+        )
+
+    detail = format_windows_qt_preflight(result)
+    detail += (
+        "\nPySide6 could not provide a compatible Qt installation on Windows. "
+        f"This app currently tests PySide6 {WINDOWS_TESTED_PYSIDE6_VERSION} on Windows.\n"
+        "The Microsoft Visual C++ Redistributable x64 may be required. If it is already "
+        "installed and the error persists, reinstall the tested PySide6 version. All "
+        "PySide6, Addons, Essentials, and shiboken6 packages must have matching versions.\n"
+        f"Try: {windows_qt_repair_command_text()}"
+    )
+    return _fail("Windows Qt preflight", detail)
 
 
 def _check_mathjax_assets() -> CheckResult:
@@ -110,11 +139,19 @@ def run_checks() -> list[CheckResult]:
         ("Markdown", "markdown"),
         ("NumPy", "numpy"),
         ("SymPy", "sympy"),
-        ("PySide6 QtCore", "PySide6.QtCore"),
-        ("PySide6 QtWidgets", "PySide6.QtWidgets"),
-        ("PySide6 QtWebEngineWidgets", "PySide6.QtWebEngineWidgets"),
     ]
     results.extend(_check_import(name, module) for name, module in third_party)
+    if sys.platform == "win32":
+        results.append(_check_windows_qt())
+    else:
+        results.extend(
+            _check_import(name, module)
+            for name, module in [
+                ("PySide6 QtCore", "PySide6.QtCore"),
+                ("PySide6 QtWidgets", "PySide6.QtWidgets"),
+                ("PySide6 QtWebEngineWidgets", "PySide6.QtWebEngineWidgets"),
+            ]
+        )
 
     core_modules = [
         "audit_gui",
