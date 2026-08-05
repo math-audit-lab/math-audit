@@ -212,6 +212,14 @@ The **full report** is a detailed audit archive and meticulous technical report.
 
 The **verification report** summarizes local Python verification results after you run the verification suite. Verification scripts are supporting evidence, not formal proof.
 
+### Raw candidates and canonical issue clusters
+
+The audit first saves model-generated findings as **raw issue candidates**. These records are provisional and remain available for provenance even if later review finds that two records describe the same root problem, one is only a downstream consequence, an objection is rejected, or a repair resolves the concern.
+
+An optional developer review workflow can create **canonical issue clusters** from explicitly accepted decisions. Rebuilt reports use consolidated headline counts only when every raw candidate has a conflict-free canonical assignment. Before that point, reports keep the raw-candidate view and show a warning that semantic consolidation or adjudication is incomplete. This is why issue totals can legitimately differ between an early raw report and a later consolidated report.
+
+Deterministic clustering suggestions are only review aids; they do not decide mathematical truth. Serious high/critical clusters still require an accepted recheck before the canonical report is marked ready. Questions that require consulting an external paper, theorem, or data source are shown separately as external-source questions.
+
 Generated report formats may include:
 
 - Markdown reports for quick reading.

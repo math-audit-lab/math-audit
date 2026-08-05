@@ -27,6 +27,7 @@ Use it cautiously. The app is not an automatic referee, proof assistant, or theo
 - Use the default continuous-conversation audit mode; `fresh_context_experimental` is available for experiments but remains explicitly experimental.
 - Generate full, concise, and verification reports in Markdown, TeX, and JSON.
 - Track report freshness so stale reports are visible after audit state changes.
+- Preserve raw model-generated issue candidates separately from optional, accepted canonical issue clusters. Canonical clustering can consolidate duplicates and downstream consequences without deleting the original findings.
 - Run generated local Python verification scripts and view progress/results.
 - Distinguish Python execution status from mathematical outcome; reported counterexamples are promoted as provisional findings in the full and concise reports.
 - Rerun selected chunks or chunks with failed/timed-out verification results.
@@ -109,6 +110,10 @@ paper_audit/
 That workdir contains state JSON, chunk records, prompts/requests/responses, generated reports, verification scripts/results, discussion turns, rerun logs, and export folders. These are local audit artifacts and are generally not meant to be committed.
 
 Do not commit audit outputs, paper PDFs/TeX sources, request/response logs, generated reports, verification scripts/results, rerun folders, or review sidecars. They may contain paper text, model responses, local filesystem paths, and sensitive review material.
+
+### Raw findings and canonical issue clusters
+
+`state/issues.json` is the raw candidate ledger produced during the audit. Those entries are provisional and are not silently deleted when later review rejects, resolves, merges, or supersedes them. Optional developer tools can prepare deterministic clustering proposals and import explicitly accepted decisions into an append-only canonical sidecar. Reports use canonical headline counts only after every raw candidate has a conflict-free accepted assignment; otherwise they retain the legacy raw view and display a consolidation warning. External-source questions remain separate because the manuscript alone cannot settle them.
 
 ## Limitations
 

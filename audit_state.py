@@ -51,6 +51,8 @@ def session_paths(workdir: str | Path) -> dict[str, Path]:
         "session": root / "state" / "session.json",
         "ledger": root / "state" / "ledger.json",
         "issues": root / "state" / "issues.json",
+        "canonical_issue_clusters": root / "state" / "canonical_issue_clusters.json",
+        "issue_cluster_events": root / "state" / "issue_cluster_events.jsonl",
         "usage": root / "state" / "usage.json",
         "status": root / "state" / "status.json",
         "manifest": root / "state" / "chunk_manifest.json",

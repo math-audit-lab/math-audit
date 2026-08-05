@@ -1203,6 +1203,16 @@ def _report_freshness_sources(session: dict[str, Any], kind: str) -> list[dict[s
         source_specs.extend(
             [
                 ("issues state", _json_file_timestamp(paths["issues"]), paths["issues"]),
+                (
+                    "canonical issue clusters",
+                    _json_file_timestamp(paths["canonical_issue_clusters"]),
+                    paths["canonical_issue_clusters"],
+                ),
+                (
+                    "canonical issue cluster events",
+                    _jsonl_event_timestamp(paths["issue_cluster_events"]),
+                    paths["issue_cluster_events"],
+                ),
                 ("status state", _json_file_timestamp(paths["status"]), paths["status"]),
                 ("chunk manifest", _json_file_timestamp(paths["manifest"]), paths["manifest"]),
                 ("chunk records", _file_mtime_datetime(paths["chunk_records"]), paths["chunk_records"]),

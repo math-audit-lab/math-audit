@@ -17,6 +17,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import audit_runtime as runtime
 import scripts.check_setup as setup_check
+from audit_issue_clusters import (
+    LIFECYCLE_STATES,
+    build_canonical_issue_ledger,
+    canonical_issue_cluster_view,
+    import_canonical_cluster_decisions,
+    issue_cluster_history,
+    report_readiness,
+    validate_cluster_decision,
+)
 from audit_chunking import ensure_chunk_display_labels, pdf_chunk_display_label
 from audit_policy_hooks import (
     CONTINUOUS_RUNNING_CONTEXT_MAX_CHARS,
@@ -120,9 +129,11 @@ from gui_controller import (
 )
 from scripts.prepare_context_mode_comparison import prepare_context_mode_comparison
 from scripts.prepare_issue_recheck_candidates import prepare_issue_recheck_candidates
+from scripts.prepare_canonical_issue_clusters import prepare_canonical_issue_clusters
 from scripts.prepare_issue_recheck_families import prepare_issue_recheck_families
 from scripts.prepare_rerun_recheck_candidates import prepare_rerun_recheck_candidates
 from scripts.import_issue_family_recheck import import_issue_family_recheck
+from scripts.import_canonical_issue_clusters import import_canonical_issue_clusters
 from scripts.run_issue_family_recheck import RESULT_SCHEMA, run_issue_family_recheck, validate_result_schema
 from scripts.run_context_mode_ab_test import run_context_mode_ab_test
 from scripts.check_windows_qt import (
@@ -5871,6 +5882,275 @@ def test_windows_qt_installation_contract() -> None:
     _assert("PySide6==6.9.3" not in mac_launcher, "macOS launcher invokes Windows repair")
 
 
+def test_canonical_issue_clustering_foundation() -> None:
+    readiness_base = {"raw_issue_count": 1, "event_count": 1, "warnings": [], "stale_cluster_ids": []}
+    _assert(
+        report_readiness(view={**readiness_base, "clusters": [], "unclustered_raw_issue_ids": ["I001"]})["status"]
+        == "clustering_incomplete",
+        "clustering-incomplete readiness state was not selected",
+    )
+    _assert(
+        report_readiness(view={
+            **readiness_base,
+            "clusters": [{"cluster_id": "C001", "lifecycle_state": "supported", "final_severity": "medium"}],
+            "unclustered_raw_issue_ids": [],
+        })["status"] == "adjudication_incomplete",
+        "adjudication-incomplete readiness state was not selected",
+    )
+    _assert(
+        report_readiness(view={
+            **readiness_base,
+            "clusters": [{
+                "cluster_id": "C001", "lifecycle_state": "verified", "final_severity": "high",
+                "serious_issue_recheck_status": "pending",
+            }],
+            "unclustered_raw_issue_ids": [],
+        })["status"] == "serious_issues_pending",
+        "serious-issues-pending readiness state was not selected",
+    )
+    _assert(
+        report_readiness(view={
+            **readiness_base,
+            "clusters": [{
+                "cluster_id": "C001", "lifecycle_state": "verified", "final_severity": "high",
+                "serious_issue_recheck_status": "accepted",
+            }],
+            "unclustered_raw_issue_ids": [],
+        })["status"] == "canonical_report_ready",
+        "canonical-ready readiness state was not selected",
+    )
+
+    def issue(issue_id: str, title: str, *, severity: str = "high", location: str = "Equation (34)", description: str = "") -> dict[str, Any]:
+        return {
+            "issue_id": issue_id,
+            "chunk_id": f"chunk_{int(issue_id[1:]):03d}",
+            "status": "open",
+            "severity": severity,
+            "title": title,
+            "location": location,
+            "description": description or title,
+            "evidence": f"Evidence for {issue_id}",
+            "proposed_fix": f"Fix {issue_id}",
+            "tags": ["mathematical-correctness"],
+        }
+
+    def decision(
+        cluster_id: str,
+        raw_ids: list[str],
+        lifecycle: str,
+        *,
+        severity: str = "medium",
+        include: bool = False,
+        upstream: list[str] | None = None,
+        downstream: list[str] | None = None,
+        external: list[str] | None = None,
+        serious: str = "not_required",
+        supersedes: list[str] | None = None,
+        clear: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "cluster_id": cluster_id,
+            "title": f"Canonical {cluster_id}",
+            "root_claim": f"Root mathematical claim for {cluster_id}",
+            "raw_issue_ids": raw_ids,
+            "lifecycle_state": lifecycle,
+            "verification_status": "verified" if lifecycle in {"verified", "resolved"} else "not_checked",
+            "proposed_severity": severity,
+            "final_severity": severity,
+            "repair_status": "verified_local_repair" if lifecycle == "resolved" else "not_assessed",
+            "confidence": "high",
+            "include_in_concise_report": include,
+            "report_issue_id": raw_ids[0],
+            "upstream_cluster_ids": upstream or [],
+            "downstream_cluster_ids": downstream or [],
+            "dependent_cluster_ids": downstream or [],
+            "external_source_requirements": external or [],
+            "serious_issue_recheck_status": serious,
+            "supersedes_cluster_ids": supersedes or [],
+            "clear_reconciliation": clear,
+        }
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_canonical_clusters_") as tmp:
+        root = Path(tmp)
+        workdir = root / "paper_audit"
+        session = _seed_state(workdir)
+        issues = [
+            issue("I001", "Equation (34) cites itself"),
+            issue("I002", "Equation (34) cites itself"),
+            issue("I003", "Theorem use depends on issue I001", description="Downstream consequence depends on issue I001."),
+            issue("I004", "Rejected sign objection", severity="critical", location="Equation (40)"),
+            issue("I005", "Repairable local reference", severity="medium", location="Proposition 4.1"),
+            issue("I006", "External theorem provenance", severity="high", location="Theorem D.1"),
+            issue("I007", "Independent verified defect", severity="high", location="Equation (63)"),
+            issue("I008", "Serious pending defect", severity="high", location="Equation (82)"),
+            issue("I009", "Separate coefficient concern", severity="medium", location="Equation (83)"),
+            issue("I010", "Coefficient normalization concern", severity="medium", location="Equation labeled eq:shared"),
+            issue("I011", "Endpoint notation ambiguity", severity="medium", location="Use of equation labeled eq:shared"),
+        ]
+        issues_path = session_paths(workdir)["issues"]
+        _write_json(issues_path, {"next_issue_id": 12, "issues": issues, "updated_at": NEW})
+        raw_before = issues_path.read_bytes()
+
+        raw_view = canonical_issue_cluster_view(workdir)
+        _assert(raw_view["report_readiness"]["status"] == "raw_only", str(raw_view))
+        _assert(raw_view["unclustered_raw_issue_ids"] == [item["issue_id"] for item in issues], str(raw_view))
+
+        prepared = prepare_canonical_issue_clusters(workdir, root / "prepared")
+        proposals = prepared["proposals"]
+        grouped = [set(item["raw_issue_ids"]) for item in proposals]
+        _assert(any({"I001", "I002", "I003"} <= item for item in grouped), str(grouped))
+        _assert(any(item == {"I009"} for item in grouped), str(grouped))
+        shared_relation = next(
+            item for item in prepared["cross_proposal_relations"]
+            if {item["issue_id"], item["related_issue_id"]} == {"I010", "I011"}
+        )
+        _assert(shared_relation["proposed_relation"] == "partially_overlaps", str(shared_relation))
+        _assert(issues_path.read_bytes() == raw_before, "candidate preparation mutated raw issues")
+        try:
+            prepare_canonical_issue_clusters(workdir, workdir / "review")
+        except ValueError:
+            pass
+        else:
+            raise RegressionFailure("candidate output inside audit workdir was accepted")
+
+        known = {item["issue_id"]: item for item in issues}
+        for index, lifecycle in enumerate(sorted(LIFECYCLE_STATES), start=1):
+            validated = validate_cluster_decision(
+                decision(f"T{index:03d}", ["I001"], lifecycle), known
+            )
+            _assert(validated["lifecycle_state"] == lifecycle, str(validated))
+        try:
+            validate_cluster_decision(decision("BAD", ["I404"], "verified"), known)
+        except ValueError:
+            pass
+        else:
+            raise RegressionFailure("unknown raw issue ID was accepted")
+        try:
+            validate_cluster_decision(decision("BAD", ["I001"], "open"), known)
+        except ValueError:
+            pass
+        else:
+            raise RegressionFailure("invalid lifecycle state was accepted")
+
+        decisions = [
+            decision("C001", ["I001", "I002"], "verified", severity="high", include=True, downstream=["C003"], serious="accepted"),
+            decision("C002", ["I003"], "duplicate", severity="low", upstream=["C001"]),
+            decision("C003", ["I004"], "rejected", severity="none", upstream=["C001"]),
+            decision("C004", ["I005"], "resolved", severity="medium", include=True),
+            decision("C005", ["I006"], "external_verification_required", severity="high", external=["Check cited Theorem D.1 source"]),
+            decision("C006", ["I007"], "verified", severity="high", include=True, serious="accepted"),
+            decision("C007", ["I008"], "verification_pending", severity="high", include=True, upstream=["C001"], serious="pending"),
+            decision("C008", ["I009"], "supported", severity="medium"),
+            decision("C009", ["I010"], "resolved", severity="low"),
+            decision("C011", ["I011"], "resolved", severity="low"),
+        ]
+        payload = {"created_by": "synthetic_regression", "decisions": decisions}
+        dry = import_canonical_cluster_decisions(workdir, payload)
+        _assert(dry["dry_run"] and not session_paths(workdir)["issue_cluster_events"].exists(), str(dry))
+        _assert(issues_path.read_bytes() == raw_before, "dry run mutated raw issues")
+
+        decision_path = root / "decisions.json"
+        _write_json(decision_path, payload)
+        accepted = import_canonical_issue_clusters(workdir, decision_path, accept=True)
+        _assert(accepted["accepted"] and accepted["prepared_decision_count"] == 10, str(accepted))
+        _assert(issues_path.read_bytes() == raw_before, "accepted import mutated raw issues")
+        _assert(session_paths(workdir)["canonical_issue_clusters"].exists(), "canonical snapshot missing")
+        _assert(Path(accepted["ledger_paths"]["json"]).exists(), "canonical ledger missing")
+        _assert((workdir / "logs" / "issue_cluster_decisions.jsonl").exists(), "decision log missing")
+
+        repeated = import_canonical_cluster_decisions(workdir, payload, accept=True)
+        _assert(repeated["prepared_decision_count"] == 0, str(repeated))
+        _assert(issue_cluster_history(workdir)["event_count"] == 10, str(issue_cluster_history(workdir)))
+        view = canonical_issue_cluster_view(workdir)
+        _assert(view["canonical_counts_applicable"], str(view))
+        _assert(view["report_readiness"]["status"] == "adjudication_incomplete", str(view))
+
+        try:
+            import_canonical_cluster_decisions(
+                workdir,
+                {"decisions": [decision("C999", ["I001"], "verified")]},
+            )
+        except ValueError:
+            pass
+        else:
+            raise RegressionFailure("conflicting raw issue assignment was accepted")
+
+        concise = build_concise_report_json(session)
+        concise_md = build_concise_report_markdown(session)
+        concise_ids = {item.get("issue_id") for item in concise["main_issues"]}
+        _assert("I001" in concise_ids and "I005" in concise_ids and "I007" in concise_ids, str(concise_ids))
+        _assert("I002" not in concise_ids and "I003" not in concise_ids and "I004" not in concise_ids and "I008" not in concise_ids, str(concise_ids))
+        _assert(concise["canonical_filter_applied"], str(concise))
+        _assert(concise["external_verification_required"][0]["cluster_id"] == "C005", str(concise))
+        _assert("External-source questions" in concise_md and "Canonical issue status" in concise_md, concise_md)
+        full_md = build_final_report_markdown(session)
+        _assert("Accepted canonical dispositions" in full_md and "C001" in full_md, full_md)
+
+        changed = decision("C001", ["I001", "I002"], "rejected", severity="none", downstream=["C003"], serious="not_required")
+        import_canonical_cluster_decisions(workdir, {"decisions": [changed]}, accept=True)
+        stale = canonical_issue_cluster_view(workdir)
+        stale_ids = set(stale["stale_cluster_ids"])
+        _assert("C003" in stale_ids and "C007" in stale_ids, str(stale))
+        _assert("C006" not in stale_ids, str(stale))
+
+        reconciled = decision("C007", ["I008"], "verified", severity="high", include=True, upstream=["C001"], serious="accepted", clear=True)
+        import_canonical_cluster_decisions(workdir, {"decisions": [reconciled]}, accept=True)
+        after_reconcile = canonical_issue_cluster_view(workdir)
+        _assert("C007" not in set(after_reconcile["stale_cluster_ids"]), str(after_reconcile))
+        _assert("C003" in set(after_reconcile["stale_cluster_ids"]), str(after_reconcile))
+
+        superseding = decision("C010", ["I001", "I002"], "resolved", severity="low", supersedes=["C001"])
+        import_canonical_cluster_decisions(workdir, {"decisions": [superseding]}, accept=True)
+        superseded = canonical_issue_cluster_view(workdir)
+        _assert("C001" in {item["cluster_id"] for item in superseded["superseded_clusters"]}, str(superseded))
+        _assert("C010" in {item["cluster_id"] for item in superseded["clusters"]}, str(superseded))
+        _assert("C003" in set(superseded["stale_cluster_ids"]), str(superseded))
+        _assert(issue_cluster_history(workdir)["event_count"] > len(superseded["clusters"]), "history was not preserved")
+        ledger = build_canonical_issue_ledger(workdir)
+        _assert(Path(ledger["json"]).exists() and Path(ledger["markdown"]).exists(), str(ledger))
+        ledger_before = Path(ledger["json"]).read_bytes()
+        build_canonical_issue_ledger(workdir)
+        _assert(Path(ledger["json"]).read_bytes() == ledger_before, "canonical ledger rebuild was not idempotent")
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_canonical_split_merge_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        _seed_state(workdir)
+        split_issues = [
+            issue("I001", "First formulation"), issue("I002", "Second formulation"), issue("I003", "Third formulation")
+        ]
+        _write_json(session_paths(workdir)["issues"], {"issues": split_issues, "updated_at": NEW})
+        import_canonical_cluster_decisions(
+            workdir,
+            {"decisions": [decision("COLD", ["I001", "I002", "I003"], "verified", serious="accepted")]},
+            accept=True,
+        )
+        split_left = decision("CLEFT", ["I001", "I002"], "verified", serious="accepted", supersedes=["COLD"])
+        split_left["decision_type"] = "split"
+        split_right = decision("CRIGHT", ["I003"], "verified", serious="accepted", supersedes=["COLD"])
+        split_right["decision_type"] = "split"
+        import_canonical_cluster_decisions(workdir, {"decisions": [split_left, split_right]}, accept=True)
+        split_view = canonical_issue_cluster_view(workdir)
+        _assert({"CLEFT", "CRIGHT"} <= {item["cluster_id"] for item in split_view["clusters"]}, str(split_view))
+        old = next(item for item in split_view["superseded_clusters"] if item["cluster_id"] == "COLD")
+        _assert(set(old["superseded_by_cluster_ids"]) == {"CLEFT", "CRIGHT"}, str(old))
+        merged = decision("CMERGE", ["I001", "I002", "I003"], "resolved", severity="low", supersedes=["CLEFT", "CRIGHT"])
+        merged["decision_type"] = "merge"
+        import_canonical_cluster_decisions(workdir, {"decisions": [merged]}, accept=True)
+        merged_view = canonical_issue_cluster_view(workdir)
+        _assert({item["cluster_id"] for item in merged_view["clusters"]} == {"CMERGE"}, str(merged_view))
+        _assert(issue_cluster_history(workdir)["event_count"] == 4, str(issue_cluster_history(workdir)))
+
+    with tempfile.TemporaryDirectory(prefix="math_audit_canonical_legacy_") as tmp:
+        workdir = Path(tmp) / "paper_audit"
+        session = _seed_state(workdir)
+        _write_json(session_paths(workdir)["issues"], {"issues": [issue("I001", "Legacy raw issue")], "updated_at": NEW})
+        legacy_md = build_concise_report_markdown(session)
+        _assert("Raw Only" in legacy_md and "raw candidate findings" in legacy_md, legacy_md)
+        legacy_json = build_concise_report_json(session)
+        _assert(not legacy_json["canonical_filter_applied"], str(legacy_json))
+        _assert(legacy_json["issue_count_basis"] == "raw_issue_candidates", str(legacy_json))
+
+
 def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
     try:
         func()
@@ -5911,6 +6191,7 @@ def main() -> int:
         ("AUX printed label display in reports", test_aux_printed_label_display_in_reports),
         ("concise report notable incorrect reference issues", test_concise_report_notable_incorrect_reference_issues),
         ("issue recheck overlay in reports", test_issue_recheck_overlay_in_reports),
+        ("canonical issue clustering foundation", test_canonical_issue_clustering_foundation),
         ("fresh rerun request metadata", test_fresh_rerun_request_metadata),
         ("usage cache diagnostics", test_usage_cache_diagnostics),
         ("retryable file download timeout detection", test_retryable_file_download_timeout_detection),

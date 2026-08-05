@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from audit_chunking import load_pdf_pages, normalize_whitespace, strip_tex_comments
+from audit_issue_clusters import (
+    canonical_concise_issue_records,
+    canonical_issue_cluster_view,
+    canonical_issue_status_summary,
+)
 from audit_state import (
     format_duration,
     load_issues,
@@ -2989,6 +2994,22 @@ def _issue_severity_summary(session: dict[str, Any], only_open_issues: bool = Fa
     counts = {severity: 0 for severity in _ISSUE_SEVERITY_SUMMARY_ORDER}
     unknown = 0
     try:
+        canonical = canonical_issue_cluster_view(session)
+    except Exception:
+        canonical = {}
+    if canonical.get("canonical_counts_applicable"):
+        canonical_counts = (canonical.get("summary") or {}).get("headline_severity_counts") or {}
+        for severity in counts:
+            counts[severity] = int(canonical_counts.get(severity, 0) or 0)
+        unknown = int(canonical_counts.get("unknown", 0) or 0)
+        return {
+            "only_open_issues": bool(only_open_issues),
+            "counts": counts,
+            "unknown": unknown,
+            "total": sum(counts.values()) + unknown,
+            "source": "canonical_clusters",
+        }
+    try:
         issues_state = load_issues(session)
         issues = list(issues_state.get("issues", []) or [])
     except Exception:
@@ -3013,6 +3034,7 @@ def _issue_severity_summary(session: dict[str, Any], only_open_issues: bool = Fa
         "counts": counts,
         "unknown": unknown,
         "total": total,
+        "source": "raw_issue_candidates",
     }
 
 
@@ -3067,7 +3089,9 @@ def _audit_summary_items(
 
     severity_summary = _issue_severity_summary(session, only_open_issues=issue_summary_open_only)
     counts = severity_summary["counts"]
-    if issue_summary_open_only:
+    if severity_summary.get("source") == "canonical_clusters":
+        items.append(("Issue severity summary", "canonical issue clusters"))
+    elif issue_summary_open_only:
         items.append(("Open issue severity summary", "open issues only"))
     else:
         items.append(("Issue severity summary", "all saved issues"))
@@ -3075,7 +3099,11 @@ def _audit_summary_items(
         items.append((severity.title(), str(counts.get(severity, 0))))
     if severity_summary.get("unknown"):
         items.append(("Unknown severity", str(severity_summary["unknown"])))
-    total_label = "Total open issues" if issue_summary_open_only else "Total issues"
+    total_label = (
+        "Total canonical headline issues"
+        if severity_summary.get("source") == "canonical_clusters"
+        else "Total open issues" if issue_summary_open_only else "Total issues"
+    )
     items.append((total_label, str(severity_summary["total"])))
     recheck_overlay = _build_issue_recheck_overlay(session)
     recheck_summary = recheck_overlay.get("issue_recheck_summary") or {}
@@ -3088,7 +3116,7 @@ def _audit_summary_items(
                 (
                     f"{family_count} accepted issue-family recheck(s) applied; "
                     f"{downstream_count} downstream-covered issue(s) are grouped in report treatment. "
-                    "Canonical issue records and severity counts are unchanged."
+                    "Raw issue records are unchanged; canonical cluster processing, when present, is separate."
                 ),
             )
         )
@@ -3372,6 +3400,107 @@ def build_final_report_tex(session: dict[str, Any], report_title: Optional[str] 
 
 _old_build_final_report_markdown_with_local_verification = build_final_report_markdown
 _old_build_final_report_tex_with_local_verification = build_final_report_tex
+
+
+def _canonical_issue_status_markdown(session: dict[str, Any], *, detailed: bool) -> str:
+    try:
+        view = canonical_issue_cluster_view(session)
+    except Exception as exc:
+        return f"## Canonical issue status\n\n> Canonical issue metadata could not be read: {exc}\n\n"
+    readiness = view.get("report_readiness") or {}
+    status = str(readiness.get("status") or "raw_only")
+    if status == "raw_only":
+        message = (
+            "This report contains raw candidate findings. Semantic consolidation has not been accepted, "
+            "so this is not a final consolidated mathematical assessment."
+        )
+    elif status == "canonical_report_ready":
+        message = "Accepted canonical issue clustering and adjudication are complete for this report build."
+    else:
+        message = "Canonical consolidation is incomplete; unresolved raw candidates or adjudication blockers remain."
+    lines = [
+        "## Canonical issue status", "", f"> **{status.replace('_', ' ').title()}.** {message}", "",
+        f"- Raw candidate records: {view.get('raw_issue_count', 0)}",
+        f"- Current canonical clusters: {view.get('accepted_cluster_count', 0)}",
+        f"- Unclustered raw candidates: {len(view.get('unclustered_raw_issue_ids') or [])}",
+    ]
+    for blocker in readiness.get("blockers") or []:
+        lines.append(f"- Readiness blocker: {normalize_math_delimiters(str(blocker))}")
+    if detailed and view.get("clusters"):
+        lines.extend(["", "### Accepted canonical dispositions", ""])
+        for cluster in view["clusters"]:
+            ids = ", ".join(cluster.get("raw_issue_ids") or [])
+            line = (
+                f"- **{cluster.get('cluster_id')}** [{cluster.get('lifecycle_state')}; "
+                f"final severity {cluster.get('final_severity')}]: "
+                f"{normalize_math_delimiters(str(cluster.get('title') or 'Untitled cluster'))} "
+                f"(raw records: {ids})"
+            )
+            if cluster.get("reconciliation_required"):
+                line += " **Dependency reconciliation required.**"
+            lines.append(line)
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _canonical_issue_status_tex(session: dict[str, Any], *, detailed: bool) -> str:
+    try:
+        view = canonical_issue_cluster_view(session)
+    except Exception as exc:
+        return r"\section*{Canonical issue status}" + "\n" + _report_latex_paragraph_local(
+            f"Canonical issue metadata could not be read: {exc}"
+        ) + "\n"
+    readiness = view.get("report_readiness") or {}
+    status = str(readiness.get("status") or "raw_only")
+    message = (
+        "This report contains raw candidate findings. Semantic consolidation has not been accepted, so this is not a final consolidated mathematical assessment."
+        if status == "raw_only"
+        else "Accepted canonical issue clustering and adjudication are complete for this report build."
+        if status == "canonical_report_ready"
+        else "Canonical consolidation is incomplete; unresolved raw candidates or adjudication blockers remain."
+    )
+    parts = [r"\section*{Canonical issue status}", _report_latex_paragraph_local(f"{status.replace('_', ' ').title()}. {message}"), r"\begin{itemize}"]
+    parts.extend([
+        r"\item " + _report_latex_paragraph_local(f"Raw candidate records: {view.get('raw_issue_count', 0)}"),
+        r"\item " + _report_latex_paragraph_local(f"Current canonical clusters: {view.get('accepted_cluster_count', 0)}"),
+        r"\item " + _report_latex_paragraph_local(f"Unclustered raw candidates: {len(view.get('unclustered_raw_issue_ids') or [])}"),
+    ])
+    for blocker in readiness.get("blockers") or []:
+        parts.append(r"\item Readiness blocker: " + _report_latex_paragraph_local(str(blocker)))
+    parts.append(r"\end{itemize}")
+    if detailed and view.get("clusters"):
+        parts.extend([r"\subsection*{Accepted canonical dispositions}", r"\begin{itemize}"])
+        for cluster in view["clusters"]:
+            text = (
+                f"{cluster.get('cluster_id')} [{cluster.get('lifecycle_state')}; final severity {cluster.get('final_severity')}]: "
+                f"{cluster.get('title') or 'Untitled cluster'} (raw records: {', '.join(cluster.get('raw_issue_ids') or [])})"
+            )
+            if cluster.get("reconciliation_required"):
+                text += " Dependency reconciliation required."
+            parts.append(r"\item " + _report_latex_paragraph_local(text))
+        parts.append(r"\end{itemize}")
+    return "\n".join(parts) + "\n"
+
+
+def _canonical_external_markdown(clusters: list[dict[str, Any]]) -> str:
+    if not clusters:
+        return ""
+    lines = ["## External-source questions", "", "These items require evidence outside the audited manuscript before adjudication.", ""]
+    for cluster in clusters:
+        requirements = "; ".join(cluster.get("external_source_requirements") or []) or "External source not specified."
+        lines.append(f"- **{cluster.get('cluster_id')} - {normalize_math_delimiters(str(cluster.get('title') or 'Untitled'))}:** {normalize_math_delimiters(requirements)}")
+    return "\n".join(lines) + "\n"
+
+
+def _canonical_external_tex(clusters: list[dict[str, Any]]) -> str:
+    if not clusters:
+        return ""
+    parts = [r"\section*{External-source questions}", _report_latex_paragraph_local("These items require evidence outside the audited manuscript before adjudication."), r"\begin{itemize}"]
+    for cluster in clusters:
+        requirements = "; ".join(cluster.get("external_source_requirements") or []) or "External source not specified."
+        parts.append(r"\item " + _report_latex_paragraph_local(f"{cluster.get('cluster_id')} - {cluster.get('title') or 'Untitled'}: {requirements}"))
+    parts.append(r"\end{itemize}")
+    return "\n".join(parts) + "\n"
 
 
 def build_final_report_markdown(session: dict[str, Any], report_title: Optional[str] = None) -> str:  # type: ignore[no-redef]
@@ -3816,7 +3945,8 @@ def build_final_report_markdown(session: dict[str, Any], report_title: Optional[
     text = _rewrite_markdown_report_references(text, session, style=style)
     source_block = _source_ingestion_status_markdown(session)
     reference_block = _reference_report_status_markdown(session, style=style)
-    text = _inject_markdown_reference_status(text, source_block + reference_block)
+    canonical_block = _canonical_issue_status_markdown(session, detailed=True)
+    text = _inject_markdown_reference_status(text, source_block + reference_block + canonical_block)
     return _insert_markdown_report_front_matter(text, session)
 
 
@@ -3826,7 +3956,8 @@ def build_final_report_tex(session: dict[str, Any], report_title: Optional[str] 
     text = _rewrite_tex_report_references(text, session, style=style)
     source_block = _source_ingestion_status_tex(session)
     reference_block = _reference_report_status_tex(session, style=style)
-    text = _inject_tex_reference_status(text, source_block + reference_block)
+    canonical_block = _canonical_issue_status_tex(session, detailed=True)
+    text = _inject_tex_reference_status(text, source_block + reference_block + canonical_block)
     return _insert_tex_report_front_matter(text, session)
 
 
@@ -3861,6 +3992,7 @@ def build_final_report(
     md_text = build_final_report_markdown(session, report_title=report_title)
     tex_text = build_final_report_tex(session, report_title=report_title)
     issue_recheck_overlay = _build_issue_recheck_overlay(session)
+    canonical_issue_view = canonical_issue_cluster_view(session)
     source_diagnostics = source_ingestion_diagnostics(session)
     verification_results = _load_verification_results(session, state=load_verification_state(session))
     verification_summary = _verification_summary_counts(verification_results)
@@ -3914,6 +4046,10 @@ def build_final_report(
         "issue_recheck_summary": issue_recheck_overlay.get("issue_recheck_summary", {}),
         "issue_recheck_overlay": issue_recheck_overlay,
         "grouped_downstream_issues": issue_recheck_overlay.get("grouped_downstream_issues", {}),
+        "canonical_issue_clusters": canonical_issue_view,
+        "canonical_issue_summary": canonical_issue_status_summary(session),
+        "report_readiness": canonical_issue_view.get("report_readiness", {}),
+        "issue_count_basis": "canonical_clusters" if canonical_issue_view.get("canonical_counts_applicable") else "raw_issue_candidates",
         "latex_compile_health": latex_compile_health,
         "generated_at": utc_now(),
     }
@@ -3978,6 +4114,9 @@ def _collect_concise_report_data(
     verification_findings = verification_findings_for_session(session, results=verification_results)
 
     candidate_issues = list(issues_state.get("issues", []) or [])
+    canonical_selection = canonical_concise_issue_records(session)
+    if canonical_selection.get("canonical_applied"):
+        candidate_issues = list(canonical_selection.get("issues") or [])
     if normalized_options.get("only_open_issues", True):
         candidate_issues = [
             issue
@@ -3987,7 +4126,10 @@ def _collect_concise_report_data(
     selected_issues = [
         issue
         for issue in candidate_issues
-        if _is_concise_selected_issue(issue, normalized_options) and not _is_pure_typographical_issue(issue)
+        if (
+            _is_concise_selected_issue(issue, normalized_options)
+            or issue.get("canonical_include_in_concise_report")
+        ) and not _is_pure_typographical_issue(issue)
         and not _issue_recheck_is_downstream_covered(issue, issue_recheck_overlay)
     ]
     selected_issues.sort(key=lambda issue: _concise_issue_sort_key(issue, chunk_map))
@@ -4031,6 +4173,9 @@ def _collect_concise_report_data(
         "verification_execution_summary": verification_summary.get("execution_summary", {}),
         "verification_mathematical_outcome_summary": verification_summary.get("mathematical_outcome_summary", {}),
         "verification_findings": verification_findings,
+        "canonical_issue_selection": canonical_selection,
+        "canonical_issue_view": canonical_selection.get("view", {}),
+        "external_verification_required": canonical_selection.get("external_verification_required", []),
     }
 
 
@@ -4118,6 +4263,12 @@ def _high_priority_issues_markdown(entries: list[dict[str, Any]], options: Optio
             ]
         )
         lines.extend(_issue_recheck_markdown_lines(issue, entry.get("recheck")))
+        if issue.get("canonical_cluster_id"):
+            lines.append(
+                f"- Canonical cluster: {issue.get('canonical_cluster_id')} "
+                f"[{issue.get('canonical_lifecycle_state')}]; consolidates "
+                f"{', '.join(issue.get('canonical_raw_issue_ids') or [])}."
+            )
         lines.append("")
     return "\n".join(lines)
 
@@ -4149,6 +4300,14 @@ def _high_priority_issues_tex(entries: list[dict[str, Any]], options: Optional[d
         tag_text = ", ".join(issue.get("tags", [])) if issue.get("tags") else "none"
         parts.append(r"\item Tags: " + _report_latex_paragraph_local(tag_text))
         parts.extend(_issue_recheck_tex_items(issue, entry.get("recheck")))
+        if issue.get("canonical_cluster_id"):
+            parts.append(
+                r"\item Canonical cluster: "
+                + _report_latex_paragraph_local(
+                    f"{issue.get('canonical_cluster_id')} [{issue.get('canonical_lifecycle_state')}]; "
+                    f"consolidates {', '.join(issue.get('canonical_raw_issue_ids') or [])}."
+                )
+            )
         parts.append(r"\end{itemize}")
     return "\n".join(parts) + "\n"
 
@@ -4288,6 +4447,9 @@ def build_concise_report_markdown(
     notable_markdown = _notable_proof_reference_issues_markdown(data["notable_proof_reference_entries"]).rstrip()
     if notable_markdown:
         lines.extend([notable_markdown, ""])
+    external_markdown = _canonical_external_markdown(data["external_verification_required"]).rstrip()
+    if external_markdown:
+        lines.extend([external_markdown, ""])
     if normalized_options.get("include_typographical_issues", True):
         lines.extend([_typographical_errors_markdown(data["typographical_entries"]).rstrip(), ""])
     if normalized_options.get("include_omitted_material_note", True):
@@ -4297,7 +4459,8 @@ def build_concise_report_markdown(
     text = _rewrite_markdown_report_references(text, session, style=style)
     source_block = _source_ingestion_status_markdown(session)
     reference_block = _reference_report_status_markdown(session, style=style)
-    text = _inject_markdown_reference_status(text, source_block + reference_block)
+    canonical_block = _canonical_issue_status_markdown(session, detailed=False)
+    text = _inject_markdown_reference_status(text, source_block + reference_block + canonical_block)
     return _insert_markdown_report_front_matter(
         text,
         session,
@@ -4357,6 +4520,9 @@ def build_concise_report_tex(
     notable_tex = _notable_proof_reference_issues_tex(data["notable_proof_reference_entries"])
     if notable_tex:
         parts.append(notable_tex + "\n")
+    external_tex = _canonical_external_tex(data["external_verification_required"])
+    if external_tex:
+        parts.append(external_tex + "\n")
     if normalized_options.get("include_typographical_issues", True):
         parts.append(_typographical_errors_tex(data["typographical_entries"]) + "\n")
     if normalized_options.get("include_omitted_material_note", True):
@@ -4369,7 +4535,8 @@ def build_concise_report_tex(
     text = _rewrite_tex_report_references(text, session, style=style)
     source_block = _source_ingestion_status_tex(session)
     reference_block = _reference_report_status_tex(session, style=style)
-    text = _inject_tex_reference_status(text, source_block + reference_block)
+    canonical_block = _canonical_issue_status_tex(session, detailed=False)
+    text = _inject_tex_reference_status(text, source_block + reference_block + canonical_block)
     return _insert_tex_report_front_matter(
         text,
         session,
@@ -4443,6 +4610,12 @@ def build_concise_report_json(
         "issue_recheck_summary": data["issue_recheck_overlay"].get("issue_recheck_summary", {}),
         "issue_recheck_overlay": data["issue_recheck_overlay"],
         "grouped_downstream_issues": data["issue_recheck_overlay"].get("grouped_downstream_issues", {}),
+        "canonical_issue_clusters": data["canonical_issue_view"],
+        "canonical_issue_summary": canonical_issue_status_summary(session),
+        "report_readiness": data["canonical_issue_view"].get("report_readiness", {}),
+        "canonical_filter_applied": bool(data["canonical_issue_selection"].get("canonical_applied")),
+        "external_verification_required": data["external_verification_required"],
+        "issue_count_basis": "canonical_clusters" if data["canonical_issue_selection"].get("canonical_applied") else "raw_issue_candidates",
     }
 
 
