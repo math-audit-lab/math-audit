@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional
 from openai import OpenAI
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
+from audit_models import canonical_model_id
 from audit_hooks import configure_runtime
 from audit_policy_hooks import build_final_report, build_user_message_for_chunk
 from audit_prompts import (
@@ -104,6 +105,8 @@ def format_chunk_completion_log_line(payload: dict[str, Any], usage_entry: dict[
     totals = usage.get("totals") or {}
     chunk_id = str(usage_entry.get("chunk_id") or status.get("current_chunk_id") or "chunk")
     parts = [f"[{chunk_id}] completed"]
+    if usage_entry.get("model"):
+        parts.append(f"Model: {usage_entry['model']}")
 
     chunks_completed = status.get("chunks_completed")
     chunks_total = status.get("chunks_total")
@@ -121,11 +124,11 @@ def format_chunk_completion_log_line(payload: dict[str, Any], usage_entry: dict[
     cost = usage_entry.get("cost") or {}
     chunk_cost = cost.get("total_cost", usage_entry.get("cost_usd"))
     if chunk_cost is not None:
-        parts.append(f"Chunk cost: ${float(chunk_cost or 0.0):.4f}")
+        parts.append(f"Chunk cost: {'~' if cost.get('approximate') else ''}${float(chunk_cost or 0.0):.4f}")
 
     cumulative_cost = totals.get("cost_usd", status.get("cost_usd"))
     if cumulative_cost is not None:
-        parts.append(f"Cumulative cost: ${float(cumulative_cost or 0.0):.4f}")
+        parts.append(f"Cumulative cost: {'~' if totals.get('cost_approximate') else ''}${float(cumulative_cost or 0.0):.4f}")
 
     total_seconds = totals.get("audit_seconds", status.get("total_audit_seconds"))
     if total_seconds is not None:
@@ -284,6 +287,7 @@ class GuiController(QObject):
         self.pdf_path = ""
         self.model = DEFAULT_MODEL
         self.reasoning_effort = DEFAULT_REASONING_EFFORT
+        self.reasoning_mode = "standard"
         self.qa_context_mode = DEFAULT_QA_CONTEXT_MODE
         self.audit_context_mode = DEFAULT_AUDIT_CONTEXT_MODE
 
@@ -357,6 +361,9 @@ class GuiController(QObject):
         self.poll_status()
 
     def set_model(self, model: str) -> None:
+        if canonical_model_id(model) not in MODEL_CHOICES:
+            self.log_message.emit("Choose a current model from the Model list for a new audit. Historical settings are display-only.")
+            return
         previous_effort = self.reasoning_effort
         self.model, self.reasoning_effort = normalize_model_and_reasoning_effort(model, previous_effort)
         if previous_effort and self.reasoning_effort != previous_effort:
@@ -364,9 +371,12 @@ class GuiController(QObject):
                 f"Reasoning effort adjusted to {self.reasoning_effort} for model {self.model}; "
                 f"{previous_effort} is not supported by this model."
             )
+        self.reasoning_mode = "standard"
         self._mark_model_effort_override_if_needed()
 
     def set_reasoning_effort(self, reasoning_effort: str) -> None:
+        if self.model not in MODEL_CHOICES:
+            return
         self.model, self.reasoning_effort = normalize_model_and_reasoning_effort(self.model, reasoning_effort)
         self._mark_model_effort_override_if_needed()
 
@@ -466,20 +476,31 @@ class GuiController(QObject):
             return
         session = load_session_from_pdf(self.pdf_path)
         if not session:
+            if self.model not in MODEL_CHOICES:
+                self.model = DEFAULT_MODEL
+                self.reasoning_effort = DEFAULT_REASONING_EFFORT
+                self.reasoning_mode = "standard"
+                self.audit_settings_changed.emit(self.model, self.reasoning_effort)
             return
-        model, effort = normalize_model_and_reasoning_effort(
-            session.get("model"),
-            session.get("reasoning_effort"),
-        )
+        # Loading is observational: never normalize historical provenance.
+        model = str(session.get("model") or "")
+        effort = str(session.get("reasoning_effort") or "")
         self.model = model
         self.reasoning_effort = effort
+        self.reasoning_mode = str(session.get("reasoning_mode") or "standard")
         saved_context_mode = str(session.get("audit_context_mode") or DEFAULT_AUDIT_CONTEXT_MODE)
         self.audit_context_mode = saved_context_mode if saved_context_mode in AUDIT_CONTEXT_MODES else DEFAULT_AUDIT_CONTEXT_MODE
         self._saved_session_model = model
         self._saved_session_reasoning_effort = effort
         self.audit_settings_changed.emit(model, effort)
         self.audit_context_mode_changed.emit(self.audit_context_mode)
-        self.log_message.emit(f"Loaded saved audit settings: {model} / {effort} / context={self.audit_context_mode}")
+        self.log_message.emit(
+            f"Loaded saved audit settings: {model or 'unspecified'} / {effort or 'unspecified'} / "
+            f"mode={self.reasoning_mode} / context={self.audit_context_mode}"
+        )
+        warning = self.saved_session_live_warning(session)
+        if warning:
+            self.log_message.emit(warning)
 
     def fresh_start_context_mode_mismatch_info(self) -> dict[str, str]:
         return fresh_start_context_mode_mismatch_info(self.pdf_path, self.audit_context_mode)
@@ -585,7 +606,13 @@ class GuiController(QObject):
         was_active = self._model_effort_override_active
         self._model_effort_override_active = differs
         if differs and not was_active:
-            self.log_message.emit(f"Overriding saved audit settings: {self.model} / {self.reasoning_effort}")
+            if self._saved_session_model not in MODEL_CHOICES:
+                self.log_message.emit(
+                    f"New-audit settings selected: {self.model} / {self.reasoning_effort}. "
+                    "The legacy audit remains unchanged; use Start Fresh Audit."
+                )
+            else:
+                self.log_message.emit(f"Explicit settings selection: {self.model} / {self.reasoning_effort}")
 
     def has_active_task(self) -> bool:
         return self._active_thread is not None
@@ -634,7 +661,13 @@ class GuiController(QObject):
     def start_fresh_audit(self) -> None:
         if not self._require_pdf_file():
             return
-        if not self._require_api_key_for_live_calls():
+        if self.model not in MODEL_CHOICES:
+            self.log_message.emit(
+                "Select a current model, then choose Start Fresh Audit. "
+                "The saved legacy model will not be silently substituted."
+            )
+            return
+        if not self._require_api_key_for_live_calls(allow_historical_session=True):
             return
         self._reset_chunk_completion_log_state_for_new_audit()
         audit_prompt, audit_prompt_source = effective_audit_system_prompt_with_source(self.model)
@@ -690,13 +723,13 @@ class GuiController(QObject):
                 return
             if not self._require_session():
                 return
-            if not self._require_api_key_for_live_calls():
+            if not self._require_api_key_for_live_calls(allow_historical_session=True):
                 return
             self._run_concurrent_cancel_current_chunk_task(include_manifest=True)
             return
         if not self._require_session():
             return
-        if not self._require_api_key_for_live_calls():
+        if not self._require_api_key_for_live_calls(allow_historical_session=True):
             return
         payload = self._load_status_payload()
         pending = ((payload.get("session") or {}).get("pending") or {})
@@ -1208,7 +1241,7 @@ class GuiController(QObject):
         total_seconds = float(totals.get("audit_seconds", 0.0) or 0.0)
         completion_summary = (
             f"{chunks_completed}/{chunks_total} chunks | "
-            f"${total_cost:.4f} | "
+            f"{'~' if totals.get('cost_approximate') else ''}${total_cost:.4f} | "
             f"{self._format_duration(total_seconds)}"
         )
 
@@ -1627,7 +1660,31 @@ class GuiController(QObject):
             return False
         return True
 
-    def _require_api_key_for_live_calls(self) -> bool:
+    def saved_session_live_warning(self, session: Optional[dict[str, Any]] = None) -> str:
+        if session is None:
+            session = load_session_from_pdf(self.pdf_path) if self.pdf_path else None
+        if not session:
+            return ""
+        model = str(session.get("model") or "")
+        if model not in MODEL_CHOICES:
+            return (
+                f"Legacy session ({model or 'unspecified model'}): inspection remains available. "
+                "Live continuation, reruns, rechecks, and discussion are disabled for this session. "
+                "Select a current model and use Start Fresh Audit to preserve the historical results in an archive."
+            )
+        if str(session.get("reasoning_mode") or "standard") != "standard":
+            return (
+                "This session records a nonstandard reasoning mode. Its saved mode is preserved. "
+                "Pro mode is not exposed in this version; use a fresh standard-mode audit for new work."
+            )
+        return ""
+
+    def _require_api_key_for_live_calls(self, *, allow_historical_session: bool = False) -> bool:
+        if not allow_historical_session:
+            warning = self.saved_session_live_warning()
+            if warning:
+                self.log_message.emit(warning)
+                return False
         if self.live_api_key_available():
             return True
         self.log_message.emit("Enter an API key before starting a live API action.")

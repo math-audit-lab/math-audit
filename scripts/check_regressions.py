@@ -188,7 +188,7 @@ def _synthetic_session(workdir: Path) -> dict[str, Any]:
         "updated_at": OLD,
         "workdir": str(workdir),
         "pdf_path": str(workdir.parent / "paper.pdf"),
-        "model": "gpt-5.4",
+        "model": runtime.DEFAULT_MODEL,
         "reasoning_effort": "high",
         "audit_started_at": OLD,
         "audit_finished_at": OLD,
@@ -254,26 +254,26 @@ def _assert(condition: bool, message: str) -> None:
 
 
 def test_model_capabilities_defaults_and_pricing() -> None:
-    _assert(runtime.DEFAULT_MODEL == "gpt-5.6-sol", runtime.DEFAULT_MODEL)
+    _assert(runtime.DEFAULT_MODEL == "gpt-6.1-sol", runtime.DEFAULT_MODEL)
     _assert(runtime.DEFAULT_REASONING_EFFORT == "xhigh", runtime.DEFAULT_REASONING_EFFORT)
-    _assert(runtime.model_choices()[0] == "gpt-5.6-sol", str(runtime.model_choices()))
-    _assert(runtime.model_display_name("gpt-5.6-sol") == "GPT-5.6 Sol — recommended", runtime.model_display_name("gpt-5.6-sol"))
+    _assert(runtime.model_choices()[0] == "gpt-6.1-sol", str(runtime.model_choices()))
+    _assert(runtime.model_display_name("gpt-6.1-sol") == "GPT-6.1 Sol — Recommended", runtime.model_display_name("gpt-6.1-sol"))
     _assert(
-        runtime.supported_reasoning_efforts_for_model("gpt-5.6-sol")
-        == ["none", "low", "medium", "high", "xhigh", "max"],
-        str(runtime.supported_reasoning_efforts_for_model("gpt-5.6-sol")),
+        runtime.supported_reasoning_efforts_for_model("gpt-6.1-sol")
+        == ["low", "medium", "high", "xhigh", "max"],
+        str(runtime.supported_reasoning_efforts_for_model("gpt-6.1-sol")),
     )
-    _assert(runtime.default_reasoning_effort_for_model("gpt-5.6-sol") == "xhigh", "bad Sol default")
-    _assert(runtime.normalize_model_and_reasoning_effort(None, None) == ("gpt-5.6-sol", "xhigh"), "bad global default")
+    _assert(runtime.default_reasoning_effort_for_model("gpt-6.1-sol") == "xhigh", "bad Sol default")
+    _assert(runtime.normalize_model_and_reasoning_effort(None, None) == ("gpt-6.1-sol", "xhigh"), "bad global default")
     _assert(
-        runtime.normalize_model_and_reasoning_effort("GPT-5.6 Sol — recommended", "max")
-        == ("gpt-5.6-sol", "max"),
+        runtime.normalize_model_and_reasoning_effort("GPT-6.1 Sol — Recommended", "max")
+        == ("gpt-6.1-sol", "max"),
         "display label did not normalize to API model id",
     )
     _assert(runtime.normalize_model_and_reasoning_effort("gpt-5.5", "xhigh") == ("gpt-5.5", "xhigh"), "GPT-5.5 xhigh changed")
     _assert("max" not in runtime.supported_reasoning_efforts_for_model("gpt-5.5"), "GPT-5.5 exposes max")
     _assert(runtime.normalize_model_and_reasoning_effort("gpt-5.5", "max") == ("gpt-5.5", "xhigh"), "GPT-5.5 max not normalized")
-    _assert(runtime.normalize_model_and_reasoning_effort("gpt-5.6-sol", "unsupported") == ("gpt-5.6-sol", "xhigh"), "bad effort not normalized")
+    _assert(runtime.normalize_model_and_reasoning_effort("gpt-6.1-sol", "unsupported") == ("gpt-6.1-sol", "xhigh"), "bad effort not normalized")
 
     usage = {
         "input_tokens": 100_000,
@@ -4893,7 +4893,7 @@ def test_verification_finding_recheck_workflow() -> None:
     with tempfile.TemporaryDirectory(prefix="math_audit_verification_recheck_") as tmp:
         workdir = Path(tmp) / "paper_audit"
         session = _seed_state(workdir)
-        session["model"] = "gpt-5.6-sol"
+        session["model"] = "gpt-6.1-sol"
         session["reasoning_effort"] = "max"
         _write_json(session_paths(workdir)["session"], session)
         chunk_text = (
@@ -5162,7 +5162,7 @@ def test_verification_finding_recheck_workflow() -> None:
         preview = prepare_verification_finding_recheck_preview(session, selection=finding["finding_id"], output_dir=preview_dir)
         _assert(preview["manifest"]["dry_run"] is True, str(preview))
         _assert(Path(preview["previews"][0]["artifacts"]["prompt"]).exists(), str(preview))
-        _assert(resolve_verification_finding_recheck_settings(session) == ("gpt-5.6-sol", "max"), str(session))
+        _assert(resolve_verification_finding_recheck_settings(session) == ("gpt-6.1-sol", "max"), str(session))
 
         usage_state = json.loads(session_paths(workdir)["usage"].read_text(encoding="utf-8"))
         usage_state["totals"] = {
@@ -5185,7 +5185,7 @@ def test_verification_finding_recheck_workflow() -> None:
                 "output_tokens_details": {"reasoning_tokens": 50},
                 "total_tokens": 1200,
             },
-            model="gpt-5.6-sol",
+            model="gpt-6.1-sol",
             elapsed_seconds=2.5,
             activity_kind="verification_finding_recheck",
             activity_id="VR-001",
@@ -5204,7 +5204,7 @@ def test_verification_finding_recheck_workflow() -> None:
                 "event": "completed",
                 "finding_ids": [finding["finding_id"]],
                 "chunk_id": "chunk_008",
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6.1-sol",
                 "reasoning_effort": "max",
                 "structured_result": confirmed,
                 "canonical": True,
@@ -5263,7 +5263,7 @@ def test_verification_finding_recheck_workflow() -> None:
             artifact_root=replacement_root,
             structured_result=script_error,
             evidence=evidence,
-            model="gpt-5.6-sol",
+            model="gpt-6.1-sol",
             reasoning_effort="max",
         )
         append_verification_finding_recheck_event(
@@ -5465,10 +5465,10 @@ def test_verification_finding_recheck_workflow() -> None:
         finally:
             runtime.set_openai_client(previous_client)
         _assert(live_result["completed_count"] == 1 and live_result["failed_count"] == 0, str(live_result))
-        _assert(live_result["model"] == "gpt-5.6-sol" and live_result["reasoning_effort"] == "max", str(live_result))
+        _assert(live_result["model"] == "gpt-6.1-sol" and live_result["reasoning_effort"] == "max", str(live_result))
         _assert(not live_result["report_paths"], str(live_result))
         request = fake_client.responses.request
-        _assert(request.get("model") == "gpt-5.6-sol", str(request))
+        _assert(request.get("model") == "gpt-6.1-sol", str(request))
         _assert((request.get("reasoning") or {}).get("effort") == "max", str(request))
         request_text = json.dumps(request.get("input") or [], ensure_ascii=False)
         _assert(script_text in request_text.replace("\\n", "\n"), "live request omitted complete script")
@@ -5504,13 +5504,13 @@ def test_verification_technical_repair_workflow() -> None:
         for name in ("state", "python_checks", "verification_results", "responses", "logs", "reports"):
             (workdir / name).mkdir(parents=True, exist_ok=True)
         session = {
-            "pdf_path": str(pdf), "workdir": str(workdir), "model": "gpt-5.6-sol",
+            "pdf_path": str(pdf), "workdir": str(workdir), "model": "gpt-6.1-sol",
             "reasoning_effort": "max", "background": True, "store": True, "pending": None,
         }
         save_json(session_paths(workdir)["session"], session)
         save_json(session_paths(workdir)["status"], {"status": "completed", "updated_at": OLD})
         save_json(session_paths(workdir)["usage"], {
-            "model": "gpt-5.6-sol", "totals": {
+            "model": "gpt-6.1-sol", "totals": {
                 "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0,
                 "reasoning_tokens": 0, "total_tokens": 0, "cost_usd": 0.0, "audit_seconds": 0.0,
             }, "per_chunk": [],
@@ -5598,7 +5598,7 @@ def test_verification_technical_repair_workflow() -> None:
         _assert("prohibited operation" in build_verification_technical_repair_prompt(unsafe_evidence, "TR-UNSAFE"), "unsafe-specific repair instruction missing")
         preview_dir = root / "preview"
         preview = prepare_verification_technical_repair_preview(session, script_path.name, preview_dir)
-        _assert(preview["manifest"]["model"] == "gpt-5.6-sol", str(preview))
+        _assert(preview["manifest"]["model"] == "gpt-6.1-sol", str(preview))
         _assert(preview["manifest"]["reasoning_effort"] == "max", str(preview))
         _assert(any(preview_dir.glob("*.repair_prompt.txt")), "technical repair preview prompt missing")
 
@@ -5665,7 +5665,7 @@ def test_verification_technical_repair_workflow() -> None:
         finally:
             runtime.set_openai_client(previous_client)
         _assert(live["completed_count"] == 1 and live["failed_count"] == 0, str(live))
-        _assert(live["model"] == "gpt-5.6-sol" and live["reasoning_effort"] == "max", str(live))
+        _assert(live["model"] == "gpt-6.1-sol" and live["reasoning_effort"] == "max", str(live))
         request_text = json.dumps(fake_client.responses.request.get("input") or [], ensure_ascii=False)
         _assert(original_script in request_text.replace("\\n", "\n"), "live technical repair omitted complete script")
         _assert((fake_client.responses.request.get("text") or {}).get("format", {}).get("name") == "verification_technical_repair", str(fake_client.responses.request))
@@ -5675,14 +5675,14 @@ def test_verification_technical_repair_workflow() -> None:
         artifact_root = workdir / "verification_technical_repairs" / "TR-001"
         proposal = persist_verification_technical_repair_proposals(
             session, repair_id="TR-001", artifact_root=artifact_root,
-            structured_result=validated, evidence=evidence, model="gpt-5.6-sol", reasoning_effort="max",
+            structured_result=validated, evidence=evidence, model="gpt-6.1-sol", reasoning_effort="max",
         )
         _assert(proposal["ready_count"] == 1, str(proposal))
         append_verification_technical_repair_event(session, {
             "event": "completed", "status": "completed", "canonical": True,
             "repair_id": "TR-001", "script_id": script_path.name, "chunk_id": "chunk_005",
             "failure_type": "parse_error", "structured_result": validated,
-            "replacement_manifest_path": proposal["manifest_path"], "model": "gpt-5.6-sol",
+            "replacement_manifest_path": proposal["manifest_path"], "model": "gpt-6.1-sol",
             "reasoning_effort": "max",
         })
         original_before = script_path.read_bytes()
@@ -6160,7 +6160,22 @@ def _run_case(name: str, func: Callable[[], None]) -> RegressionResult:
 
 
 def main() -> int:
+    # These checks are offline; a forgotten mock must fail before contacting any host.
+    import socket
+    def deny_network(*args, **kwargs):
+        raise AssertionError("Network access is forbidden in the offline regression suite")
+    socket.socket.connect = deny_network
+    from scripts.check_model_migration import run_checks as check_models
+    from scripts.check_request_migration import run_checks as check_requests
+    from scripts.check_prompt_regressions import run_checks as check_prompts
+    from scripts.check_gui_model_regressions import run_checks as check_gui
+    from scripts.check_legacy_readonly import run_checks as check_legacy_reads
     cases: list[tuple[str, Callable[[], None]]] = [
+        ("GPT-6 model/pricing migration", check_models),
+        ("GPT-6 Responses compatibility and provenance", check_requests),
+        ("prompt safeguards and offline fixtures", check_prompts),
+        ("GUI current models and historical settings", check_gui),
+        ("historical inspection preserves all files", check_legacy_reads),
         ("model capabilities defaults and pricing", test_model_capabilities_defaults_and_pricing),
         ("report freshness detection", test_report_freshness_detection),
         ("audit completion builds full and concise reports", test_audit_completion_builds_full_and_concise_reports),

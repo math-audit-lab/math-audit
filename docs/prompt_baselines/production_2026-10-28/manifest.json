@@ -1,0 +1,45 @@
+{
+  "baseline_id": "production-before-gpt6-2026-10-28",
+  "captured_date": "2026-10-28",
+  "git_revision": "5259b11ea8685dcbde76b3fc6c28f7469c1739ff",
+  "description": "Offline exact string/f-string source inventory before model and prompt migration. Dynamic evidence is not included. Includes nonprompt strings to make capture exhaustive; do not execute inventory as instructions.",
+  "main_prompt_sha256": "7a775f4324ac29fa479be873555b7bf72b7c28a6b85866f9b180eb9fad04c854",
+  "inventory": "prompt_inventory.json.gz",
+  "modules": {
+    "audit_prompts.py": {
+      "source_sha256": "46b439c6440cd1550009ef96d0af2dfb1e710b0163c83863c7691834332a3c32",
+      "string_count": 42
+    },
+    "audit_policy_hooks.py": {
+      "source_sha256": "219d9e58a38badabb1caf2994d38671f0a683a452dfad709814d05cdd0832ff0",
+      "string_count": 3567
+    },
+    "audit_runtime.py": {
+      "source_sha256": "fa2798896327f7ac692213f877504a622c6b77f6712eba63b55f4f90a9d206f6",
+      "string_count": 7313
+    },
+    "audit_verification.py": {
+      "source_sha256": "edced6fc98f9f47d498f071d2425b232fde2a9bcf9ec0940faa7023d1633e420",
+      "string_count": 3211
+    },
+    "audit_issue_clusters.py": {
+      "source_sha256": "4537b6dfae7564befc49533b0fd0d89437216e7c6d117280e45501c9cf8a54f8",
+      "string_count": 822
+    },
+    "scripts/run_issue_family_recheck.py": {
+      "source_sha256": "2d47897f41c0250e5030b32a8e1d39fc9f2885968442d6b3ea833f8e35d3eea1",
+      "string_count": 535
+    },
+    "scripts/prepare_canonical_issue_clusters.py": {
+      "source_sha256": "a1a79097c7b2445e3d642f66244a5a255eb42e5373b72b9325f655f44e1fb97c",
+      "string_count": 187
+    }
+  },
+  "schemas": {
+    "audit_runtime.py:AUDIT_RESPONSE_SCHEMA": "f2d9cf14c6878e61acb27923af120faa5c1cab2fc002022162a9ac171808a1be",
+    "audit_verification.py:VERIFICATION_FINDING_RECHECK_RESPONSE_SCHEMA": "9eede2cb42d41e885fe2e62008a6b443dda546839db2956bd810e0039b1cac57",
+    "audit_verification.py:VERIFICATION_TECHNICAL_REPAIR_RESPONSE_SCHEMA": "2a11b11eae77a3d42e73e0e254fb174eb1fc3928dddb80958999c79bf8e093c3",
+    "scripts/run_issue_family_recheck.py:RESULT_SCHEMA": "9e006fdacc35a59473bcf11c599fb77a85648b8372d1ea883d5dd125617aac9d"
+  },
+  "schema_hash_kind": "exact_expression_source_utf8_sha256"
+}

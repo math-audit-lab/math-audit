@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui_controller import AUDIT_CONTEXT_MODE_CHOICES, AUDIT_CONTEXT_MODE_LABELS, DEFAULT_MODEL, MODEL_DISPLAY_CHOICES, GuiController
+from gui_controller import AUDIT_CONTEXT_MODE_CHOICES, AUDIT_CONTEXT_MODE_LABELS, DEFAULT_MODEL, MODEL_CHOICES, MODEL_DISPLAY_CHOICES, GuiController
 
 
 def review_tab_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
@@ -819,7 +819,10 @@ class MainWindow(QMainWindow):
         layout.addRow("PDF", pdf_row)
 
         self.model_combo = QComboBox()
+        # Read-only edit text can display a legacy ID without adding it to new-audit choices.
         self.model_combo.setEditable(True)
+        self.model_combo.lineEdit().setReadOnly(True)
+        self.model_combo.setInsertPolicy(QComboBox.NoInsert)
         self.model_combo.addItems(MODEL_DISPLAY_CHOICES)
         self.model_combo.currentTextChanged.connect(self._on_model_changed)
         layout.addRow("Model", self.model_combo)
@@ -827,6 +830,15 @@ class MainWindow(QMainWindow):
         self.reasoning_combo = QComboBox()
         self.reasoning_combo.currentTextChanged.connect(self.controller.set_reasoning_effort)
         layout.addRow("Reasoning effort", self.reasoning_combo)
+
+        self.model_guidance_label = QLabel()
+        self.model_guidance_label.setWordWrap(True)
+        self.model_guidance_label.setText(
+            "Sol / xhigh is recommended for repeated chunk audits. Astra is the highest-quality option "
+            "in OpenAI's general model guidance; MATH_AUDIT comparisons have not validated this ranking. "
+            "Higher effort can increase latency and token cost. Standard reasoning mode is used for new audits."
+        )
+        layout.addRow("Model guidance", self.model_guidance_label)
 
         self.audit_context_mode_combo = QComboBox()
         self.audit_context_mode_combo.addItems(AUDIT_CONTEXT_MODE_CHOICES)
@@ -1561,6 +1573,7 @@ class MainWindow(QMainWindow):
 
     def _on_model_changed(self, model: str) -> None:
         self.controller.set_model(model)
+        self.model_combo.setToolTip(self.controller.model_guidance(self.controller.model))
         self._refresh_reasoning_options(
             self.controller.model,
             selected_effort=self.controller.reasoning_effort,
@@ -1606,7 +1619,9 @@ class MainWindow(QMainWindow):
 
     def _set_model_effort_controls(self, model: str, reasoning_effort: str) -> None:
         self.model_combo.blockSignals(True)
-        self.model_combo.setCurrentText(self.controller.model_display_name(model))
+        display = self.controller.model_display_name(model) if model in MODEL_CHOICES else (model or "Unspecified historical model")
+        self.model_combo.setCurrentText(display)
+        self.model_combo.setToolTip(self.controller.saved_session_live_warning() or self.controller.model_guidance(model))
         self.model_combo.blockSignals(False)
         self._refresh_reasoning_options(model, selected_effort=reasoning_effort, notify_controller=False)
 
@@ -1618,12 +1633,16 @@ class MainWindow(QMainWindow):
     ) -> None:
         options = self.controller.reasoning_effort_options(model)
         default_effort = self.controller.default_reasoning_effort(model)
-        effort = selected_effort if selected_effort in options else default_effort
+        preserve_saved = not notify_controller and selected_effort is not None
+        effort = selected_effort if preserve_saved or selected_effort in options else default_effort
         self.reasoning_combo.blockSignals(True)
+        self.reasoning_combo.setEditable(preserve_saved and effort not in options)
+        if self.reasoning_combo.isEditable():
+            self.reasoning_combo.lineEdit().setReadOnly(True)
         self.reasoning_combo.clear()
         self.reasoning_combo.addItems(options)
         self.reasoning_combo.setCurrentText(effort)
-        self.reasoning_combo.setEnabled(len(options) > 1)
+        self.reasoning_combo.setEnabled(model in MODEL_CHOICES and len(options) > 1)
         if len(options) == 1:
             self.reasoning_combo.setToolTip("Reasoning effort is fixed for this model.")
         else:
@@ -2037,11 +2056,19 @@ class MainWindow(QMainWindow):
             self.page_progress_value,
             f"{status.get('estimated_pages_completed', 0)} / {status.get('estimated_pages_total', 0)}"
         )
-        _set_text_if_changed(self.cost_value, f"${display_cost:.4f}")
+        _set_text_if_changed(self.cost_value, f"{'~' if totals.get('cost_approximate') else ''}${display_cost:.4f}")
+        self.cost_value.setToolTip(
+            "Approximate estimate: usage or billing details are incomplete; consult platform billing."
+            if totals.get("cost_approximate") else "Saved token-based cost estimate; API prices can change."
+        )
         _set_text_if_changed(self.tokens_value, str(int(totals.get("total_tokens", 0) or 0)))
         _set_text_if_changed(self.elapsed_value, self._format_duration(float(totals.get("audit_seconds", 0.0) or 0.0)))
         self._update_cache_reuse_status(status.get("last_chunk_usage_diagnostics") or {})
-        _set_text_if_changed(self.discussion_cost_value, f"Cost: ${float(discussion_usage.get('cost_usd', 0.0) or 0.0):.4f}")
+        _set_text_if_changed(self.discussion_cost_value, f"Cost: {'~' if discussion_usage.get('cost_approximate') else ''}${float(discussion_usage.get('cost_usd', 0.0) or 0.0):.4f}")
+        self.discussion_cost_value.setToolTip(str(discussion_usage.get("cost_note") or (
+            "Approximate saved cost estimate; consult platform billing." if discussion_usage.get("cost_approximate")
+            else "Total of saved discussion charges."
+        )))
         _set_text_if_changed(self.discussion_tokens_value, f"Tokens: {int(discussion_usage.get('total_tokens', 0) or 0)}")
         _set_text_if_changed(self.discussion_turns_value, f"Turns: {int(discussion_usage.get('turns', 0) or 0)}")
 

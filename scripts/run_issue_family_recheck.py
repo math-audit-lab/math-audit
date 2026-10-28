@@ -24,6 +24,8 @@ from audit_runtime import (  # noqa: E402
     to_jsonable,
     wait_for_response,
 )
+from audit_requests import response_request_options, session_request_settings
+from audit_prompts import MATHEMATICAL_ADJUDICATION_INSTRUCTIONS, request_prompt_metadata
 from audit_state import compute_usage_cost, session_paths, usage_cache_diagnostics  # noqa: E402
 
 
@@ -624,11 +626,10 @@ def _response_text(resp: Any) -> str:
     return "\n".join(parts).strip()
 
 
-def _save_live_outputs(output_dir: Path, prompt: str, model: str, reasoning_effort: str, poll_every: float, max_wait_seconds: float | None) -> dict[str, Any]:
+def _save_live_outputs(output_dir: Path, prompt: str, model: str, reasoning_effort: str, poll_every: float, max_wait_seconds: float | None, reasoning_mode: str = "standard") -> dict[str, Any]:
     client = _get_client()
     request_kwargs = {
-        "model": model,
-        "reasoning": {"effort": reasoning_effort},
+        **response_request_options(model, reasoning_effort, reasoning_mode),
         "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
         "text": {
             "format": {
@@ -641,6 +642,7 @@ def _save_live_outputs(output_dir: Path, prompt: str, model: str, reasoning_effo
         "background": True,
         "store": True,
     }
+    _write_json(output_dir / "family_recheck_request.json", {"request": request_kwargs, "prompt_metadata": request_prompt_metadata(request_kwargs["input"])})
     resp = client.responses.create(**request_kwargs)
     if getattr(resp, "status", None) not in {None, "completed"}:
         resp = wait_for_response(resp.id, poll_every=poll_every, max_wait_seconds=max_wait_seconds)
@@ -689,18 +691,19 @@ def run_issue_family_recheck(
         raise RuntimeError(f"Families JSON does not exist: {families_json}")
     if not allow_output_inside_audit:
         _guard_output_dir(audit_workdir, output_dir)
+    validate_result_schema(RESULT_SCHEMA)
+
+    session = _load_session(audit_workdir)
+    selected_model = model if model is not None else session.get("model", DEFAULT_MODEL)
+    selected_effort = reasoning_effort if reasoning_effort is not None else session.get("reasoning_effort", DEFAULT_REASONING_EFFORT)
+    selected_mode = session.get("reasoning_mode", "standard")
+    if live:
+        selected_model, selected_effort, selected_mode = session_request_settings(session, model, reasoning_effort)
     if live and not os.environ.get("OPENAI_API_KEY"):
         try:
             _get_client()
         except Exception as exc:
             raise RuntimeError("OPENAI_API_KEY is required for --live mode.") from exc
-    validate_result_schema(RESULT_SCHEMA)
-
-    session = _load_session(audit_workdir)
-    selected_model, selected_effort = normalize_model_and_reasoning_effort(
-        model or session.get("model") or DEFAULT_MODEL,
-        reasoning_effort or session.get("reasoning_effort") or DEFAULT_REASONING_EFFORT,
-    )
     families_payload = _load_json(families_json, default={})
     if not isinstance(families_payload, dict):
         raise RuntimeError(f"Families JSON is not an object: {families_json}")
@@ -708,7 +711,7 @@ def run_issue_family_recheck(
     evidence, source_paths = _build_evidence(audit_workdir, families_payload, family, max_context_chars=max_context_chars)
     source_paths.append(families_json)
     before = _snapshot_paths(source_paths)
-    prompt = _build_prompt(evidence, max_context_chars=max_context_chars)
+    prompt = MATHEMATICAL_ADJUDICATION_INSTRUCTIONS + "\n\n" + _build_prompt(evidence, max_context_chars=max_context_chars)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(output_dir / "family_recheck_evidence.json", evidence)
@@ -717,7 +720,7 @@ def run_issue_family_recheck(
 
     live_result: dict[str, Any] | None = None
     if live:
-        live_result = _save_live_outputs(output_dir, prompt, selected_model, selected_effort, poll_every, max_wait_seconds)
+        live_result = _save_live_outputs(output_dir, prompt, selected_model, selected_effort, poll_every, max_wait_seconds, selected_mode)
 
     after = _snapshot_paths(source_paths)
     manifest = {
@@ -733,6 +736,8 @@ def run_issue_family_recheck(
         "live_result": live_result,
         "model": selected_model,
         "reasoning_effort": selected_effort,
+        "reasoning_mode": selected_mode,
+        "prompt_metadata": request_prompt_metadata(prompt),
         "max_context_chars": max_context_chars,
         "artifacts": {
             "manifest": "family_recheck_manifest.json",

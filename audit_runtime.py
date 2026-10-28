@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import re
 import shutil
@@ -23,11 +24,16 @@ from audit_models import (
     normalize_model_and_reasoning_effort,
     reasoning_effort_guidance_for_model,
     supported_reasoning_efforts_for_model,
+    validate_new_audit_settings,
 )
+from audit_requests import response_request_options, session_request_settings, validate_response_storage
 from audit_prompts import (
     SHIPPED_AUDIT_SYSTEM_PROMPT,
     effective_audit_system_prompt_with_source,
     prompt_snapshot_metadata,
+    prompt_suite_metadata,
+    request_prompt_metadata,
+    DISCUSSION_EPISTEMIC_INSTRUCTIONS,
 )
 from audit_state import (
     _ensure_timing_state as _audit_state_ensure_timing_state,
@@ -274,8 +280,8 @@ def _resolve_audit_system_prompt(
     return prompt, prompt_snapshot_metadata(prompt, source, model)
 
 
-def _ensure_timing_state(session: dict[str, Any]) -> dict[str, Any]:
-    return _audit_state_ensure_timing_state(session, default_model=DEFAULT_MODEL)
+def _ensure_timing_state(session: dict[str, Any], *, persist: bool = True) -> dict[str, Any]:
+    return _audit_state_ensure_timing_state(session, default_model=DEFAULT_MODEL, persist=persist)
 
 
 def set_openai_client(client) -> None:
@@ -940,6 +946,20 @@ def _verbatim_block(text: str) -> str:
     return "\\begin{Verbatim}[fontsize=\\small]\n" + text + "\n\\end{Verbatim}\n"
 
 
+def _record_explicit_settings_change(session: dict[str, Any], model: str, effort: str) -> None:
+    if (model, effort) == (session.get("model"), session.get("reasoning_effort")):
+        return
+    if session.get("pending"):
+        raise ValueError("Recover or cancel the pending response before changing audit settings.")
+    session.setdefault("model_settings_history", []).append({
+        "time": utc_now(),
+        "previous": {key: session.get(key) for key in ("model", "reasoning_effort", "reasoning_mode")},
+        "selected": {"model": model, "reasoning_effort": effort, "reasoning_mode": session.get("reasoning_mode", "standard")},
+    })
+    session["model"] = model
+    session["reasoning_effort"] = effort
+
+
 def _resolve_session(session_or_pdf: dict[str, Any] | str | Path) -> dict[str, Any]:
     if isinstance(session_or_pdf, dict):
         session = session_or_pdf
@@ -947,7 +967,7 @@ def _resolve_session(session_or_pdf: dict[str, Any] | str | Path) -> dict[str, A
         session = load_session_from_pdf(session_or_pdf)
     if session is None:
         raise FileNotFoundError("No audit session found for this PDF.")
-    return _ensure_timing_state(session)
+    return _ensure_timing_state(session, persist=False)
 
 
 def _pause_state_from_session(session: dict[str, Any]) -> dict[str, Any]:
@@ -1311,7 +1331,9 @@ def _report_freshness_sources(session: dict[str, Any], kind: str) -> list[dict[s
 
 def _report_freshness_for_kind(session: dict[str, Any], kind: str) -> dict[str, Any]:
     paths = _report_paths_for_kind(session, kind)
-    refresh_report_latex_compile_health_sidecar(paths["tex"], paths["json"])
+    # Inspection of a historical audit must not rewrite its report sidecars.
+    if session.get("model") in MODEL_CHOICES:
+        refresh_report_latex_compile_health_sidecar(paths["tex"], paths["json"])
     sources = _report_freshness_sources(session, kind)
     generated_at = _report_generated_at(paths)
     latest_source = None
@@ -1440,8 +1462,8 @@ def get_audit_status(
     session_or_pdf: dict[str, Any] | str | Path,
     include_manifest: bool = False,
 ) -> dict[str, Any]:
-    session = _resolve_session(session_or_pdf)
-    session = _ensure_qa_thread_state(session)
+    session = _resolve_session(copy.deepcopy(session_or_pdf) if isinstance(session_or_pdf, dict) else session_or_pdf)
+    session = _ensure_qa_thread_state(session, persist=False)
     pause = _pause_state_from_session(session)
     status = dict(load_status(session))
     status["pause_requested"] = pause["requested"]
@@ -2427,6 +2449,8 @@ def run_issue_family_recheck_live(
     timestamp: str | None = None,
 ) -> dict[str, Any]:
     session = _resolve_session(session_or_pdf)
+    session_request_settings(session)
+    validate_response_storage(session)
     paths = _review_sidecar_paths(session)
     family_id = str(family_id or "").strip()
     if not family_id:
@@ -2538,6 +2562,8 @@ def rerun_selected_chunks(
         raise NotImplementedError("replace_existing=False is not supported in the V1 selective rerun flow.")
 
     session = _resolve_session(session_or_pdf)
+    session_request_settings(session)
+    validate_response_storage(session)
     status_before = load_status(session)
     if session.get("pending"):
         raise RuntimeError("Cannot rerun selected chunks while the session has a pending response.")
@@ -2552,19 +2578,8 @@ def rerun_selected_chunks(
     selected_set = set(selected_chunk_ids)
     chunks_by_id = {str(chunk.get("chunk_id") or ""): chunk for chunk in chunks}
 
-    if model is not None or reasoning_effort is not None:
-        selected_model = model if model is not None else session.get("model")
-        selected_effort = reasoning_effort if reasoning_effort is not None else session.get("reasoning_effort")
-        selected_model, selected_effort = normalize_model_and_reasoning_effort(selected_model, selected_effort)
-        session["model"] = selected_model
-        session["reasoning_effort"] = selected_effort
-    else:
-        selected_model, selected_effort = normalize_model_and_reasoning_effort(
-            session.get("model") or DEFAULT_MODEL,
-            session.get("reasoning_effort"),
-        )
-        session["model"] = selected_model
-        session["reasoning_effort"] = selected_effort
+    selected_model, selected_effort, _mode = session_request_settings(session, model, reasoning_effort)
+    _record_explicit_settings_change(session, selected_model, selected_effort)
     session["updated_at"] = utc_now()
     save_session(session)
 
@@ -2765,6 +2780,7 @@ def rerun_failed_verification_chunks(
     rebuild_reports: bool = True,
 ) -> dict[str, Any]:
     session = _resolve_session(session_or_pdf)
+    session_request_settings(session)
     manifest = load_manifest(session)
     failed_info = get_failed_verification_chunks(session)
     failed_by_chunk = {str(item.get("chunk_id") or ""): item for item in failed_info.get("chunks", []) or []}
@@ -2918,9 +2934,9 @@ def resolve_verification_finding_recheck_settings(
     model: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
 ) -> tuple[str, str]:
-    selected_model = model if model is not None else session.get("model") or DEFAULT_MODEL
+    selected_model = model if model is not None else session.get("model")
     selected_effort = reasoning_effort if reasoning_effort is not None else session.get("reasoning_effort")
-    return normalize_model_and_reasoning_effort(selected_model, selected_effort)
+    return str(selected_model or ""), str(selected_effort or "")
 
 
 def prepare_verification_finding_recheck_preview(
@@ -3018,17 +3034,15 @@ def run_verification_finding_rechecks(
     max_wait_seconds: Optional[float] = None,
 ) -> dict[str, Any]:
     session = _resolve_session(session_or_pdf)
+    session_request_settings(session)
+    validate_response_storage(session)
     status = load_status(session)
     if session.get("pending"):
         raise RuntimeError("Cannot recheck verification findings while the audit has a pending response.")
     if str(status.get("status") or "").strip().lower() not in {"completed", "paused"}:
         raise RuntimeError("Verification-finding rechecks are available only for completed or paused audits.")
     inventory, candidates = _select_verification_finding_recheck_candidates(session, selection)
-    selected_model, selected_effort = resolve_verification_finding_recheck_settings(
-        session,
-        model=model,
-        reasoning_effort=reasoning_effort,
-    )
+    selected_model, selected_effort, selected_mode = session_request_settings(session, model, reasoning_effort)
     root = Path(session["workdir"])
     rechecks_root = root / "verification_finding_rechecks"
     rechecks_root.mkdir(parents=True, exist_ok=True)
@@ -3082,8 +3096,7 @@ def run_verification_finding_rechecks(
             {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
         ]
         request_kwargs = {
-            "model": selected_model,
-            "reasoning": {"effort": selected_effort},
+            **response_request_options(selected_model, selected_effort, selected_mode),
             "input": request_input,
             "text": {
                 "format": {
@@ -3104,6 +3117,7 @@ def run_verification_finding_rechecks(
                 "recheck_id": recheck_id,
                 "chunk_id": chunk_id,
                 "finding_ids": finding_ids,
+                "prompt_metadata": request_prompt_metadata(request_input),
                 "request": request_kwargs,
             },
         )
@@ -3117,6 +3131,7 @@ def run_verification_finding_rechecks(
                 "chunk_id": chunk_id,
                 "model": selected_model,
                 "reasoning_effort": selected_effort,
+                "reasoning_mode": selected_mode,
                 "artifact_root": str(artifact_root.relative_to(root)),
                 "request_path": str(request_path.relative_to(root)),
                 "input_evidence_hashes": evidence.get("input_evidence_hashes") or {},
@@ -3149,6 +3164,8 @@ def run_verification_finding_rechecks(
                 chunk_id,
                 usage_obj,
                 model=selected_model,
+                reasoning_effort=selected_effort,
+                reasoning_mode=selected_mode,
                 elapsed_seconds=elapsed_seconds,
                 activity_kind="verification_finding_recheck",
                 activity_id=recheck_id,
@@ -3182,6 +3199,7 @@ def run_verification_finding_rechecks(
                     "chunk_id": chunk_id,
                     "model": selected_model,
                     "reasoning_effort": selected_effort,
+                "reasoning_mode": selected_mode,
                     "response_id": response_id,
                     "request_path": str(request_path.relative_to(root)),
                     "response_path": str(raw_response_path.relative_to(root)),
@@ -3215,6 +3233,7 @@ def run_verification_finding_rechecks(
                     "chunk_id": chunk_id,
                     "model": selected_model,
                     "reasoning_effort": selected_effort,
+                "reasoning_mode": selected_mode,
                     "response_id": response_id,
                     "artifact_root": str(artifact_root.relative_to(root)),
                     "request_path": str(request_path.relative_to(root)),
@@ -3362,15 +3381,15 @@ def run_verification_technical_repairs(
     poll_every: float = 2.0, max_wait_seconds: Optional[float] = None,
 ) -> dict[str, Any]:
     session = _resolve_session(session_or_pdf)
+    session_request_settings(session)
+    validate_response_storage(session)
     status = load_status(session)
     if session.get("pending"):
         raise RuntimeError("Cannot repair verification scripts while an audit response is pending.")
     if str(status.get("status") or "").lower() not in {"completed", "paused"}:
         raise RuntimeError("Technical repairs are available only for completed or paused audits.")
     inventory, candidates = _select_verification_technical_repair_candidates(session, selection)
-    selected_model, selected_effort = resolve_verification_finding_recheck_settings(
-        session, model=model, reasoning_effort=reasoning_effort
-    )
+    selected_model, selected_effort, selected_mode = session_request_settings(session, model, reasoning_effort)
     root = Path(session["workdir"])
     repairs_root = root / "verification_technical_repairs"
     repairs_root.mkdir(parents=True, exist_ok=True)
@@ -3414,8 +3433,7 @@ def run_verification_technical_repairs(
             {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
         ]
         request_kwargs = {
-            "model": selected_model,
-            "reasoning": {"effort": selected_effort},
+            **response_request_options(selected_model, selected_effort, selected_mode),
             "input": request_input,
             "text": {"format": {
                 "type": "json_schema", "name": "verification_technical_repair", "strict": True,
@@ -3424,7 +3442,7 @@ def run_verification_technical_repairs(
             "background": bool(session.get("background", True)),
             "store": bool(session.get("store", True)),
         }
-        save_json(request_path, {"time": utc_now(), "workflow": "verification_technical_repair", "repair_id": repair_id, "request": request_kwargs})
+        save_json(request_path, {"time": utc_now(), "workflow": "verification_technical_repair", "repair_id": repair_id, "prompt_metadata": request_prompt_metadata(request_input), "request": request_kwargs})
         supersedes = str((prior_by_script.get(script_id) or {}).get("repair_id") or "") or None
         started = append_verification_technical_repair_event(
             session,
@@ -3432,7 +3450,7 @@ def run_verification_technical_repairs(
                 "event": "started", "status": "started", "repair_id": repair_id,
                 "script_id": script_id, "chunk_id": chunk_id,
                 "failure_type": candidate.get("execution_status"), "failure_reason": candidate.get("failure_reason"),
-                "model": selected_model, "reasoning_effort": selected_effort,
+                "model": selected_model, "reasoning_effort": selected_effort, "reasoning_mode": selected_mode,
                 "artifact_root": str(artifact_root.relative_to(root)),
                 "request_path": str(request_path.relative_to(root)),
                 "input_evidence_hashes": evidence.get("input_evidence_hashes") or {},
@@ -3456,7 +3474,7 @@ def run_verification_technical_repairs(
             usage_obj = to_jsonable(getattr(resp, "usage", {}) or {})
             usage_info = update_usage_from_usage_obj(
                 session, chunk_id, usage_obj if isinstance(usage_obj, dict) else {},
-                model=selected_model, elapsed_seconds=elapsed,
+                model=selected_model, reasoning_effort=selected_effort, reasoning_mode=selected_mode, elapsed_seconds=elapsed,
                 activity_kind="verification_technical_repair", activity_id=repair_id,
             )
             if getattr(resp, "status", None) != "completed":
@@ -3478,7 +3496,7 @@ def run_verification_technical_repairs(
                     "event": "completed", "status": "completed", "canonical": True,
                     "repair_id": repair_id, "script_id": script_id, "chunk_id": chunk_id,
                     "failure_type": candidate.get("execution_status"), "failure_reason": candidate.get("failure_reason"),
-                    "model": selected_model, "reasoning_effort": selected_effort,
+                    "model": selected_model, "reasoning_effort": selected_effort, "reasoning_mode": selected_mode,
                     "response_id": response_id, "artifact_root": str(artifact_root.relative_to(root)),
                     "request_path": str(request_path.relative_to(root)),
                     "response_path": str(raw_response_path.relative_to(root)),
@@ -5052,7 +5070,10 @@ def _wait_for_response(response_id: str, poll_every: float = 3.0, max_wait_secon
         time.sleep(poll_every)
 
 
-def _ensure_qa_thread_state(session: dict[str, Any]) -> dict[str, Any]:
+def _ensure_qa_thread_state(session: dict[str, Any], *, persist: bool = True) -> dict[str, Any]:
+    # Reader callers get a derived view, leaving both the supplied dict and disk intact.
+    if not persist:
+        session = copy.deepcopy(session)
     changed = False
     legacy_has_turns, legacy_turn_conversation_id = _legacy_qa_turn_state(session)
     threads = session.get("qa_threads")
@@ -5080,10 +5101,10 @@ def _ensure_qa_thread_state(session: dict[str, Any]) -> dict[str, Any]:
     if legacy_has_turns and legacy_turn_conversation_id and not legacy.get("conversation_id"):
         legacy["conversation_id"] = legacy_turn_conversation_id
         changed = True
-    if not legacy_has_turns and legacy.get("conversation_id"):
+    if persist and not legacy_has_turns and legacy.get("conversation_id"):
         legacy["conversation_id"] = None
         changed = True
-    if not legacy_has_turns and legacy.get("pdf_attached_in_conversation"):
+    if persist and not legacy_has_turns and legacy.get("pdf_attached_in_conversation"):
         legacy["pdf_attached_in_conversation"] = False
         changed = True
     if (
@@ -5108,7 +5129,7 @@ def _ensure_qa_thread_state(session: dict[str, Any]) -> dict[str, Any]:
         }
         changed = True
 
-    if changed:
+    if changed and persist:
         session["updated_at"] = utc_now()
         save_session(session)
     return session
@@ -5121,7 +5142,7 @@ def _active_qa_thread(session: dict[str, Any]) -> dict[str, Any]:
 
 
 def _qa_thread_summary(session: dict[str, Any]) -> dict[str, Any]:
-    session = _ensure_qa_thread_state(session)
+    session = _ensure_qa_thread_state(session, persist=False)
     active_thread_id = str(session.get("active_qa_thread_id") or LEGACY_QA_THREAD_ID)
     threads = session.get("qa_threads") or {}
     active = threads.get(active_thread_id) or {}
@@ -5134,7 +5155,7 @@ def _qa_thread_summary(session: dict[str, Any]) -> dict[str, Any]:
 
 
 def _qa_thread_entries(session: dict[str, Any]) -> list[dict[str, Any]]:
-    session = _ensure_qa_thread_state(session)
+    session = _ensure_qa_thread_state(session, persist=False)
     active_thread_id = str(session.get("active_qa_thread_id") or LEGACY_QA_THREAD_ID)
     threads = session.get("qa_threads") or {}
     turn_counts: dict[str, int] = {}
@@ -5175,8 +5196,8 @@ def _qa_thread_entries(session: dict[str, Any]) -> list[dict[str, Any]]:
     return entries
 
 
-def _prune_empty_qa_threads(session: dict[str, Any]) -> dict[str, Any]:
-    session = _ensure_qa_thread_state(session)
+def _prune_empty_qa_threads(session: dict[str, Any], *, persist: bool = True) -> dict[str, Any]:
+    session = _ensure_qa_thread_state(session, persist=persist)
     threads = session.get("qa_threads") or {}
     turn_counts: dict[str, int] = {}
     for turn in _load_qa_turns(session):
@@ -5199,14 +5220,15 @@ def _prune_empty_qa_threads(session: dict[str, Any]) -> dict[str, Any]:
     if pruned:
         if active_thread_id in pruned:
             session["active_qa_thread_id"] = LEGACY_QA_THREAD_ID
-        session["updated_at"] = utc_now()
-        save_session(session)
+        if persist:
+            session["updated_at"] = utc_now()
+            save_session(session)
     return session
 
 
 def list_qa_threads(session_or_pdf_path: dict[str, Any] | str | Path) -> list[dict[str, Any]]:
-    session = _resolve_qa_session(session_or_pdf_path)
-    session = _prune_empty_qa_threads(session)
+    session = _resolve_qa_session(copy.deepcopy(session_or_pdf_path) if isinstance(session_or_pdf_path, dict) else session_or_pdf_path)
+    session = _prune_empty_qa_threads(session, persist=False)
     return _qa_thread_entries(session)
 
 
@@ -5273,6 +5295,7 @@ def _ensure_qa_pdf_file(session: dict[str, Any]) -> dict[str, Any]:
 
 def start_new_qa_thread(session_or_pdf_path: dict[str, Any] | str | Path) -> dict[str, Any]:
     session = _resolve_qa_session(session_or_pdf_path)
+    session_request_settings(session)
     _assert_qa_ready(session)
     session = _prune_empty_qa_threads(session)
     threads = session["qa_threads"]
@@ -5332,12 +5355,12 @@ def _load_qa_turns(
     thread_id: Optional[str] = None,
     active_thread_only: bool = False,
 ) -> list[dict[str, Any]]:
-    session = _ensure_qa_thread_state(session)
+    session = _ensure_qa_thread_state(session, persist=False)
     selected_thread_id = str(thread_id or "").strip()
     if active_thread_only:
         selected_thread_id = str(session.get("active_qa_thread_id") or LEGACY_QA_THREAD_ID)
     turns = []
-    for path in sorted(_qa_dir(session).glob("qa_*.json")):
+    for path in sorted((Path(session["workdir"]) / "qa").glob("qa_*.json")):
         try:
             data = load_json(path)
         except Exception:
@@ -5361,6 +5384,8 @@ def _qa_usage_summary_from_turns(turns: list[dict[str, Any]]) -> dict[str, Any]:
         "reasoning_tokens": 0,
         "total_tokens": 0,
         "cost_usd": 0.0,
+        "cost_approximate": False,
+        "cost_unavailable_turns": 0,
     }
     for turn in turns:
         if not isinstance(turn, dict):
@@ -5379,10 +5404,17 @@ def _qa_usage_summary_from_turns(turns: list[dict[str, Any]]) -> dict[str, Any]:
         summary["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
         summary["reasoning_tokens"] += int(output_details.get("reasoning_tokens", 0) or 0)
         summary["total_tokens"] += total_tokens
-        if usage:
-            summary["cost_usd"] += float(
-                compute_usage_cost(str(turn.get("model") or DEFAULT_MODEL), usage).get("total_cost", 0.0) or 0.0
-            )
+        # Summaries are historical views: sum the recorded charges, never reprice
+        # past turns with today's registry or silently infer a missing model.
+        saved_cost = turn.get("cost")
+        if isinstance(saved_cost, dict) and saved_cost.get("total_cost") is not None:
+            summary["cost_usd"] += float(saved_cost["total_cost"])
+            summary["cost_approximate"] = summary["cost_approximate"] or bool(saved_cost.get("approximate"))
+        else:
+            summary["cost_unavailable_turns"] += 1
+            summary["cost_approximate"] = True
+    if summary["cost_unavailable_turns"]:
+        summary["cost_note"] = "Total includes saved charges only; some historical discussion costs are unavailable."
     return summary
 
 
@@ -5457,13 +5489,13 @@ def _extract_qa_answer_text(resp) -> str:
 
 def _qa_developer_prompt(mode: str) -> str:
     if mode == "audit":
-        return (
+        return DISCUSSION_EPISTEMIC_INSTRUCTIONS + "\n\n" + (
             "You are answering follow-up questions about a completed mathematical paper audit. "
             "Use the ongoing conversation plus the supplied audit artifacts. "
             "Ground the answer in the saved audit state when possible, distinguish paper facts from audit findings, "
             "cite chunk ids or issue ids when they materially help, and say explicitly when the artifacts are insufficient."
         )
-    return (
+    return DISCUSSION_EPISTEMIC_INSTRUCTIONS + "\n\n" + (
         "You are answering follow-up questions about a mathematical paper after a completed audit. "
         "Use the ongoing conversation context conservatively, answer clearly, preserve mathematical notation, "
         "and say when a claim cannot be supported from the paper context you have."
@@ -6289,6 +6321,7 @@ def _run_qa_turn(
 ) -> dict[str, Any]:
     qa_context_mode = _normalize_qa_context_mode(qa_context_mode)
     session = _resolve_qa_session(session_or_pdf_path)
+    qa_model, qa_effort, qa_mode = session_request_settings(session, model, reasoning_effort)
     _assert_qa_ready(session)
     session = _ensure_qa_thread_state(session)
     session = _ensure_qa_conversation(session)
@@ -6302,9 +6335,6 @@ def _run_qa_turn(
     if not clean_question:
         raise ValueError("question must be a non-empty string")
 
-    qa_model = model or session.get("model") or DEFAULT_MODEL
-    qa_effort = reasoning_effort or session.get("reasoning_effort")
-    qa_model, qa_effort = normalize_model_and_reasoning_effort(qa_model, qa_effort)
     grounding_summary = ""
     if qa_context_mode == "reduced_audit_context":
         grounding_summary = _build_reduced_audit_qa_context(session, clean_question)
@@ -6322,8 +6352,7 @@ def _run_qa_turn(
 
     client = _get_client()
     resp = client.responses.create(
-        model=qa_model,
-        reasoning={"effort": qa_effort},
+        **response_request_options(qa_model, qa_effort, qa_mode),
         conversation=conversation_id,
         input=input_payload,
         background=False,
@@ -6352,6 +6381,8 @@ def _run_qa_turn(
         "answer": answer,
         "model": qa_model,
         "reasoning_effort": qa_effort,
+        "reasoning_mode": qa_mode,
+        "prompt_metadata": request_prompt_metadata(input_payload),
         "qa_context_mode": qa_context_mode,
         "response_id": getattr(resp, "id", None),
         "conversation_id": conversation_id,
@@ -6563,7 +6594,7 @@ def load_qa_turns(
     thread_id: Optional[str] = None,
     active_thread_only: bool = False,
 ) -> list[dict[str, Any]]:
-    session = _resolve_qa_session(session_or_pdf_path)
+    session = _resolve_qa_session(copy.deepcopy(session_or_pdf_path) if isinstance(session_or_pdf_path, dict) else session_or_pdf_path)
     return _load_qa_turns(session, thread_id=thread_id, active_thread_only=active_thread_only)
 
 
@@ -7905,6 +7936,8 @@ def _save_request_metadata(
         "used_code_interpreter_tool": bool(used_code_interpreter_tool),
         "code_interpreter_file_ids": list(code_interpreter_file_ids or []),
         "audit_system_prompt_metadata": session.get("audit_system_prompt_metadata"),
+        "prompt_metadata": request_prompt_metadata(request_kwargs.get("input", [])),
+        "prompt_suite_metadata": prompt_suite_metadata(),
         "request_size_diagnostics": _audit_request_size_diagnostics(session, chunk, request_kwargs),
         "request": to_jsonable(request_kwargs),
     }
@@ -8691,6 +8724,8 @@ def process_one_chunk(
     code_interpreter_file_ids: Optional[list[str]] = None,
     allow_ci_failure_fallback: bool = True,
 ) -> dict[str, Any]:
+    session_request_settings(session)
+    validate_response_storage(session)
     verification_mode = _normalize_verification_mode(verification_mode)
     if verification_mode == "code_interpreter" and not session.get("use_code_interpreter", False):
         raise RuntimeError(
@@ -8794,8 +8829,7 @@ def process_one_chunk(
     save_json(prompt_path, input_payload)
     chunk_started_at = utc_now()
     request_kwargs = {
-        "model": request_session["model"],
-        "reasoning": {"effort": request_session["reasoning_effort"]},
+        **response_request_options(*session_request_settings(request_session)),
         "conversation": request_session["conversation_id"],
         "input": input_payload,
         "text": {
@@ -8973,6 +9007,7 @@ def recover_pending_chunk(
     display_output: bool = True,
     allow_ci_failure_fallback: bool = True,
 ) -> Optional[dict[str, Any]]:
+    session_request_settings(session)
     pending = session.get("pending")
     if not pending:
         return None
@@ -9144,7 +9179,10 @@ def create_new_session(
     audit_system_prompt: Optional[str] = None,
     audit_system_prompt_source: Optional[str] = None,
 ) -> dict[str, Any]:
-    model, reasoning_effort = normalize_model_and_reasoning_effort(model, reasoning_effort)
+    model = model if model is not None else DEFAULT_MODEL
+    effort = reasoning_effort if reasoning_effort is not None else default_reasoning_effort_for_model(model)
+    model, reasoning_effort, reasoning_mode = validate_new_audit_settings(model, effort)
+    validate_response_storage({"background": background, "store": store})
     audit_context_mode = _normalize_audit_context_mode(audit_context_mode)
     resolved_prompt, prompt_metadata = _resolve_audit_system_prompt(
         model,
@@ -9156,7 +9194,9 @@ def create_new_session(
         raise FileNotFoundError(pdf_path)
     tex_path = pdf_path.with_suffix(".tex")
     workdir = workdir_from_pdf(pdf_path)
-    if archive_existing_workdir and workdir.exists():
+    if workdir.exists() and session_paths(workdir)["session"].exists():
+        if not archive_existing_workdir:
+            raise ValueError("An audit already exists. Start fresh with archival enabled or choose a new output location; existing state cannot be overwritten.")
         archive_existing_audit_workdir(pdf_path)
     ensure_workdir_tree(workdir)
     init_state_files(workdir, model=model, reasoning_effort=reasoning_effort)
@@ -9172,6 +9212,11 @@ def create_new_session(
         "workdir": str(workdir),
         "model": model,
         "reasoning_effort": reasoning_effort,
+        "reasoning_mode": reasoning_mode,
+        "reasoning_context": "current_turn",
+        "prompt_cache_options": {"ttl": "30m"},
+        "service_tier": "default",
+        "prompt_suite_metadata": prompt_suite_metadata(),
         "store": store,
         "background": background,
         "conversation_id": conversation.id,
@@ -9305,9 +9350,12 @@ def audit_the_paper(
             selected_chunk_indices.add(int(raw_idx))
         except Exception:
             continue
-    session = _resolve_session(pdf_path) if continue_existing else None
+    saved_session = load_session_from_pdf(pdf_path) if continue_existing else None
+    session = _resolve_session(saved_session) if saved_session is not None else None
     if session is None:
-        model, reasoning_effort = normalize_model_and_reasoning_effort(model, reasoning_effort)
+        model = model if model is not None else DEFAULT_MODEL
+        effort = reasoning_effort if reasoning_effort is not None else default_reasoning_effort_for_model(model)
+        model, reasoning_effort, _mode = validate_new_audit_settings(model, effort)
         session = create_new_session(
             pdf_path,
             model=model,
@@ -9330,19 +9378,9 @@ def audit_the_paper(
             print(f"PDF: {session['pdf_path']}")
             print(f"TeX: {session['tex_path'] or 'not found'}")
     else:
-        if explicit_model_override or explicit_reasoning_override:
-            selected_model = model if explicit_model_override else session.get("model")
-            selected_effort = reasoning_effort if explicit_reasoning_override else None
-            selected_model, selected_effort = normalize_model_and_reasoning_effort(selected_model, selected_effort)
-            session["model"] = selected_model
-            session["reasoning_effort"] = selected_effort
-        else:
-            selected_model, selected_effort = normalize_model_and_reasoning_effort(
-                session.get("model") or DEFAULT_MODEL,
-                session.get("reasoning_effort"),
-            )
-            session["model"] = selected_model
-            session["reasoning_effort"] = selected_effort
+        selected_model, selected_effort, _mode = session_request_settings(session, model, reasoning_effort)
+        validate_response_storage(session)
+        _record_explicit_settings_change(session, selected_model, selected_effort)
         if use_code_interpreter is not None:
             session["use_code_interpreter"] = bool(use_code_interpreter)
         if code_interpreter_memory_limit is not None:
@@ -9362,8 +9400,17 @@ def audit_the_paper(
                 audit_system_prompt=audit_system_prompt,
                 audit_system_prompt_source=audit_system_prompt_source,
             )
-            session["audit_system_prompt"] = resolved_prompt
-            session["audit_system_prompt_metadata"] = prompt_metadata
+            if resolved_prompt != session.get("audit_system_prompt"):
+                if session.get("pending"):
+                    raise ValueError("Recover or cancel the pending response before changing its audit prompt.")
+                session.setdefault("prompt_history", []).append({
+                    "time": utc_now(),
+                    "audit_system_prompt": session.get("audit_system_prompt"),
+                    "audit_system_prompt_metadata": session.get("audit_system_prompt_metadata"),
+                })
+                session["audit_system_prompt"] = resolved_prompt
+                session["audit_system_prompt_metadata"] = prompt_metadata
+                session["developer_prompt_seeded"] = False
         session["updated_at"] = utc_now()
         save_session(session)
         if verbose:

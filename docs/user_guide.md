@@ -31,17 +31,24 @@ Use it cautiously. The app is not an automatic referee, proof assistant, or theo
 
 ## Cost Expectations
 
-API usage can cost real money. Cost depends on the model, reasoning effort, paper length, mathematical density, chunking, cached input, reruns, and model output length. Platform pricing can also change, so check OpenAI's current pricing page before running long audits:
+API usage can cost real money. Cost depends on the model, reasoning effort, paper length, mathematical density, chunking, cache reads and writes, reruns, and generated tokens. Higher reasoning effort can increase latency and cost. A fixed cost-per-page estimate from an older model is not a reliable budget for GPT-6; measure a small approved run before estimating a full manuscript.
 
-- [OpenAI API pricing](https://openai.com/api/pricing/)
+Standard short-context prices per million tokens, verified on **2026-10-28** from the [official API pricing documentation](https://developers.openai.com/api/docs/pricing):
 
-As a rough planning estimate, GPT-5.6 Sol with `xhigh` reasoning effort may cost about $1 per PDF page for mathematically dense audits. Nontechnical or expository pages may cost less, while proof-heavy pages may cost more. A 20-page PDF with GPT-5.6 Sol at `xhigh` may plausibly cost around $15-$25, but this is only an estimate, not a promise.
+| Model | Input | Cached input read | 30-minute cache write | 12-hour cache write | Output |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| GPT-6 Astra | $10.00 | $1.00 | $12.50 | $25.00 | $50.00 |
+| GPT-6.1 Sol | $2.00 | $0.10 | $2.50 | $5.00 | $10.00 |
+| GPT-6.1 Terra | $1.00 | $0.05 | $1.25 | $2.50 | $5.00 |
+| GPT-6 Luna | $0.10 | $0.01 | $0.125 | $0.25 | $0.50 |
 
-Cheaper models or lower reasoning effort can reduce cost, but they may noticeably reduce audit quality.
+For requests above 272,000 input tokens, the whole request uses twice the input/cache rates and 1.5 times the output rate. Reasoning tokens are part of output usage, so they must not be charged again separately. Cache reads and cache writes are distinct billing categories; neither should be counted a second time as uncached input. The app keeps compact running context and uses the documented 30-minute cache setting for current-model requests. Longer retention and alternate processing tiers are not GUI options.
 
-The app's local cost estimates are best-effort calculations from token usage metadata. They may differ from platform billing in edge cases; in particular, GPT-5.6 Sol cache-write charges are not estimated separately unless the API usage metadata exposes those token counts reliably.
+Local cost estimates are approximate when the API does not expose all required quantities or billing settings. Prices can change; consult platform billing for authoritative charges. Historical saved costs remain unchanged and are not recalculated with the current table. Discussion totals sum saved charges; if an old turn has no saved charge, the total is marked approximate and its tooltip explains the missing cost.
 
-> **Cost warning for GPT-5.5-pro:** GPT-5.5-pro is much more expensive than regular GPT-5.6 Sol or GPT-5.5. Its token rates are roughly 6 times higher, and it may not receive the same cached-input discount. Do not choose GPT-5.5-pro unless you are prepared for a much larger bill. A 20-page audit that might cost around $15-$25 with GPT-5.6 Sol or GPT-5.5 could plausibly exceed $100 with GPT-5.5-pro depending on token use and reasoning output.
+New audits use standard reasoning mode. OpenAI also documents a separate `reasoning.mode: "pro"` parameter, which is independent of `reasoning.effort: "max"`. Pro mode bills more aggregate model work at the selected model's token rates and can increase latency. Its GUI control is deferred pending controlled integration evaluation; historical mode metadata remains readable.
+
+Linked interface screenshots show the earlier GPT-5.5 interface and are retained only as historical references. Use the current model table in this guide for setup; no screenshot has been edited.
 
 ## 1. Install Conda/Miniforge and Download Math Paper Audit
 
@@ -102,7 +109,7 @@ python audit_gui.py
 
 On first launch, the app should open to the main audit setup screen. The stable public tabs are **Reports**, **Discussion**, and **Logs**. Experimental developer-only features are hidden by default.
 
-![Startup screen](screenshots/02_startup.png)
+[Historical interface screenshot: startup screen](screenshots/02_startup.png)
 
 ## 3. API Key Setup
 
@@ -138,7 +145,7 @@ Security reminders:
 
 Never capture an API key in screenshots. If you need a screenshot of the setup area, clear the key field or use a mock placeholder that is not key-like.
 
-![API key field](screenshots/03_api_key.png)
+[Historical interface screenshot: api key field](screenshots/03_api_key.png)
 
 ## 4. Selecting a PDF and Optional TeX Source
 
@@ -153,7 +160,7 @@ demo_paper.tex
 
 the app will try TeX-aware chunking. If TeX is unavailable or incomplete, the app falls back to PDF text extraction. PDF-only mode is supported, but references and labels may be less precise.
 
-![Select PDF](screenshots/04_select_pdf.png)
+[Historical interface screenshot: select pdf](screenshots/04_select_pdf.png)
 
 ## 5. Choosing a Context Mode
 
@@ -162,15 +169,28 @@ The default context mode is the continuous-conversation audit flow. It is the st
 `fresh_context_experimental` is experimental. It may help with longer audits or robustness against accumulated conversation/file-service problems, but it is still a research feature and should be compared carefully before relying on it.
 
 
-![Context mode selector](screenshots/05_context_mode.png)
+[Historical interface screenshot: context mode selector](screenshots/05_context_mode.png)
 
 ## 6. Starting an Audit
 
 After selecting the PDF, choose model/reasoning settings and click **Start Fresh Audit**. The app will break the paper into chunks and audit them using OpenAI API calls. It creates an audit workdir next to the selected PDF; that folder contains the generated reports and saved audit state.
 
-For serious research-level mathematical manuscript analysis, GPT-5.6 Sol with `xhigh` reasoning effort is the recommended default for new audits. GPT-5.5 remains selectable for comparison and compatibility with older runs. The `max` effort for GPT-5.6 Sol is available for the hardest quality-first audits or focused rechecks, but it is not the global default because it can increase latency and token use.
+**GPT-6.1 Sol / `xhigh`** is the recommended default for repeated chunk-level mathematical audits. The selector offers only the current family:
 
-Lower reasoning effort or cheaper/earlier models can reduce cost, but they may noticeably reduce audit quality. It is reasonable to experiment with cheaper settings while testing the app or reading mostly expository material, but be cautious about relying on lower-quality settings for real mathematical auditing. Existing audits resume with the model and reasoning effort saved in their audit session.
+| Model | Intended role | Default effort | Available efforts |
+| --- | --- | --- | --- |
+| GPT-6.1 Sol | Recommended | `xhigh` | `low`, `medium`, `high`, `xhigh`, `max` |
+| GPT-6 Astra | Highest quality | `xhigh` | `low`, `medium`, `high`, `xhigh`, `max` |
+| GPT-6.1 Terra | Lower cost | `high` | `none`, `low`, `medium`, `high`, `xhigh`, `max` |
+| GPT-6 Luna | Exploratory / lowest cost | `medium` | `none`, `low`, `medium`, `high`, `xhigh`, `max` |
+
+Astra is the strongest option in [OpenAI's general model guidance](https://developers.openai.com/api/docs/models), while Sol offers a useful cost/capability balance. These rankings have not been validated specifically for MATH_AUDIT. A newer model, higher effort, or a successfully executed check does not guarantee a mathematically correct audit. Findings remain provisional until verification and adjudication; finite searches do not prove unrestricted claims.
+
+Switching models preserves the selected effort when supported; otherwise the selector uses the destination model's default and explains the adjustment in the log. `max` is never selected automatically. The default `xhigh` setting for Sol and Astra is an application choice for serious audits, not a claim that it is optimal for every manuscript.
+
+Historical audits retain their original model ID, effort, mode, prompt metadata, response IDs, context mode, usage records, and saved costs. The GUI displays historical IDs without adding them to the new-audit menu. Legacy GPT-5.x and superseded-model sessions cannot be continued, rerun, rechecked, or used for live discussion in this version, even after selecting a current model. Reports and saved evidence remain available. To start a safe comparison, choose a current model and **Start Fresh Audit**; the old folder is archived and the new run uses standard mode. No unfinished state is migrated automatically. Opening status, reports, or saved discussion does not rewrite historical files. Explicit report rebuilds or local verification actions still create or update their corresponding outputs when requested.
+
+Each new session snapshots its exact main prompt and records prompt versions/content hashes for comparison. Resumed sessions retain their saved prompt metadata. The compact continuous-context workflow remains the default; fresh-context mode stays experimental. Persisted reasoning, dynamic effort changes, and context compaction are not enabled as new experiments in this migration.
 
 For a paper named `demo_paper.pdf`, the default workdir is:
 
@@ -180,7 +200,7 @@ demo_paper_audit/
 
 
 
-![Audit settings](screenshots/04_audit_settings.png)
+[Historical interface screenshot: audit settings](screenshots/04_audit_settings.png)
 
 ## 7. Reading the Logs Tab
 
@@ -200,7 +220,7 @@ A chunk completion line may include:
 
 `Chunk tokens` refers to the just-completed chunk. `Cumulative tokens` refers to all audit tokens counted so far.
 
-![Logs tab](screenshots/07_logs_tab.png)
+[Historical interface screenshot: logs tab](screenshots/07_logs_tab.png)
 
 ## 8. Reports
 
@@ -235,7 +255,7 @@ demo_paper_audit/reports/
 
 You can access them by opening that folder or by clicking **Open Full Report**, **Open Concise Report**, or **Open Verification Report** when the corresponding report exists. The app opens generated `.tex` files with your system default application for TeX files. If that is not the LaTeX editor/compiler you want, open the generated file manually in TeXShop, TeXworks, VS Code, or compile it from the command line with `pdflatex`.
 
-![Reports tab](screenshots/08_reports_tab.png)
+[Historical interface screenshot: reports tab](screenshots/08_reports_tab.png)
 
 ## 9. Report Freshness
 
@@ -249,7 +269,7 @@ Some chunk audits generate local Python verification scripts. These are small Py
 
 Successful execution does not mean that the paper's claim passed. A script may execute normally and find a counterexample. Conversely, finding no counterexample in a finite tested range does not prove an unrestricted claim. Verification-derived findings are provisional supporting evidence and require human review. Counterexamples and reported claim failures are surfaced as prominent findings in the verification, full, and concise reports; scripts can still be wrong, so inspect the script, scope, and output before drawing conclusions.
 
-![Verification controls](screenshots/07_verification.png)
+[Historical interface screenshot: verification controls](screenshots/07_verification.png)
 
 ## 11. Rerunning Failed Verification Chunks
 
@@ -280,7 +300,7 @@ Reruns and counterexample rechecks can consume API budget. Confirm that an actio
 
 After an audit, the **Discussion** tab lets you ask follow-up questions inside the app using saved audit context. It uses the OpenAI API through the app, uses the app's configured API key, and may incur API costs.
 
-![Discussion tab](screenshots/12_discussion.png)
+[Historical interface screenshot: discussion tab](screenshots/12_discussion.png)
 
 ### 12.2 ChatGPT Context Pack Export
 
@@ -299,7 +319,7 @@ This can be useful if you want to continue discussion in ChatGPT without spendin
 
 The exported files may contain manuscript text, audit findings, summaries, issue descriptions, and verification context. Only upload them to ChatGPT if you are allowed to share that manuscript/audit material there. Do not share export packs publicly unless they have been sanitized.
 
-![ChatGPT context pack export](screenshots/13_context_pack_export.png)
+[Historical interface screenshot: chatgpt context pack export](screenshots/13_context_pack_export.png)
 
 ## 13. Output Folder Structure
 

@@ -106,7 +106,7 @@ The PySide6 app is the primary maintained frontend for this public preview.
 
 1. Choose a paper PDF with **Browse...**.
 2. Optionally place a same-basename TeX file next to the PDF, for example `paper.pdf` and `paper.tex`.
-3. Use the default GPT-5.6 Sol / `xhigh` setting for serious research-level audits, or select GPT-5.5 for comparison/compatibility with older runs. GPT-5.6 Sol `max` is available for the hardest quality-first audits or focused rechecks, but it is not the default.
+3. Use the default **GPT-6.1 Sol / `xhigh`** for serious mathematical audits. GPT-6 Astra / `xhigh` is the highest-quality selectable option; GPT-6.1 Terra / `high` is lower cost; GPT-6 Luna / `medium` is exploratory / lowest cost. These roles follow general model guidance and have not been validated by MATH_AUDIT comparisons. `max` is optional and can increase latency and token use.
 4. Click **Start Fresh Audit**.
 5. Monitor progress, cost, chunks, pages, and status in the GUI.
 6. Use **Quick review** to build/open a concise report.
@@ -115,7 +115,9 @@ The PySide6 app is the primary maintained frontend for this public preview.
 9. Rebuild/open final reports after verification and repairs.
 10. Optionally export a ChatGPT context pack for manual handoff outside the app.
 
-Existing audits resume with the model and reasoning effort saved in their audit session; selecting a new default does not silently migrate old runs.
+Current-model audits retain their saved settings when resumed. Historical GPT-5.x and superseded-model audits remain readable with their original provenance and costs. Live continuation, reruns, rechecks, and discussion of legacy sessions are disabled in this version; selecting a current model does not migrate them. To compare a new run, choose a current model and **Start Fresh Audit**, which archives the previous audit.
+
+The model-aware effort selector preserves a supported effort or logs a change to the destination default. New audits use standard reasoning mode. Pro reasoning mode is a separate API setting from `max` effort; its GUI control is deferred. A newer model does not establish mathematical correctness: findings remain provisional until verification and adjudication. Cost estimates may be approximate when cache-write accounting is incomplete; check the [current API pricing](https://developers.openai.com/api/docs/pricing) before long runs.
 
 ## Reports
 

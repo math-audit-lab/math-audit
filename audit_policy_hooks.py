@@ -6,6 +6,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
 
+from audit_prompts import VERIFICATION_GENERATION_CONTRACT
 from audit_chunking import load_pdf_pages, normalize_whitespace, strip_tex_comments
 from audit_issue_clusters import (
     canonical_concise_issue_records,
@@ -1430,18 +1431,8 @@ Boundary: {chunk['boundary']}
 Source kind: {chunk['source_kind']}
 Estimated page span: {chunk['page_start']}-{chunk['page_end']}
 
-Use the provided structured output schema.
-Keep mathematical prose human-readable, with inline math in $...$ and display math in $$...$$.
-If you include python_checks, every item must contain:
-- purpose: a short title
-- description: a self-contained explanation of the claim being tested, the test strategy, and any sample parameters or cases used
-- expected_outcome: what output or condition would count as success
-- code: runnable local Python code
-Write the description so it can stand on its own in the final report before the script body.
-Every script must emit exactly one final line using this contract (after importing json):
-result = {{"schema_version":1,"check_kind":"counterexample_search","outcome":"counterexample_found" if failures else "no_counterexample_found","summary":"...","counterexamples":failures,"failed_cases":[],"tested_range":{{}},"target":{{}},"linked_issue_ids":[]}}
-print("MATH_AUDIT_VERIFICATION_RESULT_JSON=" + json.dumps(result, sort_keys=True))
-Use outcome counterexample_found or claim_failed when the check finds a mathematical failure. Use no_counterexample_found only for a bounded search with no found case, and state the tested scope; do not call that a proof of an unrestricted claim. Return code 0 means execution completed and may accompany a counterexample.
+Use the provided structured output schema. Discover granular candidates with exact evidence and locations; final canonical adjudication is a later stage.
+{VERIFICATION_GENERATION_CONTRACT}
 
 Reference numbering status for this run:
 {ref_status_note}
@@ -1460,7 +1451,9 @@ Reference guidance for this chunk:
 {fresh_context_verification_reminder}
 
 Chunk text:
+<manuscript_evidence>
 {chunk['chunk_text']}
+</manuscript_evidence>
 """
     content.append({"type": "input_text", "text": prompt_text})
     return [{"role": "user", "content": content}]

@@ -84,7 +84,20 @@ For the easiest startup path:
 
 The launcher does not bundle Python. It searches for Conda/Mamba in `PATH` and common installation locations, then installs required Python/GUI dependencies into the `math-audit` environment automatically. Users should not manually install PySide6, Qt WebEngine, the OpenAI SDK, or PDF packages one by one. Very old or heavily customized Conda installations may have package-solving problems; if that happens, rerun the launcher, refresh the environment, or try a clean Miniforge installation. Windows currently uses the tested PySide6 6.9.3 package set, and the Windows launcher checks Qt imports before opening the GUI. The current Microsoft Visual C++ Redistributable x64 is recommended. Windows support remains experimental and less tested than macOS. Linux users should use the manual Conda setup for now. A packaged `.app` or installer is a future milestone; the `.command` and `.bat` launchers are the current public-preview convenience paths.
 
-New audits default to GPT-5.6 Sol with `xhigh` reasoning effort for serious research-level mathematical auditing. GPT-5.5 remains selectable for comparison and compatibility with older audits. GPT-5.6 Sol `max` effort is available for the hardest quality-first audits or focused rechecks, but it is not the global default. Existing audits resume with their saved model and effort.
+New audits default to **GPT-6.1 Sol / `xhigh`**, balancing capability and cost for repeated chunk-level auditing. The new-audit choices are:
+
+| Model | Intended role | Default effort |
+| --- | --- | --- |
+| GPT-6.1 Sol (`gpt-6.1-sol`) | Recommended | `xhigh` |
+| GPT-6 Astra (`gpt-6-astra`) | Highest quality | `xhigh` |
+| GPT-6.1 Terra (`gpt-6.1-terra`) | Lower cost | `high` |
+| GPT-6 Luna (`gpt-6-luna`) | Exploratory / lowest cost | `medium` |
+
+These roles follow [OpenAI's general model guidance](https://developers.openai.com/api/docs/models); comparative evaluations have not established these rankings for MATH_AUDIT. `max` is optional, never the default. Higher effort can increase latency and token cost, and a newer model does not guarantee a correct audit. Findings remain provisional until verification and adjudication.
+
+The effort selector is model-aware and preserves a supported selection when switching models; otherwise it selects the destination default and logs the adjustment. New audits use standard reasoning mode. The separate API `reasoning.mode: "pro"` feature is deferred in the GUI; it is distinct from `max` effort and can use more tokens and time.
+
+Historical GPT-5.x and superseded-model audits remain inspectable with their original model, effort, mode, prompt metadata, response IDs, usage, and saved costs. They are no longer new-audit choices. Live continuation of legacy sessions is blocked in this version. To begin a comparison, deliberately choose a current model and **Start Fresh Audit**; the previous audit is archived, not migrated. See the [user guide](docs/user_guide.md) for pricing and provenance details and the [prompt comparison plan](docs/prompt_architecture.md) for offline evaluation preparation.
 
 At a high level:
 
@@ -123,7 +136,7 @@ Do not commit audit outputs, paper PDFs/TeX sources, request/response logs, gene
 - TeX-aware chunking is preferred when a companion `.tex` file is available and covers the paper reliably.
 - Report TeX is intended to be robust, but local LaTeX installations still vary.
 - The GUI discussion rendered mode depends on bundled local MathJax assets.
-- Pricing/cost estimates are local calculations and may differ from platform billing in edge cases, including cache-write charges when those token counts are not exposed in usage metadata.
+- Pricing/cost estimates use token usage metadata and may differ from platform billing. Cache reads, cache writes, and long-context rates differ; missing accounting quantities make estimates approximate. Prices were verified on 2026-10-28 and can change. Historical saved costs are not recomputed with current rates.
 
 ## License
 

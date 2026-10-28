@@ -7,6 +7,9 @@ from typing import Any, Optional
 
 from audit_models import (
     GPT56_SOL_CACHE_WRITE_LIMITATION,
+    CURRENT_MODEL_CAPABILITIES,
+    PRICING_VERIFIED_DATE,
+    long_context_threshold_for_model,
     LONG_CONTEXT_INPUT_TOKEN_THRESHOLD,
     LONG_CONTEXT_PRICING_USD_PER_1M,
     PRICING_USD_PER_1M,
@@ -186,7 +189,7 @@ def pricing_context_for_model_usage(model: str, usage_obj: Optional[dict[str, An
     usage_obj = usage_obj or {}
     pricing_key = pricing_key_for_model(model)
     input_tokens = int(usage_obj.get("input_tokens", 0) or 0)
-    if pricing_key in LONG_CONTEXT_PRICING_USD_PER_1M and input_tokens > LONG_CONTEXT_INPUT_TOKEN_THRESHOLD:
+    if pricing_key in LONG_CONTEXT_PRICING_USD_PER_1M and input_tokens > long_context_threshold_for_model(model):
         return "long"
     return "short"
 
@@ -200,43 +203,112 @@ def pricing_for_model(model: str, usage_obj: Optional[dict[str, Any]] = None) ->
     return {"input": 0.0, "cached_input": 0.0, "output": 0.0}
 
 
-def compute_usage_cost(model: str, usage_obj: dict[str, Any]) -> dict[str, Any]:
+def compute_usage_cost(
+    model: str,
+    usage_obj: dict[str, Any],
+    *,
+    cache_ttl: Optional[str] = None,
+    service_tier: str = "standard",
+) -> dict[str, Any]:
+    """Estimate a new response only; never reprice stored usage or historical totals.
+
+    Output counts already include reasoning (and Pro's aggregated model work).
+    Cache reads, writes and ordinary input are mutually exclusive billed buckets.
+    Missing write counts/lifetimes are explicitly marked approximate.
+    """
     pricing_key = pricing_key_for_model(model)
     pricing_context = pricing_context_for_model_usage(model, usage_obj)
-    pricing = pricing_for_model(model, usage_obj)
+    pricing = dict(pricing_for_model(model, usage_obj))
     pricing_available = pricing_key in PRICING_USD_PER_1M or (
         pricing_context == "long" and pricing_key in LONG_CONTEXT_PRICING_USD_PER_1M
     )
-    input_tokens = int(usage_obj.get("input_tokens", 0) or 0)
-    output_tokens = int(usage_obj.get("output_tokens", 0) or 0)
-    cached_tokens = int(((usage_obj.get("input_tokens_details") or {}).get("cached_tokens", 0)) or 0)
-    pricing_limitations: list[str] = []
-    if pricing_key == "gpt-5.6-sol":
-        pricing_limitations.append(GPT56_SOL_CACHE_WRITE_LIMITATION)
+    current = pricing_key in CURRENT_MODEL_CAPABILITIES
+    input_tokens = max(0, int(usage_obj.get("input_tokens", 0) or 0))
+    output_tokens = max(0, int(usage_obj.get("output_tokens", 0) or 0))
+    details = usage_obj.get("input_tokens_details") or {}
+    cached_tokens = max(0, int(details.get("cached_tokens", 0) or 0))
+    limitations: list[str] = []
+    if not pricing_available:
+        limitations.append("No verified price is available for this model; the numeric estimate excludes its charges.")
+    if current and ("input_tokens" not in usage_obj or "output_tokens" not in usage_obj):
+        limitations.append("Input or output usage is missing; unreported token charges are excluded.")
+    if current and "cached_tokens" not in details:
+        limitations.append("Cached-input usage is missing; unreported reads are estimated as ordinary input.")
+    if cached_tokens > input_tokens:
+        limitations.append("Cached-input tokens exceed input tokens; inconsistent usage was bounded for this estimate.")
+        cached_tokens = input_tokens
+
+    write_tokens = 0
+    write_30m = 0
+    write_12h = 0
+    if current:
+        if "cache_write_tokens" not in details:
+            limitations.append("Cache-write usage is missing; unreported writes are estimated as ordinary input.")
+        else:
+            write_tokens = max(0, int(details.get("cache_write_tokens", 0) or 0))
+            if write_tokens > input_tokens - cached_tokens:
+                limitations.append("Cache-write counts overlap reads or exceed input; inconsistent usage was bounded.")
+                write_tokens = input_tokens - cached_tokens
+            lifetimes = details.get("cache_write_tokens_details") or {}
+            if all(k in lifetimes for k in ("ttl_30m_tokens", "ttl_12h_tokens")):
+                write_30m = max(0, int(lifetimes.get("ttl_30m_tokens", 0) or 0))
+                write_12h = max(0, int(lifetimes.get("ttl_12h_tokens", 0) or 0))
+                if write_30m + write_12h != write_tokens:
+                    limitations.append("Cache-write lifetime counts do not sum to total writes; known counts were bounded and the remainder estimated at 30m.")
+                    write_12h = min(write_12h, write_tokens)
+                    write_30m = write_tokens - write_12h
+            elif write_tokens:
+                if cache_ttl == "12h":
+                    write_12h = write_tokens
+                else:
+                    write_30m = write_tokens
+                limitations.append("Cache-write lifetime breakdown is missing; writes use the requested lifetime, or an assumed 30m lifetime when unspecified.")
+    elif pricing_key == "gpt-5.6-sol":
+        limitations.append(GPT56_SOL_CACHE_WRITE_LIMITATION)
+
+    # This app exposes Standard only. Accommodate explicit returned tiers without
+    # pretending an unknown tier has a known price; do not alter historical rates.
+    tier = str(service_tier or "standard")
+    tier_multipliers = {"standard": 1.0, "default": 1.0, "fast": 2.0, "priority": 2.0, "flex": 0.5, "batch": 0.5}
+    if current:
+        multiplier = tier_multipliers.get(tier)
+        if multiplier is None:
+            limitations.append(f"Unpriced processing tier {tier!r}; estimate uses Standard rates.")
+            multiplier = 1.0
+        pricing = {k: (v * multiplier if v is not None else None) for k, v in pricing.items()}
 
     if pricing.get("cached_input") is None:
         billable_uncached = input_tokens
         billable_cached = 0
     else:
-        billable_uncached = max(0, input_tokens - cached_tokens)
+        billable_uncached = max(0, input_tokens - cached_tokens - write_tokens)
         billable_cached = cached_tokens
     input_cost = billable_uncached * (pricing.get("input") or 0.0) / 1_000_000
     cached_cost = billable_cached * (pricing.get("cached_input") or 0.0) / 1_000_000
+    write_cost = (write_30m * (pricing.get("cache_write_30m") or 0.0)
+                  + write_12h * (pricing.get("cache_write_12h") or 0.0)) / 1_000_000
     output_cost = output_tokens * (pricing.get("output") or 0.0) / 1_000_000
-
     return {
         "input_cost": input_cost,
         "cached_input_cost": cached_cost,
+        "cache_write_cost": write_cost,
+        "cache_write_tokens": write_tokens,
+        "cache_write_30m_tokens": write_30m,
+        "cache_write_12h_tokens": write_12h,
+        "ordinary_input_tokens": billable_uncached,
         "output_cost": output_cost,
-        "total_cost": input_cost + cached_cost + output_cost,
+        "total_cost": input_cost + cached_cost + write_cost + output_cost,
         "pricing_context": pricing_context,
         "pricing_model": pricing_key,
         "pricing_available": pricing_available,
-        "pricing_rates_usd_per_1m": dict(pricing),
+        "pricing_rates_usd_per_1m": pricing,
+        "pricing_verified_date": PRICING_VERIFIED_DATE if current else None,
         "pricing_input_token_threshold": (
-            LONG_CONTEXT_INPUT_TOKEN_THRESHOLD if pricing_key in LONG_CONTEXT_PRICING_USD_PER_1M else None
+            long_context_threshold_for_model(model) if pricing_key in LONG_CONTEXT_PRICING_USD_PER_1M else None
         ),
-        "pricing_limitations": pricing_limitations,
+        "processing_tier": tier,
+        "approximate": bool(limitations),
+        "pricing_limitations": limitations,
     }
 
 
@@ -247,7 +319,8 @@ def usage_cache_diagnostics(usage_obj: dict[str, Any]) -> dict[str, Any]:
     output_tokens = int(usage_obj.get("output_tokens", 0) or 0)
     reasoning_tokens = int(((usage_obj.get("output_tokens_details") or {}).get("reasoning_tokens", 0)) or 0)
     total_tokens = int(usage_obj.get("total_tokens", 0) or 0)
-    uncached_tokens = max(0, input_tokens - cached_tokens)
+    write_tokens = int(((usage_obj.get("input_tokens_details") or {}).get("cache_write_tokens", 0)) or 0)
+    uncached_tokens = max(0, input_tokens - cached_tokens - write_tokens)
     cached_ratio = (cached_tokens / input_tokens) if input_tokens else None
     low_cached_input_reuse = (
         input_tokens > LONG_CONTEXT_INPUT_TOKEN_THRESHOLD
@@ -258,6 +331,7 @@ def usage_cache_diagnostics(usage_obj: dict[str, Any]) -> dict[str, Any]:
         "input_tokens": input_tokens,
         "cached_input_tokens": cached_tokens,
         "uncached_input_tokens": uncached_tokens,
+        "cache_write_tokens": write_tokens,
         "cached_input_ratio": cached_ratio,
         "cached_input_percent": round(cached_ratio * 100.0, 1) if cached_ratio is not None else None,
         "output_tokens": output_tokens,
@@ -287,7 +361,9 @@ def format_duration(seconds: float) -> str:
     return f"{seconds:.1f}s" if seconds < 10 else f"{s}s"
 
 
-def _ensure_timing_state(session: dict[str, Any], default_model: str = "gpt-5.4") -> dict[str, Any]:
+def _ensure_timing_state(
+    session: dict[str, Any], default_model: str = "gpt-5.4", *, persist: bool = True,
+) -> dict[str, Any]:
     changed_session = False
     if "audit_started_at" not in session:
         session["audit_started_at"] = session.get("created_at", utc_now())
@@ -359,12 +435,12 @@ def _ensure_timing_state(session: dict[str, Any], default_model: str = "gpt-5.4"
             status[k] = v
             changed_status = True
 
-    if changed_session:
+    if changed_session and persist:
         session["updated_at"] = utc_now()
         save_session(session)
-    if changed_usage:
+    if changed_usage and persist:
         save_usage(session, usage)
-    if changed_status:
+    if changed_status and persist:
         save_status(session, status)
     return session
 
@@ -377,10 +453,17 @@ def update_usage_from_usage_obj(
     elapsed_seconds: float = 0.0,
     activity_kind: str = "audit_chunk",
     activity_id: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    reasoning_mode: Optional[str] = None,
 ) -> dict[str, Any]:
     usage_state = load_usage(session)
     usage_obj = usage_obj or {}
-    cost = compute_usage_cost(model or session.get("model") or "gpt-5.4", usage_obj)
+    actual_model = model or session.get("model") or "unknown"
+    cost = compute_usage_cost(
+        actual_model, usage_obj,
+        cache_ttl=(session.get("prompt_cache_options") or {}).get("ttl"),
+        service_tier=session.get("service_tier", "standard"),
+    )
     cache_diagnostics = usage_cache_diagnostics(usage_obj)
 
     totals = usage_state["totals"]
@@ -390,6 +473,8 @@ def update_usage_from_usage_obj(
     totals["reasoning_tokens"] += int(((usage_obj.get("output_tokens_details") or {}).get("reasoning_tokens", 0)) or 0)
     totals["total_tokens"] += int(usage_obj.get("total_tokens", 0) or 0)
     totals["cost_usd"] += float(cost["total_cost"])
+    totals["cache_write_tokens"] = int(totals.get("cache_write_tokens", 0)) + cost["cache_write_tokens"]
+    totals["cost_approximate"] = bool(totals.get("cost_approximate", False) or cost["approximate"])
     totals["audit_seconds"] = float(totals.get("audit_seconds", 0.0) or 0.0) + float(elapsed_seconds or 0.0)
 
     clean_activity_kind = str(activity_kind or "audit_chunk").strip() or "audit_chunk"
@@ -397,6 +482,9 @@ def update_usage_from_usage_obj(
         "time": utc_now(),
         "chunk_id": chunk_id,
         "activity_kind": clean_activity_kind,
+        "model": actual_model,
+        "reasoning_effort": reasoning_effort if reasoning_effort is not None else session.get("reasoning_effort"),
+        "reasoning_mode": reasoning_mode if reasoning_mode is not None else session.get("reasoning_mode", "standard"),
         "activity_id": str(activity_id or "").strip() or None,
         "usage": usage_obj,
         "cost": cost,
@@ -430,6 +518,8 @@ def update_usage_from_usage_obj(
     )
     activity_summary["total_tokens"] += int(usage_obj.get("total_tokens", 0) or 0)
     activity_summary["cost_usd"] += float(cost["total_cost"])
+    activity_summary["cache_write_tokens"] = int(activity_summary.get("cache_write_tokens", 0)) + cost["cache_write_tokens"]
+    activity_summary["cost_approximate"] = bool(activity_summary.get("cost_approximate", False) or cost["approximate"])
     activity_summary["elapsed_seconds"] += float(elapsed_seconds or 0.0)
     save_usage(session, usage_state)
     return {"usage": usage_obj, "cost": cost, "usage_diagnostics": cache_diagnostics, "usage_state": usage_state}

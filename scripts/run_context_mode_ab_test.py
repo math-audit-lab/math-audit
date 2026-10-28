@@ -32,6 +32,9 @@ from audit_runtime import (
     to_jsonable,
     wait_for_response,
 )
+from audit_models import is_current_model, validate_new_audit_settings
+from audit_requests import response_request_options, validate_response_storage
+from audit_prompts import request_prompt_metadata
 from audit_state import compute_usage_cost, session_paths, usage_cache_diagnostics, utc_now
 from scripts.prepare_context_mode_comparison import (
     _backfill_context_db,
@@ -160,6 +163,8 @@ def _build_request(
         "background": bool(session.get("background", True)),
         "store": bool(session.get("store", True)),
     }
+    if is_current_model(session["model"]):
+        request_kwargs.update(response_request_options(session["model"], session["reasoning_effort"], session.get("reasoning_mode", "standard")))
     diagnostics = _audit_request_size_diagnostics(session, chunk, request_kwargs)
     return user_input, prompt_text, request_kwargs, list(retrieved.get("entries") or []), diagnostics
 
@@ -189,6 +194,9 @@ def _live_response(
     poll_every: float,
     max_wait_seconds: float | None,
 ):
+    options = response_request_options(request_kwargs["model"], request_kwargs["reasoning"]["effort"], request_kwargs["reasoning"].get("mode", "standard"))
+    request_kwargs.update(options)
+    validate_response_storage(request_kwargs)
     client = _get_client()
     resp = client.responses.create(**request_kwargs)
     if getattr(resp, "status", None) not in {None, "completed"}:
@@ -274,10 +282,10 @@ def run_context_mode_ab_test(
 
     source_paths = session_paths(audit_workdir)
     source_session, manifest, issues = _load_source_state(audit_workdir)
-    selected_model, selected_effort = normalize_model_and_reasoning_effort(
-        model or source_session.get("model") or DEFAULT_MODEL,
-        reasoning_effort or source_session.get("reasoning_effort") or DEFAULT_REASONING_EFFORT,
-    )
+    selected_model = model if model is not None else source_session.get("model", DEFAULT_MODEL)
+    selected_effort = reasoning_effort if reasoning_effort is not None else source_session.get("reasoning_effort", DEFAULT_REASONING_EFFORT)
+    if live:
+        selected_model, selected_effort, _mode = validate_new_audit_settings(selected_model, selected_effort, source_session.get("reasoning_mode", "standard"))
     chunks = manifest.get("chunks") or []
     if not isinstance(chunks, list):
         raise RuntimeError(f"Manifest has no chunk list: {source_paths['manifest']}")
@@ -360,6 +368,7 @@ def run_context_mode_ab_test(
                     "audit_context_mode": SUPPORTED_MODE,
                     "model": selected_model,
                     "reasoning_effort": selected_effort,
+                    "reasoning_mode": source_session.get("reasoning_mode", "standard"),
                     "fresh_context_conversation": True,
                     "main_conversation_id": source_session.get("conversation_id"),
                     "conversation_id": conversation_id,
@@ -369,6 +378,7 @@ def run_context_mode_ab_test(
                     "request_size_diagnostics": diagnostics,
                     "priority_issues": priority_issues,
                     "priority_issue_reason_counts": reason_counts,
+                    "prompt_metadata": request_prompt_metadata(request_kwargs["input"]),
                     "request": to_jsonable(request_kwargs),
                 },
             )
